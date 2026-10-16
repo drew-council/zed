@@ -1,0 +1,14 @@
+[
+  {
+    "context": "CodeReview > Editor && mode == full && vim_mode == normal && !menu",
+    "bindings": {
+      "; h": "code_review::ToggleFocus",
+    },
+  },
+  {
+    "context": "ReviewPanel",
+    "bindings": {
+      "; l": "code_review::ToggleFocus",
+    },
+  },
+]
