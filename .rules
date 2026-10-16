@@ -1,3 +1,11 @@
+# Drew's Zed fork
+
+This is `drew-council/zed`, a personal fork of Zed.
+
+Fork-specific work in progress: the **`code_review`** feature (tuicr-style code review inside Zed).
+Before working on it, read `crates/code_review/DESIGN.md` — it holds the agreed design, research
+pointers, implementation milestones, build/dev setup, and working agreements with the user.
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
