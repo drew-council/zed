@@ -1,0 +1,21 @@
+// Mirrored from Drew's ~/.config/zed/keymap.json, minus the lazygit task binding and the
+// edit-prediction block (AI is disabled in the harness).
+[
+  {
+    "bindings": {
+      "alt-h": "workspace::ActivatePaneLeft",
+      "alt-j": "workspace::ActivatePaneDown",
+      "alt-k": "workspace::ActivatePaneUp",
+      "alt-l": "workspace::ActivatePaneRight",
+      "ctrl-b": "workspace::ToggleLeftDock",
+      "ctrl-shift-escape": "workspace::ToggleZoom",
+      "ctrl-shift-e": "project_panel::ToggleFocus",
+      "shift-escape": null,
+      "ctrl-right": "pane::SplitRight",
+      "ctrl-left": "pane::SplitLeft",
+      "ctrl-up": "pane::SplitUp",
+      "ctrl-down": "pane::SplitDown",
+      "ctrl-q": "pane::CloseActiveItem"
+    }
+  }
+]

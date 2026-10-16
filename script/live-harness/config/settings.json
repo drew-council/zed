@@ -1,0 +1,67 @@
+// Settings for the harness-launched (isolated) Zed. Copied into the isolated
+// config dir on every `zh start`. To change a setting for one session without
+// restarting, edit "$(zh path config)/settings.json" instead (Zed live-reloads it).
+{
+  // ---- Mirrored from Drew's ~/.config/zed/settings.json (behaviour-relevant parts) ----
+  "vim_mode": true,
+  "base_keymap": "VSCode",
+  "vim": {
+    "toggle_relative_line_numbers": true,
+    "highlight_on_yank_duration": 400
+  },
+  "cursor_blink": false,
+  "hide_mouse": "on_typing",
+  "scroll_beyond_last_line": "off",
+  "autosave": {
+    "after_delay": {
+      "milliseconds": 500
+    }
+  },
+  "cli_default_open_behavior": "existing_window",
+  "buffer_font_family": "JetBrainsMono Nerd Font",
+  "buffer_font_size": 15,
+  "ui_font_size": 15,
+  "project_panel": { "dock": "left" },
+  "outline_panel": { "dock": "left" },
+  "collaboration_panel": { "dock": "left" },
+  "git_panel": { "dock": "left" },
+  "agent": { "dock": "right" },
+  "file_types": {
+    "CMake": ["CMakeLists.txt", "cmake"],
+    "Dockerfile": ["Dockerfile*"]
+  },
+  "languages": {
+    "Markdown": { "soft_wrap": "editor_width" },
+    "Go": { "soft_wrap": "editor_width", "tab_size": 4 },
+    "Python": { "tab_size": 4 },
+    "Zig": { "tab_size": 4 },
+    "Nu": { "tab_size": 4 }
+  },
+  // Drew uses Catppuccin Mocha (an extension, not available offline here); One Dark is the
+  // closest built-in dark theme. diff_view_style is left at Zed's default ("split"), as in
+  // Drew's config.
+  "theme": {
+    "mode": "dark",
+    "dark": "One Dark",
+    "light": "One Light"
+  },
+
+  // ---- Harness-only: offline, quiet, deterministic ----
+  "telemetry": { "diagnostics": false, "metrics": false },
+  "auto_update": false,
+  "disable_ai": true,
+  "auto_install_extensions": { "html": false },
+  "session": {
+    "trust_all_worktrees": true,
+    "restore_unsaved_buffers": false
+  },
+  "restore_on_startup": "none",
+  "use_system_path_prompts": false,
+  "enable_language_server": false,
+  "title_bar": {
+    "show_sign_in": false,
+    "show_user_picture": false,
+    "show_onboarding_banner": false
+  },
+  "show_call_status_icon": false
+}

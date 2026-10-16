@@ -1,0 +1,880 @@
+#!/usr/bin/env bash
+# zh - run and drive an isolated, headless Zed on a private Xvfb display.
+# See README.md next to this script for usage, isolation guarantees and gotchas.
+set -euo pipefail
+
+HARNESS_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Runtime state (isolated HOME, logs, screenshots, tool GC roots, demo repo) lives outside the
+# repo so the user's own Zed never sees a nested repo or screenshot churn in its worktree.
+STATE_ROOT="${ZH_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zed-live-harness}"
+RUN_DIR="$STATE_ROOT/run"
+# Unix socket paths must be < 108 bytes and Zed puts its CLI socket in its data dir, so the
+# isolated Zed only ever sees $RUN_DIR through this short symlink.
+LINK="${ZH_LINK:-/tmp/zh-$(id -u)}"
+TOOLS="$STATE_ROOT/tools"
+STATE="$RUN_DIR/state.env"
+LOCK="$STATE_ROOT/zh.lock"
+REPO_DIR="$(cd "$HARNESS_DIR/../.." && pwd)"
+FORK_BINARY="${ZH_FORK_BINARY:-$REPO_DIR/target/release-fast/zed}"
+
+# CPU/priority limits (compute is shared with cargo builds and other agents).
+NICE="${ZH_NICE:-10}"
+LP_THREADS="${ZH_LP_THREADS:-2}"
+if [[ -z "${ZH_CPUS+x}" ]]; then
+    ncpu="$(nproc)"
+    if (( ncpu > 2 )); then ZH_CPUS="$((ncpu - 2))-$((ncpu - 1))"; else ZH_CPUS=""; fi
+fi
+CPUS="$ZH_CPUS"
+KEY_DELAY_MS="${ZH_KEY_DELAY_MS:-60}"
+TYPE_DELAY_MS="${ZH_TYPE_DELAY_MS:-25}"
+SHOT_DELAY_MS="${ZH_SHOT_DELAY_MS:-400}"
+START_TIMEOUT_S="${ZH_START_TIMEOUT_S:-90}"
+
+die() { echo "zh: $*" >&2; exit 1; }
+log() { echo "zh: $*" >&2; }
+now_ms() { date +%s%3N; }
+sleep_ms() { sleep "$(awk -v ms="$1" 'BEGIN { printf "%.3f", ms / 1000 }')"; }
+
+usage() {
+    cat <<'EOF'
+zh - isolated headless Zed for agents (Xvfb + xdotool). See README.md.
+
+Lifecycle:
+  zh start [--binary PATH|--fork] [--workdir DIR] [--size WxH] [--fresh]
+           [--settings FILE] [--keymap FILE]     start display + Zed (idempotent)
+  zh restart [start options]                     stop, then start
+  zh stop [--clean]                              stop everything (--clean also wipes run/)
+  zh status                                      show state; exit 1 if not running
+
+Input (all go to the Zed window on the private display):
+  zh keys KEY...        xdotool keysyms/chords, one keypress per token, e.g.
+                          zh keys ctrl+shift+p      zh keys '] f'      zh keys g g G
+                          zh keys Escape colon w Return   (punctuation like ] [ : / ok)
+  zh type TEXT          type literal text (newline = Return)
+  zh click X Y [BTN]    move + click (BTN 1=left 2=middle 3=right; default 1)
+  zh dblclick X Y       double click
+  zh move X Y           move the pointer
+  zh scroll up|down [N] wheel scroll N notches at the current pointer position
+  zh park               move pointer to a neutral spot (bottom-left of the screen)
+  zh focus              re-focus the Zed window
+
+Output:
+  zh shot [OUT.png] [--now] [--crop WxH+X+Y] [--scale PCT]
+                        screenshot (waits ZH_SHOT_DELAY_MS first unless --now); prints path
+  zh clip [--primary] [--targets] [--target T]   print the test display's clipboard
+  zh clip-set TEXT      put TEXT on the test display's clipboard
+  zh logs [N] [--errors] [--all] [--path]   tail Zed.log of the isolated instance
+  zh wait-log REGEX [TIMEOUT_S]             wait until Zed.log (this session) matches
+
+Misc:
+  zh open PATH[:LINE[:COL]]   open a file in the running Zed via its CLI (if available)
+  zh mkrepo DIR               create a scratch git repo with uncommitted changes
+  zh env                      print shell exports for the private display/isolated env
+  zh path [run|home|config|data|log|shots]   print an isolated path
+  zh xdo ARGS...              run xdotool against the private display
+EOF
+}
+
+# ---------------------------------------------------------------- tools
+
+declare -A NIX_ATTR=(
+    [xdotool]=nixpkgs#xdotool
+    [xclip]=nixpkgs#xclip
+    [imagemagick]=nixpkgs#imagemagick
+    [xdpyinfo]=nixpkgs#xorg.xdpyinfo
+)
+
+ensure_tools() {
+    mkdir -p "$TOOLS"
+    local name
+    for name in "${!NIX_ATTR[@]}"; do
+        if [[ ! -e "$TOOLS/$name" ]]; then
+            log "fetching $name (${NIX_ATTR[$name]}) into $TOOLS/$name"
+            nix build --no-warn-dirty -o "$TOOLS/$name" "${NIX_ATTR[$name]}" >&2 \
+                || die "nix build ${NIX_ATTR[$name]} failed"
+        fi
+    done
+    if ! command -v Xvfb >/dev/null && [[ ! -e "$TOOLS/xvfb" ]]; then
+        nix build -o "$TOOLS/xvfb" nixpkgs#xorg.xorgserver >&2 || die "cannot get Xvfb"
+    fi
+    if ! command -v dbus-daemon >/dev/null && [[ ! -e "$TOOLS/dbus" ]]; then
+        nix build -o "$TOOLS/dbus" nixpkgs#dbus >&2 || die "cannot get dbus-daemon"
+    fi
+}
+
+xvfb_bin() { command -v Xvfb || echo "$TOOLS/xvfb/bin/Xvfb"; }
+dbus_bin() { command -v dbus-daemon || echo "$TOOLS/dbus/bin/dbus-daemon"; }
+XDOTOOL="$TOOLS/xdotool/bin/xdotool"
+XCLIP="$TOOLS/xclip/bin/xclip"
+IMPORT="$TOOLS/imagemagick/bin/import"
+XDPYINFO="$TOOLS/xdpyinfo/bin/xdpyinfo"
+
+# ---------------------------------------------------------------- state
+
+load_state() {
+    [[ -f "$STATE" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$STATE"
+}
+
+save_state() {
+    {
+        local var
+        for var in DISPLAY_NUM XVFB_PID DBUS_PID ZED_PID ZED_BINARY ZED_CLI WORKDIR SIZE \
+            WINDOW_ID LOG_FILE STARTED_AT CPU_SET; do
+            printf '%s=%q\n' "$var" "${!var-}"
+        done
+    } >"$STATE"
+}
+
+alive() { [[ -n "${1-}" ]] && kill -0 "$1" 2>/dev/null; }
+
+is_running() {
+    load_state 2>/dev/null || return 1
+    owned_pid xvfb "${XVFB_PID-}" && owned_pid zed "${ZED_PID-}"
+}
+
+require_running() {
+    is_running || die "not running (zh start first; zh status / zh logs for details)"
+    export DISPLAY=":$DISPLAY_NUM"
+}
+
+# ---------------------------------------------------------------- binaries
+
+resolve_binary() {
+    local path
+    path="$(readlink -f "$1")" || die "binary not found: $1"
+    [[ -x "$path" ]] || die "not executable: $path"
+    local dir base
+    dir="$(dirname "$path")"
+    base="$(basename "$path")"
+    # nixpkgs zed-editor: bin/zeditor is the CLI, libexec/zed-editor is the app.
+    if [[ "$base" == zeditor && -x "$dir/../libexec/zed-editor" ]]; then
+        readlink -f "$dir/../libexec/zed-editor"
+        return
+    fi
+    if [[ "$base" == cli && -x "$dir/zed" ]]; then
+        echo "$dir/zed"
+        return
+    fi
+    echo "$path"
+}
+
+cli_for_binary() {
+    local dir
+    dir="$(dirname "$1")"
+    if [[ "$(basename "$1")" == zed-editor && -x "$dir/../bin/zeditor" ]]; then
+        readlink -f "$dir/../bin/zeditor"
+    elif [[ -x "$dir/cli" ]]; then
+        echo "$dir/cli"
+    fi
+}
+
+default_binary() {
+    if [[ -n "${ZH_BINARY-}" ]]; then
+        echo "$ZH_BINARY"
+        return
+    fi
+    local cli
+    cli="$(command -v zeditor || true)"
+    [[ -n "$cli" ]] || die "no zeditor in PATH; pass --binary PATH"
+    echo "$cli"
+}
+
+# ---------------------------------------------------------------- environment
+
+lvp_icd() {
+    if [[ -n "${ZH_VK_ICD-}" ]]; then
+        echo "$ZH_VK_ICD"
+        return
+    fi
+    local candidate
+    for candidate in /run/opengl-driver/share/vulkan/icd.d/lvp_icd.x86_64.json \
+        /usr/share/vulkan/icd.d/lvp_icd.x86_64.json; do
+        [[ -f "$candidate" ]] && { echo "$candidate"; return; }
+    done
+    die "lavapipe ICD json not found; set ZH_VK_ICD to mesa's lvp_icd.*.json"
+}
+
+# The isolated environment is built from scratch (env -i): only an allowlist of the
+# caller's variables survives, so WAYLAND_DISPLAY, the user's DBus bus, SSH agent,
+# HYPRLAND_INSTANCE_SIGNATURE etc. can never leak into the test Zed.
+isolated_env() {
+    local home="$LINK/home"
+    ENV_ARGS=(
+        env -i
+        "PATH=$PATH"
+        "HOME=$home"
+        "USER=${USER:-$(id -un)}"
+        "LOGNAME=${LOGNAME:-$(id -un)}"
+        "SHELL=${ZH_SHELL:-${SHELL:-/bin/sh}}"
+        "LANG=${LANG:-C.UTF-8}"
+        "XDG_CONFIG_HOME=$home/.config"
+        "XDG_DATA_HOME=$home/.local/share"
+        "XDG_STATE_HOME=$home/.local/state"
+        "XDG_CACHE_HOME=$home/.cache"
+        "XDG_RUNTIME_DIR=$LINK/runtime"
+        "XDG_SESSION_TYPE=x11"
+        "DISPLAY=:$DISPLAY_NUM"
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=$LINK/bus"
+        "ZED_WINDOW_SIZE=${SIZE/x/,}"
+        "ZED_WINDOW_POSITION=0,0"
+        "ZED_ALLOW_EMULATED_GPU=1"
+        "LP_NUM_THREADS=$LP_THREADS"
+    )
+    local var
+    for var in LOCALE_ARCHIVE FONTCONFIG_FILE FONTCONFIG_PATH TZ TZDIR LC_ALL LC_CTYPE; do
+        [[ -n "${!var-}" ]] && ENV_ARGS+=("$var=${!var}")
+    done
+    # Xvfb has no DRI3, so hardware Vulkan drivers cannot present ("no compatible surface
+    # formats") and wgpu would fall back to lavapipe anyway after probing the real GPUs.
+    local icd
+    icd="$(lvp_icd)"
+    ENV_ARGS+=("VK_ICD_FILENAMES=$icd" "VK_DRIVER_FILES=$icd" "LIBGL_ALWAYS_SOFTWARE=1")
+    # Extra variables for the test Zed, e.g. ZH_EXTRA_ENV="RUST_LOG=code_review=debug".
+    local extra
+    for extra in ${ZH_EXTRA_ENV-}; do
+        ENV_ARGS+=("$extra")
+    done
+}
+
+prepare_home() {
+    local settings="$1" keymap="$2"
+    local home="$RUN_DIR/home"
+    mkdir -p "$home/.config/zed" "$home/.local/share" "$home/.local/state" "$home/.cache" \
+        "$RUN_DIR/runtime" "$RUN_DIR/shots"
+    chmod 700 "$RUN_DIR/runtime"
+    cp "$settings" "$home/.config/zed/settings.json"
+    cp "$keymap" "$home/.config/zed/keymap.json"
+    if [[ ! -f "$home/.gitconfig" ]]; then
+        cat >"$home/.gitconfig" <<'EOF'
+[user]
+	name = Zed Harness
+	email = harness@example.invalid
+[init]
+	defaultBranch = main
+[safe]
+	directory = *
+EOF
+    fi
+    # Zed replaces its environment with a login shell's; NixOS' /etc/profile derives PATH
+    # from $HOME/.nix-profile, which is where git and friends live for this user.
+    local real_home
+    real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+    if [[ -e "$real_home/.nix-profile" && ! -e "$home/.nix-profile" ]]; then
+        ln -s "$real_home/.nix-profile" "$home/.nix-profile"
+    fi
+}
+
+ensure_link() {
+    if [[ -L "$LINK" ]]; then
+        [[ "$(readlink "$LINK")" == "$RUN_DIR" ]] && return
+        local other
+        other="$(readlink "$LINK")"
+        # shellcheck disable=SC1091
+        if [[ -f "$other/state.env" ]] && (source "$other/state.env" && alive "${ZED_PID-}"); then
+            die "$LINK points at another running harness ($other); set ZH_LINK"
+        fi
+        rm -f "$LINK"
+    elif [[ -e "$LINK" ]]; then
+        die "$LINK exists and is not a symlink; set ZH_LINK to another short path"
+    fi
+    ln -s "$RUN_DIR" "$LINK"
+}
+
+pick_display() {
+    local n
+    for n in $(seq 90 140); do
+        [[ -e "/tmp/.X$n-lock" || -e "/tmp/.X11-unix/X$n" ]] && continue
+        # Also skip abstract sockets: X clients on Linux try @/tmp/.X11-unix/X<n> first.
+        grep -qa "/tmp/.X11-unix/X$n\$" /proc/net/unix && continue
+        echo "$n"
+        return
+    done
+    die "no free X display in :90-:140"
+}
+
+# ---------------------------------------------------------------- lifecycle
+
+cmd_start() {
+    local binary="" workdir="${ZH_WORKDIR-}" size="${ZH_SIZE:-1600x1000}" fresh=0
+    local settings="$HARNESS_DIR/config/settings.json" keymap="$HARNESS_DIR/config/keymap.json"
+    while (($#)); do
+        case "$1" in
+        --binary) binary="$2"; shift 2 ;;
+        --fork) binary="$FORK_BINARY"; shift ;;
+        --workdir) workdir="$2"; shift 2 ;;
+        --size) size="$2"; shift 2 ;;
+        --fresh) fresh=1; shift ;;
+        --settings) settings="$2"; shift 2 ;;
+        --keymap) keymap="$2"; shift 2 ;;
+        *) die "start: unknown option $1" ;;
+        esac
+    done
+    [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || die "--size must look like 1600x1000"
+    [[ -n "$binary" ]] || binary="$(default_binary)"
+    binary="$(resolve_binary "$binary")"
+    if [[ -z "$workdir" ]]; then
+        workdir="$STATE_ROOT/demo-repo"
+        [[ -d "$workdir/.git" ]] || cmd_mkrepo "$workdir" >/dev/null
+    fi
+    workdir="$(readlink -f "$workdir")"
+    [[ -d "$workdir" || -f "$workdir" ]] || die "workdir does not exist: $workdir"
+
+    if is_running; then
+        if [[ "$ZED_BINARY" == "$binary" && "$WORKDIR" == "$workdir" && "$SIZE" == "$size" && $fresh == 0 ]]; then
+            log "already running (display :$DISPLAY_NUM, zed pid $ZED_PID)"
+            cmd_status
+            return 0
+        fi
+        die "already running with different options (binary=$ZED_BINARY workdir=$WORKDIR size=$SIZE); use 'zh restart ...' or 'zh stop' first"
+    fi
+    # Leftovers from a crashed session.
+    stop_processes quiet
+
+    ensure_tools
+    mkdir -p "$RUN_DIR"
+    if ((fresh)); then
+        rm -rf "${RUN_DIR:?}/home" "${RUN_DIR:?}/runtime"
+    fi
+    ensure_link
+    prepare_home "$settings" "$keymap"
+    # Any failure from here on must not leak Xvfb/dbus/Zed processes.
+    trap 'stop_processes quiet' EXIT
+
+    ZED_BINARY="$binary"
+    ZED_CLI="$(cli_for_binary "$binary")"
+    WORKDIR="$workdir"
+    SIZE="$size"
+    CPU_SET="$CPUS"
+    STARTED_AT="$(date -Is)"
+    ZED_PID="" DBUS_PID="" XVFB_PID="" WINDOW_ID="" DISPLAY_NUM=""
+    LOG_FILE="$RUN_DIR/home/.local/share/zed/logs/Zed.log"
+    local taskset_args=()
+    [[ -n "$CPU_SET" ]] && taskset_args=(taskset -c "$CPU_SET")
+
+    local t0
+    t0="$(now_ms)"
+
+    # Xvfb on an explicit, verified-free display number. Never -displayfd: it can pick :0
+    # when the user's Xwayland only listens on the filesystem socket, hijacking :0 clients.
+    local attempt
+    for attempt in 1 2 3; do
+        DISPLAY_NUM="$(pick_display)"
+        setsid nice -n "$NICE" "${taskset_args[@]}" "$(xvfb_bin)" ":$DISPLAY_NUM" \
+            -screen 0 "${size}x24" -nolisten tcp -noreset \
+            >"$RUN_DIR/xvfb.log" 2>&1 </dev/null 9>&- &
+        XVFB_PID=$!
+        for _ in $(seq 1 50); do
+            "$XDPYINFO" -display ":$DISPLAY_NUM" >/dev/null 2>&1 && break
+            alive "$XVFB_PID" || break
+            sleep 0.1
+        done
+        if alive "$XVFB_PID" && "$XDPYINFO" -display ":$DISPLAY_NUM" >/dev/null 2>&1; then
+            break
+        fi
+        log "Xvfb on :$DISPLAY_NUM failed (attempt $attempt); see $RUN_DIR/xvfb.log"
+        kill "$XVFB_PID" 2>/dev/null || true
+        XVFB_PID=""
+    done
+    [[ -n "$XVFB_PID" ]] || die "could not start Xvfb"
+    save_state
+
+    rm -f "$RUN_DIR/bus"
+    sed "s|@BUS_PATH@|$LINK/bus|" "$HARNESS_DIR/config/dbus-session.conf.in" >"$RUN_DIR/dbus-session.conf"
+    setsid nice -n "$NICE" "$(dbus_bin)" --config-file="$RUN_DIR/dbus-session.conf" --nofork \
+        >"$RUN_DIR/dbus.log" 2>&1 </dev/null 9>&- &
+    DBUS_PID=$!
+    save_state
+    for _ in $(seq 1 30); do
+        [[ -S "$RUN_DIR/bus" ]] && break
+        sleep 0.1
+    done
+    [[ -S "$RUN_DIR/bus" ]] || die "private dbus-daemon did not start; see $RUN_DIR/dbus.log"
+
+    isolated_env
+    (
+        cd "$workdir" 2>/dev/null || cd "$(dirname "$workdir")"
+        exec setsid "${ENV_ARGS[@]}" nice -n "$NICE" "${taskset_args[@]}" "$binary" "$workdir" \
+            >"$RUN_DIR/zed.stdout" 2>&1 </dev/null
+    ) 9>&- &
+    ZED_PID=$!
+    WINDOW_ID=""
+    save_state
+
+    export DISPLAY=":$DISPLAY_NUM"
+    local deadline=$(($(now_ms) + START_TIMEOUT_S * 1000))
+    while (($(now_ms) < deadline)); do
+        alive "$ZED_PID" || {
+            log "Zed exited during startup. stdout/stderr:"
+            tail -20 "$RUN_DIR/zed.stdout" >&2 || true
+            log "log: $LOG_FILE"
+            die "start failed"
+        }
+        WINDOW_ID="$("$XDOTOOL" search --onlyvisible --pid "$ZED_PID" 2>/dev/null | tail -1 || true)"
+        [[ -n "$WINDOW_ID" ]] && break
+        sleep 0.2
+    done
+    [[ -n "$WINDOW_ID" ]] || die "no Zed window after ${START_TIMEOUT_S}s (zh logs)"
+    local t_window
+    t_window="$(now_ms)"
+    # Wait for the first frame so the first screenshot is not blank.
+    while (($(now_ms) < deadline)); do
+        session_log | grep -q "Rendered first frame" && break
+        sleep 0.2
+    done
+    "$XDOTOOL" windowmove --sync "$WINDOW_ID" 0 0 >/dev/null 2>&1 || true
+    "$XDOTOOL" windowfocus --sync "$WINDOW_ID" >/dev/null 2>&1 || true
+    park_pointer
+    save_state
+    trap - EXIT
+    local t1
+    t1="$(now_ms)"
+    log "started in $((t1 - t0)) ms (window after $((t_window - t0)) ms)"
+    cmd_status
+}
+
+# PIDs in state.env may be stale (and reused by unrelated processes after a reboot or a
+# crash), so only signal a PID after checking it is really one of ours.
+owned_pid() {
+    local kind="$1" pid="$2"
+    alive "$pid" || return 1
+    local cmdline environ
+    cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    case "$kind" in
+    xvfb) [[ "$cmdline" == *Xvfb*":${DISPLAY_NUM-}"* ]] ;;
+    dbus) [[ "$cmdline" == *"$RUN_DIR/dbus-session.conf"* ]] ;;
+    zed)
+        environ="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
+        grep -qxF "XDG_RUNTIME_DIR=$LINK/runtime" <<<"$environ"
+        ;;
+    esac
+}
+
+stop_processes() {
+    local quiet="${1-}"
+    load_state 2>/dev/null || return 0
+    local kind pid targets=()
+    [[ -n "${ZED_PID-}" ]] && owned_pid zed "$ZED_PID" && targets+=("$ZED_PID")
+    [[ -n "${DBUS_PID-}" ]] && owned_pid dbus "$DBUS_PID" && targets+=("$DBUS_PID")
+    [[ -n "${XVFB_PID-}" ]] && owned_pid xvfb "$XVFB_PID" && targets+=("$XVFB_PID")
+    # Each was started with setsid, so its PID is also its process group id: killing the
+    # group takes Zed's crash handler, shell-env probes and language servers with it.
+    for pid in "${targets[@]}"; do
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    done
+    local still
+    for _ in $(seq 1 30); do
+        still=0
+        for pid in "${targets[@]}"; do alive "$pid" && still=1; done
+        ((still)) || break
+        sleep 0.1
+    done
+    for pid in "${targets[@]}"; do
+        if alive "$pid"; then
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    [[ -n "$quiet" ]] || log "stopped"
+    ZED_PID="" XVFB_PID="" DBUS_PID="" WINDOW_ID=""
+    save_state
+}
+
+cmd_stop() {
+    local clean=0
+    [[ "${1-}" == --clean ]] && clean=1
+    stop_processes
+    if [[ -L "$LINK" && "$(readlink "$LINK")" == "$RUN_DIR" ]]; then
+        rm -f "$LINK"
+    fi
+    if ((clean)); then
+        rm -rf "$RUN_DIR"
+        log "removed $RUN_DIR"
+    fi
+}
+
+cmd_status() {
+    if ! load_state 2>/dev/null; then
+        echo "not running (no state)"
+        return 1
+    fi
+    local zed_state="dead" xvfb_state="dead"
+    alive "${ZED_PID-}" && zed_state="alive"
+    alive "${XVFB_PID-}" && xvfb_state="alive"
+    cat <<EOF
+display:   :${DISPLAY_NUM-} (Xvfb pid ${XVFB_PID:-none}, $xvfb_state) size ${SIZE-}
+zed:       pid ${ZED_PID:-none} ($zed_state) window ${WINDOW_ID:-none}
+binary:    ${ZED_BINARY-}
+workdir:   ${WORKDIR-}
+binary mtime: $(date -r "${ZED_BINARY-}" '+%F %T' 2>/dev/null || echo '?')
+render:    lavapipe (LP_NUM_THREADS=$LP_THREADS) cpus: ${CPU_SET:-all} nice: $NICE
+log:       ${LOG_FILE-}
+started:   ${STARTED_AT-}
+EOF
+    [[ "$zed_state" == alive && "$xvfb_state" == alive ]]
+}
+
+# ---------------------------------------------------------------- input
+
+ensure_focus() {
+    if ! "$XDOTOOL" getwindowname "$WINDOW_ID" >/dev/null 2>&1; then
+        local wid
+        wid="$("$XDOTOOL" search --onlyvisible --pid "$ZED_PID" 2>/dev/null | tail -1 || true)"
+        [[ -n "$wid" ]] || die "Zed window not found"
+        WINDOW_ID="$wid"
+        save_state
+    fi
+    local focused
+    focused="$("$XDOTOOL" getwindowfocus 2>/dev/null || true)"
+    if [[ "$focused" != "$WINDOW_ID" ]]; then
+        "$XDOTOOL" windowfocus --sync "$WINDOW_ID" >/dev/null 2>&1 || true
+    fi
+}
+
+park_pointer() {
+    local height="${SIZE#*x}"
+    "$XDOTOOL" mousemove --sync 1 "$((height - 1))" >/dev/null 2>&1 || true
+}
+
+# Map one token (possibly a chord like ctrl+]) to xdotool keysym syntax.
+map_key() {
+    local token="$1"
+    [[ "$token" == "+" ]] && { echo plus; return; }
+    local prefix="" last="$token"
+    if [[ "$token" == *++ ]]; then
+        prefix="${token%++}+"
+        last="+"
+    elif [[ "$token" == *+* ]]; then
+        prefix="${token%+*}+"
+        last="${token##*+}"
+    fi
+    case "$last" in
+    "]") last=bracketright ;; "[") last=bracketleft ;;
+    "{") last=braceleft ;; "}") last=braceright ;;
+    "(") last=parenleft ;; ")") last=parenright ;;
+    ";") last=semicolon ;; ":") last="colon" ;;
+    "'") last=apostrophe ;; '"') last=quotedbl ;;
+    ",") last=comma ;; ".") last=period ;;
+    "<") last=less ;; ">") last=greater ;;
+    "/") last=slash ;; "?") last=question ;;
+    "\\") last=backslash ;; "|") last=bar ;;
+    "-") last=minus ;; "_") last=underscore ;;
+    "=") last=equal ;; "+") last=plus ;;
+    "\`") last=grave ;; "~") last=asciitilde ;;
+    "!") last=exclam ;; "@") last="at" ;;
+    "#") last=numbersign ;; "\$") last=dollar ;;
+    "%") last=percent ;; "^") last=asciicircum ;;
+    "&") last=ampersand ;; "*") last=asterisk ;;
+    esc | escape) last=Escape ;;
+    enter | ret | return) last=Return ;;
+    tab) last=Tab ;;
+    bs | backspace) last=BackSpace ;;
+    del | delete) last=Delete ;;
+    up) last=Up ;; down) last=Down ;; left) last=Left ;; right) last=Right ;;
+    pgup | pageup) last=Prior ;; pgdn | pagedown) last=Next ;;
+    home) last=Home ;; end) last=End ;;
+    esac
+    prefix="${prefix//cmd+/super+}"
+    echo "$prefix$last"
+}
+
+cmd_keys() {
+    require_running
+    (($#)) || die "keys: nothing to send"
+    ensure_focus
+    local arg token tokens=()
+    for arg in "$@"; do
+        # shellcheck disable=SC2206
+        local split=($arg)
+        tokens+=("${split[@]}")
+    done
+    local first=1
+    for token in "${tokens[@]}"; do
+        ((first)) || sleep_ms "$KEY_DELAY_MS"
+        first=0
+        "$XDOTOOL" key --delay 0 "$(map_key "$token")"
+    done
+}
+
+cmd_type() {
+    require_running
+    ensure_focus
+    "$XDOTOOL" type --delay "$TYPE_DELAY_MS" -- "$*"
+}
+
+cmd_click() {
+    require_running
+    local x="${1:?click X Y [BUTTON]}" y="${2:?click X Y [BUTTON]}" button="${3:-1}" repeat="${4:-1}"
+    ensure_focus
+    "$XDOTOOL" mousemove --sync "$x" "$y" click --repeat "$repeat" --delay 80 "$button"
+}
+
+cmd_move() {
+    require_running
+    "$XDOTOOL" mousemove --sync "${1:?move X Y}" "${2:?move X Y}"
+}
+
+cmd_scroll() {
+    require_running
+    local direction="${1:?scroll up|down [N]}" count="${2:-3}" button
+    case "$direction" in
+    up) button=4 ;; down) button=5 ;; left) button=6 ;; right) button=7 ;;
+    *) die "scroll: direction must be up/down/left/right" ;;
+    esac
+    ensure_focus
+    "$XDOTOOL" click --repeat "$count" --delay 30 "$button"
+}
+
+# ---------------------------------------------------------------- output
+
+cmd_shot() {
+    require_running
+    local out="" now=0 crop="" scale=""
+    while (($#)); do
+        case "$1" in
+        --now) now=1; shift ;;
+        --crop) crop="$2"; shift 2 ;;
+        --scale) scale="$2"; shift 2 ;;
+        -*) die "shot: unknown option $1" ;;
+        *) out="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$out" ]]; then
+        mkdir -p "$RUN_DIR/shots"
+        out="$RUN_DIR/shots/shot-$(date +%H%M%S-%3N).png"
+    fi
+    ((now)) || sleep_ms "$SHOT_DELAY_MS"
+    local args=(-window root)
+    [[ -n "$crop" ]] && args+=(-crop "$crop" +repage)
+    [[ -n "$scale" ]] && args+=(-resize "$scale%")
+    "$IMPORT" "${args[@]}" "$out"
+    readlink -f "$out"
+}
+
+# Zed (X11) only offers UTF8_STRING / text/plain targets, while xclip asks for STRING by
+# default, so always name the target explicitly.
+cmd_clip() {
+    require_running
+    local selection=clipboard target=UTF8_STRING
+    while (($#)); do
+        case "$1" in
+        --primary) selection=primary; shift ;;
+        --targets) target=TARGETS; shift ;;
+        --target) target="$2"; shift 2 ;;
+        *) die "clip: unknown option $1" ;;
+        esac
+    done
+    timeout 5 "$XCLIP" -selection "$selection" -o -t "$target"
+}
+
+cmd_clip_set() {
+    require_running
+    # xclip forks a child that serves the selection until another client takes ownership
+    # (it dies with the Xvfb on stop).
+    printf '%s' "$*" | "$XCLIP" -selection clipboard -t UTF8_STRING -i
+}
+
+# Lines of Zed.log written by the current session (Zed logs a banner at every launch).
+session_log() {
+    [[ -f "${LOG_FILE-}" ]] || return 0
+    awk '/========== starting zed/ { n = 0; delete lines } { lines[++n] = $0 } END { for (i = 1; i <= n; i++) print lines[i] }' "$LOG_FILE"
+}
+
+cmd_logs() {
+    load_state 2>/dev/null || die "no state"
+    local lines=60 errors=0 all=0
+    while (($#)); do
+        case "$1" in
+        --errors) errors=1; shift ;;
+        --all) all=1; shift ;;
+        --path) echo "$LOG_FILE"; return ;;
+        [0-9]*) lines="$1"; shift ;;
+        *) die "logs: unknown option $1" ;;
+        esac
+    done
+    if ((errors)); then
+        session_log | grep -E "ERROR|WARN|panic|Panic" | tail -n "$lines" || true
+    elif ((all)); then
+        session_log
+    else
+        session_log | tail -n "$lines"
+    fi
+    if ! alive "${ZED_PID-}" && [[ -s "$RUN_DIR/zed.stdout" ]]; then
+        echo "--- zed.stdout (process not running) ---"
+        tail -n 30 "$RUN_DIR/zed.stdout"
+    fi
+}
+
+cmd_wait_log() {
+    require_running
+    local pattern="${1:?wait-log REGEX [TIMEOUT_S]}" timeout_s="${2:-30}"
+    local deadline=$(($(now_ms) + timeout_s * 1000))
+    while (($(now_ms) < deadline)); do
+        if session_log | grep -E -m1 -- "$pattern"; then
+            return 0
+        fi
+        alive "$ZED_PID" || die "Zed exited"
+        sleep 0.25
+    done
+    die "timed out after ${timeout_s}s waiting for /$pattern/ in Zed.log"
+}
+
+# ---------------------------------------------------------------- misc
+
+cmd_open() {
+    require_running
+    [[ -n "${ZED_CLI-}" ]] || die "no CLI binary next to $ZED_BINARY; open files via the file finder (zh keys ctrl+p; zh type NAME; zh keys Return)"
+    (($#)) || die "open: PATH required"
+    isolated_env
+    # Relative paths are resolved against the workdir (the CLI resolves them against its cwd).
+    (
+        cd "$WORKDIR" 2>/dev/null || cd "$(dirname "$WORKDIR")"
+        exec "${ENV_ARGS[@]}" "$ZED_CLI" --zed "$ZED_BINARY" --existing "$@" </dev/null
+    )
+}
+
+cmd_mkrepo() {
+    local dir="${1:?mkrepo DIR}"
+    [[ -e "$dir/.git" ]] && die "$dir is already a git repo"
+    mkdir -p "$dir"
+    (
+        cd "$dir"
+        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+        git init -q -b main
+        git config user.name "Zed Harness"
+        git config user.email harness@example.invalid
+        mkdir -p src
+        cat >src/main.rs <<'EOF'
+use std::collections::HashMap;
+
+fn main() {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for word in ["alpha", "beta", "alpha", "gamma"] {
+        *counts.entry(word).or_default() += 1;
+    }
+    println!("{counts:?}");
+}
+
+fn helper(value: usize) -> usize {
+    value * 2
+}
+EOF
+        cat >src/lib.rs <<'EOF'
+pub fn add(left: usize, right: usize) -> usize {
+    left + right
+}
+
+pub fn subtract(left: usize, right: usize) -> usize {
+    left - right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_adds() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+EOF
+        printf '# Demo\n\nA scratch repository for the Zed live harness.\n\n- one\n- two\n- three\n' >README.md
+        printf 'obsolete = true\n' >old.toml
+        git add -A
+        git commit -q -m "Initial commit"
+        # Uncommitted changes: modification, addition, deletion, untracked file.
+        cat >src/main.rs <<'EOF'
+use std::collections::HashMap;
+
+fn main() {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for word in ["alpha", "beta", "alpha", "gamma", "delta"] {
+        *counts.entry(word).or_default() += 1;
+    }
+    let total: usize = counts.values().sum();
+    println!("{counts:?} total={total}");
+}
+
+fn helper(value: usize) -> usize {
+    value * 3
+}
+EOF
+        sed -i 's/- two/- two (changed)/' README.md
+        printf '\n## Notes\n\nAdded after the first commit.\n' >>README.md
+        git rm -q old.toml
+        printf 'fn untracked() {}\n' >src/new_file.rs
+    )
+    readlink -f "$dir"
+}
+
+cmd_env() {
+    require_running
+    isolated_env
+    echo "export DISPLAY=:$DISPLAY_NUM"
+    echo "export ZH_WINDOW_ID=$WINDOW_ID"
+    echo "export XDOTOOL=$XDOTOOL XCLIP=$XCLIP IMPORT=$IMPORT"
+    echo "# full isolated environment Zed was started with:"
+    local entry
+    for entry in "${ENV_ARGS[@]:2}"; do
+        printf '#   %q\n' "$entry"
+    done
+}
+
+cmd_path() {
+    load_state 2>/dev/null || true
+    case "${1:-run}" in
+    run) echo "$RUN_DIR" ;;
+    home) echo "$RUN_DIR/home" ;;
+    config) echo "$RUN_DIR/home/.config/zed" ;;
+    data) echo "$RUN_DIR/home/.local/share/zed" ;;
+    log) echo "$RUN_DIR/home/.local/share/zed/logs/Zed.log" ;;
+    shots) echo "$RUN_DIR/shots" ;;
+    *) die "path: one of run|home|config|data|log|shots" ;;
+    esac
+}
+
+cmd_xdo() {
+    require_running
+    "$XDOTOOL" "$@"
+}
+
+main() {
+    local command="${1:-help}"
+    (($#)) && shift
+    case "$command" in
+    start | restart | stop)
+        mkdir -p "$STATE_ROOT"
+        exec 9>"$LOCK"
+        flock -w 30 9 || die "another zh start/stop is in progress"
+        case "$command" in
+        start) cmd_start "$@" ;;
+        restart) stop_processes quiet; cmd_start "$@" ;;
+        stop) cmd_stop "$@" ;;
+        esac
+        ;;
+    status) cmd_status ;;
+    keys | key) cmd_keys "$@" ;;
+    type) cmd_type "$@" ;;
+    click) cmd_click "$@" ;;
+    dblclick) cmd_click "${1:?}" "${2:?}" 1 2 ;;
+    rclick) cmd_click "${1:?}" "${2:?}" 3 ;;
+    move) cmd_move "$@" ;;
+    scroll) cmd_scroll "$@" ;;
+    park) require_running; park_pointer ;;
+    focus) require_running; ensure_focus ;;
+    shot | screenshot) cmd_shot "$@" ;;
+    clip) cmd_clip "$@" ;;
+    clip-set) cmd_clip_set "$@" ;;
+    logs | log) cmd_logs "$@" ;;
+    wait-log) cmd_wait_log "$@" ;;
+    open) cmd_open "$@" ;;
+    mkrepo) cmd_mkrepo "$@" ;;
+    env) cmd_env ;;
+    path) cmd_path "$@" ;;
+    xdo | xdotool) cmd_xdo "$@" ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"
