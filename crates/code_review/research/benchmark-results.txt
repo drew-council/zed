@@ -1,0 +1,10 @@
+# zed build benchmark  2026-10-16T15:14:33-04:00
+# rustc 1.98.1 (48a229cea 2026-09-01)  cpus=16  jobs=4  profile=release-fast(debug=limited)
+clean_build              1210s  (00:20:10)  rc=0  rev=v1.24.2
+leaf_crate_edit            38s  (00:00:38)  rc=0  rev=v1.24.2
+zed_crate_edit             37s  (00:00:37)  rc=0  rev=v1.24.2
+noop                        1s  (00:00:01)  rc=0  rev=v1.24.2
+upstream_bump_1wk         743s  (00:12:23)  rc=0  rev=v1.25.0-pre
+24G	target
+# done 2026-10-16T15:48:23-04:00
+core_editor_edit          277s  (00:04:37)  rc=0  rev=v1.25.0-pre
