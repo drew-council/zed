@@ -1,4 +1,7 @@
+mod diff;
 mod panel;
+mod target;
+mod view;
 
 use anyhow::Context as _;
 use gpui::{App, KeyBinding, actions};
@@ -6,11 +9,17 @@ use settings::{KeybindSource, KeymapFile, KeymapFileLoadResult};
 use util::ResultExt as _;
 use workspace::Workspace;
 
+pub use diff::ReviewDiff;
 pub use panel::ReviewPanel;
+pub use target::ReviewTarget;
+pub use view::ReviewView;
 
 actions!(
     code_review,
     [
+        /// Opens a review of the uncommitted changes (staged and unstaged) in the active
+        /// repository.
+        ReviewUncommitted,
         /// Toggles focus on the review panel.
         ToggleFocus,
     ]
@@ -25,6 +34,7 @@ const VIM_KEYMAP: &str = include_str!("../../../assets/keymaps/code_review_vim.j
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         panel::register(workspace);
+        view::register(workspace);
     })
     .detach();
 }
@@ -63,10 +73,18 @@ fn parse_keymap(content: &str, source: KeybindSource, cx: &App) -> anyhow::Resul
 
 #[cfg(test)]
 pub(crate) fn init_test(cx: &mut gpui::TestAppContext) {
+    use gpui::BorrowAppContext as _;
+
     cx.update(|cx| {
         let store = settings::SettingsStore::test(cx);
         cx.set_global(store);
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.editor.diff_view_style = Some(settings::DiffViewStyle::Unified);
+            });
+        });
         theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
         init(cx);
     });
 }

@@ -15,10 +15,11 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: branch bootstrapped, no feature code yet.** The long-lived fork branch `code-review`
-exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits (`.rules` pointer, this
-directory, the README banner). The fork's `main` is untouched and equals upstream `main`. The dev
-loop below is verified. Next: milestone 1 (§6).
+**Status: milestone 1 (walking skeleton) done.** The long-lived fork branch `code-review` exists
+locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is untouched
+and equals upstream `main`. `code_review::ReviewUncommitted` opens a read-only review tab of HEAD →
+working tree over real project buffers; an empty review panel sits in the left dock. Next:
+milestone 2 (§6).
 
 What exists:
 
@@ -26,11 +27,64 @@ What exists:
 |---|---|
 | branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
+| `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), actions `ReviewUncommitted` / `ToggleFocus`, keymap loading helpers, shared `init_test` |
+| `crates/code_review/src/target.rs` | `ReviewTarget` (only `Uncommitted` so far): title, empty-state label |
+| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by `DiffBufferList`; `ReviewTarget` → `DiffBase` mapping (`diff_base`) |
+| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `ReviewView::deploy`, GPUI tests |
+| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock, empty placeholder) |
+| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim one empty for now) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
+| `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks |
 | `target/` (gitignored) | **Warm build cache** (see §8.3): `release-fast` for `-p zed` plus `debug` test artifacts, 43 GB |
 | `.rules` ("Drew's Zed fork" section) | Pointer to this file for agent sessions (`CLAUDE.md`/`AGENTS.md` symlink to it) |
 | `README.md` first two lines | `> [!IMPORTANT]` banner required by the `.rules` HARD RULE; never remove it (the user does) |
+
+Upstream glue so far (all append-style, §3.10): root `Cargo.toml` (member + workspace dep),
+`crates/zed/Cargo.toml` (dep), `crates/zed/src/main.rs` (`code_review::init` after `git_ui::init`),
+`crates/zed/src/zed.rs` (`ReviewPanel::load` in `initialize_panels`; `code_review::key_bindings`
+after the base keymap and `code_review::vim_key_bindings` right after `vim.json` in
+`load_default_keymap`; `"code_review"` in `test_action_namespaces`). Core patch #1 not applied yet.
+
+**Implementation decisions (milestone 1)** — implementation details, not user questions:
+
+- Keymaps are `include_str!`-embedded by `code_review` (`key_bindings` / `vim_key_bindings`) instead
+  of read through `settings::SettingsAssets`: rust-embed (release builds) doesn't notice new files,
+  and each edit of an embedded keymap would rebuild `settings` and everything downstream. Current
+  bindings (vim only): `; h` in the review editor's normal mode and `; l` in the panel →
+  `code_review::ToggleFocus` (§2.5 `;h`/`;l`, approximated by toggle-focus until the panel exists).
+- `ReviewDiff` drops from `DiffMultibuffer`: conflict UI, git-panel coupling, upstream's
+  `diff-review` button/comment count, `GitPanelSettings` sorting, folding of deleted/untracked files
+  (folding is reserved for reviewed marks, §3.7), and `move_to_path`/`pending_scroll` (copy them
+  back from `git_ui/src/diff_multibuffer.rs` when the panel needs scroll-to-file).
+- Hunk renderer `HiddenUnstagedDiffHunkRenderer`: no stage/restore controls, staged and unstaged
+  hunks drawn alike. Read-only = `MultiBuffer::new(Capability::ReadOnly)` + `rhs.set_read_only(true)`
+  (the split LHS is read-only by construction). Note `set_diff_hunk_renderer(None)` collapses hunks.
+- File order: Zed's git-panel tree order (directories before files at each level; `PathKey` sort
+  prefix 0 + NUL-prefixed directory components). tuicr lists a directory's files before its
+  subdirectories — revisit with the panel (M4) if the user prefers that.
+- The repository is fixed when a review opens (the active repository); `deploy` reuses an open tab
+  with the same target and repository. No repository → auto-hiding toast, nothing opens.
+- `ReviewView`: `Item::capability` = `ReadOnly` (tab tooltip "Read-Only Tab"); `act_as_type` → self,
+  `Editor` (RHS), `SplittableEditor`, `ReviewDiff`; `as_searchable` → the `SplittableEditor`;
+  `can_split`; `is_dirty`/`can_save` false; not a `SerializableItem` yet, so review tabs don't come
+  back after a restart (needs persisted targets).
+- `ReviewPanel`: left dock only (`position_is_valid`), since no setting persists a move;
+  `activation_priority` 4 (must be unique per dock: debug builds panic on duplicates, `dock.rs:786`);
+  icon `ListTodo`, always shown; `persistent_name` "Review Panel", `panel_key` "ReviewPanel".
+
+**Known issues / notes for the next slices:**
+
+- Saving: for an active item whose `capability` isn't editable, the workspace doesn't register
+  `workspace::Save` (`workspace.rs:8065-8100`) and `save_item` returns early for save intents
+  (`pane.rs:2276`). The comments milestone (`:w` / `ctrl-s` saving drafts, §3.5) must make the
+  capability editable or route saving differently.
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`), clippy. `cargo test -p code_review`:
+  5 tests, stable under `ITERATIONS=30`.
+- DESIGN's file:line pointers checked on `v1.25.0-pre` for this slice (`diff_buffer_list.rs`,
+  `diff_multibuffer.rs`, `split.rs:1192`, `git_store.rs`, `zed.rs`, `main.rs`) match within a line or
+  two. `git_ui` on the tag also has `staged_diff.rs` — a read-only `DiffMultibuffer` item, the
+  closest template to `ReviewView`.
 
 **Decisions** (made by the user, 2026-10-16; don't ask again):
 
