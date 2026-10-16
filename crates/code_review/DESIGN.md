@@ -7,37 +7,97 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 > **Line numbers** in this file refer to Zed commit `2d4c4831943153f63ad0aeddf49c8f5a3d008e75`
 > (main, 2026-10-16, version 1.26.0-dev) — the fork's `main` at the time of writing. Re-verify
-> after rebasing. tuicr references are to `~/personal/tuicr` branch `bizmythy-tweaks` @ `5ea82dc`
+> after rebasing. The `code-review` branch is based on `v1.25.0-pre`, 43 upstream commits behind
+> that commit, so expect small drift there too. tuicr references are to `~/personal/tuicr` branch `bizmythy-tweaks` @ `5ea82dc`
 > (upstream v0.27.0 + the user's fork commits).
 
 ---
 
 ## 0. Status & how to resume
 
-**Status: design complete, nothing implemented.** No code exists yet besides this directory
-(`DESIGN.md`, `research/`). Nothing is committed; the fork's working tree is otherwise clean on
-`main`.
+**Status: branch bootstrapped, no feature code yet.** The long-lived fork branch `code-review`
+exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits (`.rules` pointer, this
+directory, the README banner). The fork's `main` is untouched and equals upstream `main`. The dev
+loop below is verified. Next: milestone 1 (§6).
 
 What exists:
 
 | Path | What |
 |---|---|
+| branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
-| `target/` (gitignored) | **Warm build cache**, 24 GB, moved in from the benchmark clone (see §8.3) |
+| `target/` (gitignored) | **Warm build cache** (see §8.3): `release-fast` for `-p zed` plus `debug` test artifacts, 43 GB |
 | `.rules` ("Drew's Zed fork" section) | Pointer to this file for agent sessions (`CLAUDE.md`/`AGENTS.md` symlink to it) |
+| `README.md` first two lines | `> [!IMPORTANT]` banner required by the `.rules` HARD RULE; never remove it (the user does) |
+
+**Decisions** (made by the user, 2026-10-16; don't ask again):
+
+- Branch: **`code-review`**, one long-lived branch rebased onto each upstream stable tag (§2.1).
+- Base: **`v1.25.0-pre`** (`aa9c16803d`) for now, because it matches the warm `target/` cache. Rebase
+  onto `v1.25.0` once that stable tag ships; until then `crates/zed/RELEASE_CHANNEL` is `preview`.
+- Agent build cap: **`-j8` under `nice -n 10`** for every cargo invocation. Never run cargo without
+  these limits. This applies to agent sessions only; the Nix package build stays uncapped (§2.1).
 
 **Before writing code, the next agent should:**
 
 1. Read this whole file, then skim the tuicr UX it ports (§9) — tuicr is a *UX reference only*.
-2. Ask the user (it was not decided) what the long-lived fork branch should be called and which
-   stable tag to start from (decision: track upstream **stable tags**, not main — §2.1). The fork's
-   `main` currently equals upstream `main`.
+2. Work on `code-review`; never commit fork work to `main`; don't push unless asked.
 3. Follow the milestones in §6. Milestone 1 is a walking skeleton; keep each milestone shippable.
-4. When building inside an agent session, **ask the user about CPU limits first** — during the
-   design session they capped agent builds at 4 jobs (`cargo build -j4`, low priority) because other
-   work was running. That cap was for the session, not the product's build setup.
+4. Use the dev loop below.
+
+**Dev loop** (verified 2026-10-16 on `code-review`, Ryzen 7 7800X3D, `-j8`, `nice -n 10`):
+
+- **Devshell:** wrap every command in `direnv exec /home/drew/personal/zed …`. It loads
+  nix-direnv's cached profile (instant; no Nix evaluation unless `flake.nix`/`flake.lock`/`.envrc`
+  change) and works whether or not the calling shell already has direnv's env. `cargo` there is the
+  devshell wrapper (`script/cargo`, adds `--timings`), which is fine. **Don't** use
+  `nix develop -c …`: the devshell includes a crane build of `docs_preprocessor` whose source is all
+  of `crates/` (`nix/modules/devshells.nix`, `nix/build.nix` `mkIncludeFilter`), so after any edit
+  Nix would rebuild it, uncapped (and all of Zed's deps if a `Cargo.toml`/`Cargo.lock` changed).
+  The same happens once via direnv when a rebase changes `flake.lock`.
+- **Build & run** (the warm-cache profile):
+
+  ```sh
+  direnv exec /home/drew/personal/zed env CARGO_PROFILE_RELEASE_FAST_DEBUG=limited \
+    nice -n 10 cargo build -j8 --profile release-fast -p zed
+  ./target/release-fast/zed
+  ```
+
+- **Type-check a crate:** run the same `-p zed` build. Every crate we touch is in `zed`'s graph,
+  errors show before the link step, and only the `-p zed` selection hits the warm cache. **Don't**
+  `cargo build/check --profile release-fast -p <crate>`: there is no workspace-hack crate, so a
+  different `-p` selection resolves different features and recompiles third-party crates (`-p
+  go_to_line` started recompiling `proc-macro2`, `syn`, `serde_json`, … and was stopped after 181
+  crates). `cargo check` never reuses `build` artifacts, so it is cold for the whole graph (not
+  measured).
+- **Tests:** default `test` profile, like upstream CI (`cargo nextest run`). `--profile release-fast`
+  buys nothing: test-support dev-dependency features change the hashes of gpui/editor/project…, so
+  most of the closure rebuilds anyway, at opt-level 3.
+
+  ```sh
+  direnv exec /home/drew/personal/zed nice -n 10 cargo test -j8 -p <crate>
+  # nextest (uses .config/nextest.toml timeouts); its -j is test threads, the build cap is --build-jobs:
+  direnv exec /home/drew/personal/zed nice -n 10 cargo nextest run --build-jobs 8 -p <crate>
+  ```
+
+- **Clippy:** `direnv exec /home/drew/personal/zed nice -n 10 ./script/clippy -p code_review -j8`
+  (runs `--release --all-targets --all-features`, a separate check-mode build that is cold the first
+  time; not run yet).
+
+| Step | Time |
+|---|---|
+| First `-p zed` build on the branch (189 crates: workspace crates + 6 third-party in the webrtc/livekit chain) | 6m05s |
+| No-op `-p zed` build | 2s |
+| Leaf crate edit (`journal` + `go_to_line` touched) → `-p zed` | 22s |
+| First `cargo test -p go_to_line` (cold `test` profile, 688 crates, +11 GB) → 9 GPUI tests pass in 0.7s | 2m27s |
+| Re-run after touching the crate (`cargo test` / `cargo nextest run`) | 4s / 3s |
+| Then `cargo test -p git_ui --no-run` (131 crates recompiled, 53 third-party, because features differ per `-p`; +8 GB) | 1m22s |
+
+Cosmetic quirk: the cached devshell was evaluated on `main`, so it exports
+`ZED_COMMIT_SHA=2d4c483…` and builds report main's SHA (`crates/zed/build.rs` prefers the env var
+over `git rev-parse HEAD`).
 
 **Working agreements with the user** (learned the hard way — follow these):
 
@@ -556,13 +616,9 @@ cap); the user's normal builds use all cores.
 `~/personal/zed/target/` contains the benchmark's artifacts for `--profile release-fast` with
 `CARGO_PROFILE_RELEASE_FAST_DEBUG=limited`, built from a clone of v1.25.0-pre inside the Zed devshell.
 Third-party crates (the bulk of the 20-min clean build) should be reused **only if you build with the
-same profile, the same env var, and the same devshell**; workspace crates will recompile once (their
-package IDs include the old checkout path). Example dev loop:
-
-```sh
-CARGO_PROFILE_RELEASE_FAST_DEBUG=limited cargo build --profile release-fast -p zed
-./target/release-fast/zed      # or cargo run …
-```
+same profile, the same env var, and the same devshell**; workspace crates recompiled once on the
+`code-review` branch (6m05s at `-j8`, their package IDs include the old checkout path). The
+verified, CPU-capped commands are in §0 ("Dev loop").
 
 If you choose a different profile (e.g. `dev`), the cache gives nothing; delete stale dirs with
 `cargo clean --profile release-fast` when disk matters.

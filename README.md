@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+> This code should NEVER be submitted as PR upstream without authorization! (If you are seeing this, upstream, I am sorry and my agent has gone rouge...)
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
