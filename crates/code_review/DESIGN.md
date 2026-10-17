@@ -15,8 +15,11 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: implementation complete, ready for final validation.** Milestones 1–9 and polish A/B
-are done; next is the final validation (`plans/FINAL-validation.md`, orchestrator's state dir).
+**Status: implementation complete; final validation done, its FAILs being fixed.** Milestones 1–9
+and polish A/B are done, and so is the final validation (`plans/FINAL-validation.md`,
+`validation/FINAL/` in the orchestrator's state dir). Fix 1 (slices A and B of
+`plans/FIX-final-validation.md`: every FAIL) is done (see "Fix 1"); slice C (cheap polish from the
+validators' observations) is next.
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -461,7 +464,9 @@ state dir):**
 - **Focus return**: to the diff editor the comment was opened from (else the focused side), with the
   selection collapsed to the cursor row (vim normal mode); a one-shot `on_focus` guard re-focuses it
   after the editor's own `handle_focus` re-focused a stale `last_focused_descendant` (palette leaves).
-- **Types**: `tab`/`shift-tab` in the editor's vim normal mode (insert-mode `tab` is text), untyped →
+- **Types**: `tab`/`shift-tab` in the editor's vim normal mode (insert-mode `tab` is text: Zed's
+  indent, soft-tab spaces per the user's editor settings rather than a tab character, as Zed does;
+  V3.11, accepted by the orchestrator after the final validation), untyped →
   Issue → Suggestion → Note → Praise → untyped; changed at once (`:q!` keeps the type). Badge + left
   accent: Issue error, Suggestion info, Note warning, Praise success colors.
 - **Comment at the cursor** (`i`, `Enter`, `dd`; its card gets the focused border): the one `]t`/`[t`
@@ -472,9 +477,11 @@ state dir):**
   replays it without vim's operator context, which broke the blocked `d u`/`d o` staging keys. Asks
   "Delete this comment?" (first line as detail).
 - **`]t`/`[t`, `m`/`M`** (`m`/`M` give up vim's marks and `WindowMiddle` in the review tab, per §2.5):
-  line and file comments in diff order (file, file comments first, then last line, then id), wrapping;
+  line and file comments in diff order (file, file comments first, then last line, then id; since
+  fix 1 old lines facing the same new line go by their old line before the id), wrapping;
   review-level comments, filtered files and lines outside every excerpt are skipped; single-file mode
-  switches files; folded files unfold. From a plain row, a comment below that row is the next one.
+  switches files; folded files unfold (fix 1: their line comments and threads count too). From a
+  plain row, a comment below that row is the next one.
 - **Review-level comments** (`;c`): a "Review comments" section in `ReviewTopBlock` after the branch /
   commit part (scrolls past 16 lines). Every non-editing card has edit/delete buttons (the only
   keyboard-free way to reach review-level comments until the panel list).
@@ -1492,6 +1499,66 @@ in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs`
   the destination below the top block, over the file header. No errors in the log beyond the known
   noise.
 
+**Fix 1 (the final validation's FAILs: `plans/FIX-final-validation.md` slices A and B)** —
+`validation/FINAL/FAILS.md` in the orchestrator's state dir. No upstream edits:
+
+- **Focus lost after a split clone closes, or after the focused left side goes away** (V2.15+,
+  V7.X1). `ReviewDiff`'s container (`track_focus`, the empty state's focus) could end up focused
+  while the diff wasn't empty, outside every editor: no vim keys, no `editor:` palette actions, a
+  frozen or missing mode indicator. (a) A review that gets the focus while it loads (opened from the
+  palette, the panel, `; l`) leaves its pane's `last_focus_handle_by_item` on the container, and
+  focusing that pane again (closing a split clone, `force_remove_pane`) restores it. (b) Unsplitting
+  while the left side is focused (`ToggleSplitDiff`, a pane getting too narrow) drops the focused
+  editor, and GPUI's focus-lost fallback focuses the nearest focusable ancestor, the container,
+  without a redraw. The container now forwards the focus to the editor when it is focused with a
+  non-empty diff (`on_focus`, route a) and when the focus-lost fallback lands on it (`on_focus_lost`,
+  registered after the workspace's, plus a next-frame notify so vim's indicator updates, route b).
+  The comment editors' focus guard holds its handle weakly. The fold the V2 validator correlated
+  with the bug is incidental: the regression test fails the same with and without it; what matters
+  is opening the review from outside its pane (the validator's passing controls had re-recorded the
+  editor through palette/panel round trips). Upstream `git_ui`'s `DiffMultibuffer` has the same
+  latent gap.
+- **`ctrl-w h` after a split toggle or a resize jumped to the end of the review** (V7.X2). Each split
+  creates a new left side whose cursor upstream only mirrors from the right side when the right
+  cursor moves. `LineCursor` now puts a new left side's cursor on the row facing the right cursor
+  (`selections.change_with`, so no selection effects and nothing mirrors back).
+- **`]t`/`[t`/`m`/`M` skipped the line comments and threads of reviewed (folded) files** (V3.15):
+  `comment_order` used the placement check, which leaves folded files out. It now only needs the
+  row in an excerpt (`line_row_in_excerpts`); landing unfolds the file as before.
+- **Unified placement of an old-side comment on the unchanged row right after a pure deletion**
+  (V7.X3): the row's anchor was left-biased and resolved to the removed rows at the same place, so
+  the card sat under the red row. It is right-biased now, and `]t` orders old lines facing the same
+  new line by their old line.
+- **Filter counts** (V2.08): generated/vendored files hidden by `.gitattributes` count as such
+  before the include/exclude patterns ("include src · 3 filtered out · 1 generated hidden · 1
+  vendored hidden"), and "All N changed files are hidden" counts the files the attribute filters
+  don't hide (all of them when that is none).
+- **Line breaks** (V3.02): comment cards, review threads, the pull request's description and review
+  summaries, and (agent decision, same text going to GitHub) the submit modal's review body render
+  a line break as a line break, as GitHub does (`comments::comment_markdown_style`,
+  `soft_break_as_hard_break`). Commit messages keep CommonMark.
+- **Panel comment rows** (V3.17/V4.O5): the location takes its full width (up to the row's) and the
+  first line gets the rest, instead of the location being capped at 60% of a row sized to its
+  content.
+- **`e` on a removed row of a unified snapshot** (V1.F1) opens the working-tree file at the removed
+  line (the path now comes from the row's file, `path_at_cursor`; the row stays the old one, as on
+  the left side).
+- Tests: 7 new (191 total + 1 ignored; the new and extended ones stable under `ITERATIONS=5`), each
+  red before its fix: closing a split clone opened from the panel (with and without a fold), the
+  focused left side dropped by a resize and by `ToggleSplitDiff`, an old-side comment after a pure
+  deletion (placement and `]t` order), multi-line card height, the panel location width
+  (`debug_bounds`), `e` on a removed row of a snapshot. Extended: `test_split_mirrors_cursor_row`
+  (`ctrl-w h` after toggles and a resize), `test_comment_navigation` (`[t`/`M`/`]t`/`m` into a
+  folded file), `test_filters_and_search` (counts, the all-hidden label). Clippy (`-p code_review`)
+  clean.
+- **Live check** (harness, `validation/FINAL/fix1/`, the V7 fixture in `fix1/fx`): V2.15+ ×4 (`:q`
+  and `ctrl-w q` after `r` folded the original's file from the clone, without a fold, and right
+  after a click), V7.X1 (palette toggle and narrowing after the narrow/type/widen/save sequence),
+  V7.X2 (toggle ×2 and narrow/widen, then `ctrl-w h`), V3.15 (`]t`, `[t`, `M`, `m` into folded
+  lib.rs), V7.X3, V2.08, V3.02, V3.17, V1.F1: all PASS; closing two split clones one by one still
+  keeps the focus. The relative line numbers after closing a clone (V2.O6) looked right in these
+  runs. No new log errors.
+
 **Known issues / notes for the next slices:**
 
 - **Notes for the final validation (V6)**:
@@ -1517,8 +1584,12 @@ in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs`
   stored numbers are the last mover's.
 - Split view: a block below a *changed* row is still mirrored below the start of its hunk, so rows inside
   a multi-row hunk don't face each other until the hunk ends; a block below the last unchanged row of an
-  excerpt is mirrored above the facing row (no next row to anchor to). Both are upstream
-  `balancing_block` behaviour.
+  excerpt is mirrored above the facing row (no next row to anchor to); a comment on the unchanged row
+  right above a pure deletion is drawn after the deletion's spacer on the right side, so it reads as
+  belonging to the next row (V8.O2: `block_below_row` picks `Above(next row)`, which on the right side
+  comes after the spacer). All are upstream `balancing_block` behaviour (`editor/src/display_map/
+  block_map.rs`); the fix needs core (candidate core patch #4: mirror `Below` as `Below` for
+  unchanged rows, which would retire all three).
 - Harness: `zh type` turns newlines into a key that isn't Enter for Zed; use `zh keys Return`.
 - Upstream quirks seen live: vim relative line numbers apply to the focused side only and count across
   file sections; on the LHS the current line shows 0 instead of its number; after toggling soft wrap in
@@ -1528,8 +1599,8 @@ in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs`
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (polish B). `cargo test -p code_review`: 184 tests + 1 ignored live
-  GitHub test (after polish B; 180 after polish A; 166 after
+  `cargo test -p cli`: 8 passed (polish B). `cargo test -p code_review`: 191 tests + 1 ignored live
+  GitHub test (after fix 1; 184 after polish B; 180 after polish A; 166 after
   M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
