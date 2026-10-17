@@ -15,12 +15,15 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: implementation complete; final validation done and its findings fixed.** Milestones 1–9
-and polish A/B are done, and so is the final validation (`plans/FINAL-validation.md`,
-`validation/FINAL/` in the orchestrator's state dir). Fix 1 (slices A and B of
-`plans/FIX-final-validation.md`: every FAIL) and fix 2 (slice C plus the orchestrator's additions:
-the validators' cheap observations) are done (see "Fix 1" and "Fix 2"); what is left of the
-observations is under "Known issues".
+**Status: implementation complete; final live validation passed (see
+`crates/code_review/research/final-validation/`).** Milestones 1–9 and polish A/B are done, and so
+is the final validation: eight sessions over its checklist (`research/final-validation/
+CHECKLIST.md`), fix 1 (slices A and B of `plans/FIX-final-validation.md`: every FAIL), fix 2 (slice
+C plus the orchestrator's additions: the validators' cheap observations), two regression sweeps of
+the fixed build (R1, local reviews: 74/74; R2, pull requests and the CLI: 48/50, one
+upstream-inherited FAIL and one known issue) and fix 3 (the sweeps' last cheap findings, see "Fix
+1", "Fix 2" and "Fix 3"; per-session counts in `research/final-validation/SUMMARY.md`). What is
+left of the observations is under "Known issues".
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -108,6 +111,8 @@ What exists:
 | `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); GPUI tests |
 | `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
+| `crates/code_review/research/github-api-live-verification.md` | M7's live GitHub API probes against the sandbox repository (payload shapes, line/side rules, error texts, pending reviews, the sandbox's PRs and its reset recipe), the source of §4's and `submit.rs`'s rules |
+| `crates/code_review/research/final-validation/` | The final live validation: `CHECKLIST.md` (sessions V1–V8 as run, with their setup) and `SUMMARY.md` (results per session, the fixes they led to, the sweeps R1/R2) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
 | `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks. M8: `zh cli [-C DIR] ARGS` runs the fork's CLI against the isolated instance only |
 | `.claude/skills/rebase-code-review/SKILL.md` | M9: the fork rebase procedure (§2.1) as a Claude Code project skill: exact old tag, backup, per-commit keep/adapt/drop, the conflict table for every upstream file the fork touches, `range-diff`, capped build/tests and a Nix evaluation, DESIGN refresh, push only after the user confirms |
@@ -1641,6 +1646,36 @@ orchestrator's additions)** — upstream edits: one appended help paragraph in `
   window activation (no window manager in the harness; GPUI test). Sandbox writes: that review; PR
   C reset to **#12**. Token leak grep clean.
 
+**Fix 3 (the regression sweeps' last cheap findings: R1 O1/O5, R2 KNOWN/O2)** — no upstream edits:
+
+- **Panel selection on the left side** (R2, V2.O5/V4.O7): landing on an item of the other side of a
+  split diff (`]t` from engine.rs "Old line 193" on the left side to filters.rs 20–25 on PR A)
+  moves that side's cursor and focuses it before `SplittableEditor` switches its last focused side
+  (on the next frame), so `ReviewDiff` didn't count either selection change as the diff's and the
+  panel stayed on the previous file. A selection change counts while either side has the focus; the
+  mirrored cursor of the side left behind changes last and names the new file.
+- **Panel header with a second repository** (R1 O1): review tabs subscribe to the `GitStore`'s
+  `RepositoryAdded`/`RepositoryRemoved` and re-title themselves (`TitleChanged` + notify), which the
+  panel observes, so its header names the repository at once.
+- **`r` at the top** (R1 O5): `r` moves to the next file with its header at the top and folds the
+  file; from the very top that scrolled the folded header out of view. A view at y = 0 stays at the
+  top when the cursor's new row fits with the scroll margin (`comments::stay_at_start`).
+- **The review just posted** (R2 O2): `PullRequestState` remembers the posted review's URL; once its
+  summary is loaded each tab's top block scrolls its 8-line description block to it (once; tabs
+  opened afterwards start at the description). Decision: chosen over listing the newest summaries
+  first, which would differ from GitHub's order.
+- Tests: 3 new (201 total + 1 ignored), each red without its fix: `]t` across sides with the panel
+  (both directions), a repository added after a review opened, `g g r` at the top; extended:
+  `test_submit_a_pull_request_review` (the description block scrolls to the posted summary). Stable
+  under `ITERATIONS=5`. Clippy (`-p code_review`) clean.
+- **Live check** (harness, `validation/FINAL/fix3/`): all four PASS: PR A `]t` from Old line 193
+  to filters.rs 20–25 (panel on filters.rs) and a local left-side → right-side → left-side round
+  trip; adding `repo2` renames the panel header with the tab; `g g r` keeps main.go's folded header
+  and strings.rs in view (`r` further down unchanged); one Comment review on PR C #13 shows its
+  summary under "Reviews" without scrolling (gh: one COMMENTED review), then `new-pr-c` → **#15**.
+  Smoke (uncommitted, branch, PR A: `j`/`k`/`]f`/`]c`/`]t`, a comment on each side, `y`): no
+  regressions; logs only the usual noise. Token leak grep clean.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -1649,15 +1684,37 @@ orchestrator's additions)** — upstream edits: one appended help paragraph in `
   view (V7.O1); sticky headers are narrower than the editor (V7.O5); the cursor row can sit under
   the sticky header after a split toggle (V7.O6); the status bar `line:col` goes stale after an
   external edit (V3.O4); the horizontal scrollbar thumb stays visible (V1.O5); `app_will_quit`
-  timeouts on quit, also without review tabs (V3.O1/V7.O4); palette recency ranking with no non-vim
-  review keymap (V8.O1, by design); non-vim character selections are invisible (V8.O3); a visual
-  `y` across a file boundary copies the last file's rows (V3.O3); the header strip peeks out under a
-  tall top block (V3.O6); `[t` visits the file comment first (V3.O7); Review in Worktree replaces
-  the workspace (V4.O8); two `zed://review` links in one request: only the last opens (V6.O2,
-  upstream `OpenRequest` keeps one kind); `R` on a folded header gives the generic toast (V2.O3); a
-  thread posted on a previous head shows as moved until GitHub re-anchors it (V5.O6). The panel
-  selection following one `]t` across files (V2.O5/V4.O7) and stale relative line numbers after
-  closing a clone (V2.O6) weren't seen again.
+  timeouts on quit, also without review tabs (V3.O1/V7.O4); non-vim character selections are
+  invisible (V8.O3); a visual `y` across a file boundary copies the last file's rows (V3.O3); the
+  header strip peeks out under a tall top block (V3.O6); `[t` visits the file comment first
+  (V3.O7); Review in Worktree replaces the workspace (V4.O8); two `zed://review` links in one
+  request: only the last opens (V6.O2, upstream `OpenRequest` keeps one kind); `R` on a folded
+  header gives the generic toast (V2.O3); a thread posted on a previous head shows as moved until
+  GitHub re-anchors it (V5.O6). Stale relative line numbers after closing a clone (V2.O6) weren't
+  seen again.
+- **Non-vim users and the palette** (V8.O1, by design): the review tab's keys are vim-only (no
+  default non-vim bindings, which would clash with the base keymaps), so non-vim users reach the
+  review actions through the command palette, and its recency ranking is a trap there: once
+  "code_review: add review comment" has been used, typing "add comment" ranks it above "code_review:
+  add comment" and Return adds a review comment instead of a line comment. Read the highlighted row,
+  or bind the actions in the user keymap.
+- **Deleted file, stale buffer** (R2 N1, upstream-inherited): a file deleted on disk while a review
+  holds its buffer (a checkout that deletes it, `rm`) keeps showing the buffer's old text as its new
+  side ("+1 −0" instead of its rows removed) until every tab holding the buffer closes; Zed's own
+  `git: diff` does the same. GitHub's comment gate still refuses lines GitHub's diff doesn't have,
+  so no wrong comment is posted. Possible fix here: treat a buffer whose file is deleted as empty
+  for the new side.
+- **Refused `c`, then typing** (R2 O1, vim semantics): when `c` is refused by a toast (for example
+  "Check out the pull request's head … to comment on its lines"), the text typed next runs as
+  normal-mode commands (`e` opens the file, `s` substitutes; autosave then writes the edit). Inherent
+  to modal editing; a blocking hint or swallowing keys until Escape would be safer.
+- **Seen in the R1 sweep, upstream or by design**: `ctrl-u` back to the very top leaves the cursor
+  three rows into the first file (vim's scroll clamps the cursor to the scroll margin below the
+  header block; R1 O2); V3.O7 above reads like a dead key right after `r` (`r r M`: the first `M`
+  lands on the file comment at the cursor; R1 O3); vim `/pattern` with the cursor below the last
+  match picks the last match instead of wrapping, as in a plain Zed editor (R1 O4); clicking a file
+  header outside its chevron or checkbox folds the file without reviewing it, Zed's header click
+  (R1 O6).
 
 - **Notes for the final validation (V6)**:
   - Build with `-p zed -p cli` before `zh start` (the harness finds `target/release-fast/cli` at
@@ -1668,8 +1725,8 @@ orchestrator's additions)** — upstream edits: one appended help paragraph in `
   - Change Base's picker preselects `origin/main` when typing `main`: press Down for the local `main`.
   - `--review` lands in the *active* window among those with the repository open (GPUI's active
     window, which `-n` doesn't always change without a window manager).
-  - Sandbox (after fix 2): PR A #1 (read-only), PR C **#12** (own, clean; #11 closed by fix 2), PR B
-    **#10** (bot, clean), PR D #4 (API probes); the harness clone is on `feature/template-filters`.
+  - Sandbox (after fix 3): PR A #1 (read-only), PR C **#15** (own, clean; #13 closed by fix 3), PR B
+    **#14** (bot, clean), PR D #4 (API probes).
   - `zh keys`/`click` always refocus the window `zh` started with: when a CLI request opens a second
     window, the keys still go to the first one (it typed a draft into the PR tab once). Close the
     first window (`ctrl+shift+w`) or drive the second with `zh xdo`.
@@ -1697,9 +1754,9 @@ orchestrator's additions)** — upstream edits: one appended help paragraph in `
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 198 tests + 1 ignored live
-  GitHub test (after fix 2; 191 after fix 1; 184 after polish B; 180 after polish A; 166 after
-  M8; 152 after M7 slice d, 136
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 201 tests + 1 ignored live
+  GitHub test (after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
+  A; 166 after M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
   `ITERATIONS=5`; the hardening-2 comment tests under `ITERATIONS=10`).
