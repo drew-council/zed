@@ -33,6 +33,18 @@ actions!(
         ScrollLeft,
         /// Scrolls the review diff right.
         ScrollRight,
+        /// Moves to the first line of the next file in the review.
+        NextFile,
+        /// Moves to the first line of the previous file in the review.
+        PreviousFile,
+        /// Moves to the next file not marked as reviewed, wrapping around.
+        NextUnreviewedFile,
+        /// Moves to the previous file not marked as reviewed, wrapping around.
+        PreviousUnreviewedFile,
+        /// Shows only the file at the cursor, or all files again.
+        ToggleSingleFileMode,
+        /// Opens the file at the cursor line in a regular editor.
+        OpenFileAtCursor,
     ]
 );
 
@@ -107,6 +119,9 @@ pub(crate) mod test_support {
         Action as _, AppContext as _, BorrowAppContext as _, Entity, TestAppContext,
         VisualContext as _, VisualTestContext,
     };
+    use editor::{Editor, SelectionEffects, SplittableEditor};
+    use language::Point;
+    use multi_buffer::MultiBufferRow;
     use project::{FakeFs, Project};
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
@@ -149,6 +164,74 @@ pub(crate) mod test_support {
             let panel = cx.new(|cx| ReviewPanel::new(workspace, window, cx));
             workspace.add_panel(panel.clone(), window, cx);
             panel
+        })
+    }
+
+    pub(crate) fn splittable(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<SplittableEditor> {
+        review.read_with(cx, |review, cx| review.diff().read(cx).editor().clone())
+    }
+
+    pub(crate) fn rhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
+        splittable(review, cx).read_with(cx, |editor, _| editor.rhs_editor().clone())
+    }
+
+    pub(crate) fn lhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
+        splittable(review, cx).read_with(cx, |editor, _| editor.lhs_editor().unwrap().clone())
+    }
+
+    pub(crate) fn cursor_point(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Point {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).head()
+        })
+    }
+
+    pub(crate) fn row_text(editor: &Entity<Editor>, row: u32, cx: &mut VisualTestContext) -> String {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+            snapshot.text_for_range(Point::new(row, 0)..end).collect()
+        })
+    }
+
+    pub(crate) fn move_to_row_with_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestContext) -> u32 {
+        let row = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            (0..=snapshot.max_row().0)
+                .find(|row| {
+                    let end = Point::new(*row, snapshot.line_len(MultiBufferRow(*row)));
+                    snapshot
+                        .text_for_range(Point::new(*row, 0)..end)
+                        .collect::<String>()
+                        == text
+                })
+                .unwrap()
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)])
+            });
+        });
+        cx.run_until_parked();
+        row
+    }
+
+    pub(crate) fn cursor_line(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
+        let row = cursor_point(editor, cx).row;
+        row_text(editor, row, cx)
+    }
+
+    /// The worktree path of the file under the cursor.
+    pub(crate) fn path_at_cursor(
+        review: &Entity<ReviewView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<String> {
+        review.read_with(cx, |review, cx| {
+            review
+                .diff()
+                .read(cx)
+                .path_at_cursor(cx)
+                .map(|path_key| path_key.path.as_unix_str().to_string())
         })
     }
 

@@ -49,6 +49,14 @@
   {
     "context": "CodeReview > Editor && mode == full && vim_mode == normal && !menu",
     "bindings": {
+      "] f": "code_review::NextFile",
+      "[ f": "code_review::PreviousFile",
+      "}": "code_review::NextFile",
+      "{": "code_review::PreviousFile",
+      "] u": "code_review::NextUnreviewedFile",
+      "[ u": "code_review::PreviousUnreviewedFile",
+      "e": "code_review::OpenFileAtCursor",
+      "; f": "code_review::ToggleSingleFileMode",
       "; e": "code_review::TogglePanel",
       "; h": "code_review::FocusPanel",
       "; l": "code_review::FocusDiff",

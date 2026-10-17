@@ -295,9 +295,9 @@ fn deleted_row_color(cx: &App) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ReviewView,
-        test_support::{add_review_panel, open_review_fixture},
+    use crate::test_support::{
+        add_review_panel, cursor_point, lhs_editor, move_to_row_with_text, open_review_fixture,
+        rhs_editor, row_text, splittable,
     };
     use editor::{SelectionEffects, ToPoint as _, ToggleSplitDiff};
     use gpui::{Focusable as _, TestAppContext, VisualTestContext};
@@ -306,18 +306,6 @@ mod tests {
 
     fn init(cx: &mut TestAppContext, diff_view_style: DiffViewStyle) {
         crate::test_support::init_vim_test(cx, diff_view_style);
-    }
-
-    fn splittable(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<SplittableEditor> {
-        review.read_with(cx, |review, cx| review.diff().read(cx).editor().clone())
-    }
-
-    fn rhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
-        splittable(review, cx).read_with(cx, |editor, _| editor.rhs_editor().clone())
-    }
-
-    fn lhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
-        splittable(review, cx).read_with(cx, |editor, _| editor.lhs_editor().unwrap().clone())
     }
 
     /// The highlighted cursor rows of `editor`, with the kind of row they were painted as.
@@ -365,43 +353,6 @@ mod tests {
         })
     }
 
-    fn cursor_point(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Point {
-        editor.update(cx, |editor, cx| {
-            let snapshot = editor.display_snapshot(cx);
-            editor.selections.newest::<Point>(&snapshot).head()
-        })
-    }
-
-    fn row_text(editor: &Entity<Editor>, row: u32, cx: &mut VisualTestContext) -> String {
-        editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
-            snapshot.text_for_range(Point::new(row, 0)..end).collect()
-        })
-    }
-
-    fn move_to_row_with_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestContext) -> u32 {
-        let row = editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            (0..=snapshot.max_row().0)
-                .find(|row| {
-                    let end = Point::new(*row, snapshot.line_len(MultiBufferRow(*row)));
-                    snapshot
-                        .text_for_range(Point::new(*row, 0)..end)
-                        .collect::<String>()
-                        == text
-                })
-                .unwrap()
-        });
-        editor.update_in(cx, |editor, window, cx| {
-            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
-                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)])
-            });
-        });
-        cx.run_until_parked();
-        row
-    }
-
     fn scroll_x(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> f64 {
         editor.update(cx, |editor, cx| editor.scroll_position(cx).x)
     }
@@ -434,7 +385,7 @@ mod tests {
 
         let row = move_to_row_with_text(&editor, "line 4", cx);
         for keystrokes in [
-            "w", "b", "e", "shift-w", "$", "^", "space", "backspace", "(", ")", "%", "f", "t",
+            "w", "b", "shift-w", "shift-e", "$", "^", "space", "backspace", "(", ")", "%", "f", "t",
             "; ,", "end",
         ] {
             cx.simulate_keystrokes(keystrokes);

@@ -1,10 +1,12 @@
 use crate::{
-    FocusDiff, FocusPanel, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight,
+    FocusDiff, FocusPanel, NextFile, NextUnreviewedFile, OpenFileAtCursor, PreviousFile,
+    PreviousUnreviewedFile, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight,
+    ToggleSingleFileMode,
     diff::ReviewDiff,
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     target::ReviewTarget,
 };
-use editor::{Editor, EditorEvent, SplittableEditor};
+use editor::{Editor, EditorEvent, PathKey, SplittableEditor, actions::OpenExcerpts};
 use gpui::{
     Action as _, AnyEntity, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
     WeakEntity,
@@ -159,6 +161,116 @@ impl ReviewView {
         discard_vim_count(window, cx);
     }
 
+    fn next_file(&mut self, _: &NextFile, window: &mut Window, cx: &mut Context<Self>) {
+        // No wrapping, like tuicr: the last file is a stop.
+        self.move_to_file(window, cx, |order, current| match current {
+            Some(current) => order.iter().find(|key| *key > current).cloned(),
+            None => order.first().cloned(),
+        });
+    }
+
+    fn previous_file(&mut self, _: &PreviousFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_to_file(window, cx, |order, current| {
+            let current = current?;
+            order.iter().rev().find(|key| *key < current).cloned()
+        });
+    }
+
+    fn next_unreviewed_file(
+        &mut self,
+        _: &NextUnreviewedFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_unreviewed_file(window, cx, |order, current| {
+            let after = current.and_then(|current| order.iter().find(|key| *key > current));
+            after
+                .or_else(|| order.iter().find(|key| Some(*key) != current))
+                .cloned()
+        });
+    }
+
+    fn previous_unreviewed_file(
+        &mut self,
+        _: &PreviousUnreviewedFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_unreviewed_file(window, cx, |order, current| {
+            let before = current.and_then(|current| order.iter().rev().find(|key| *key < current));
+            before
+                .or_else(|| order.iter().rev().find(|key| Some(*key) != current))
+                .cloned()
+        });
+    }
+
+    /// Unlike plain file navigation, this wraps around: it finds the remaining work from anywhere.
+    fn move_to_unreviewed_file(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        target: impl FnOnce(&[PathKey], Option<&PathKey>) -> Option<PathKey>,
+    ) {
+        self.move_to_file(window, cx, |order, current| {
+            let unreviewed = order
+                .iter()
+                .filter(|key| !Self::is_file_reviewed(key))
+                .cloned()
+                .collect::<Vec<_>>();
+            target(&unreviewed, current)
+        });
+    }
+
+    // Reviewed marks arrive with the review panel's file tree (milestone 4).
+    fn is_file_reviewed(_path_key: &PathKey) -> bool {
+        false
+    }
+
+    fn move_to_file(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        target: impl FnOnce(&[PathKey], Option<&PathKey>) -> Option<PathKey>,
+    ) {
+        self.diff.update(cx, |diff, cx| {
+            let order = diff.file_order();
+            let current = diff.path_at_cursor(cx);
+            if let Some(target) = target(&order, current.as_ref()) {
+                diff.move_to_path(target, window, cx);
+            }
+        });
+        discard_vim_count(window, cx);
+    }
+
+    fn toggle_single_file_mode(
+        &mut self,
+        _: &ToggleSingleFileMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff.update(cx, |diff, cx| {
+            let single_file = if diff.single_file().is_some() {
+                None
+            } else {
+                diff.path_at_cursor(cx)
+                    .or_else(|| diff.file_order().first().cloned())
+            };
+            diff.set_single_file(single_file, window, cx);
+        });
+        discard_vim_count(window, cx);
+    }
+
+    fn open_file_at_cursor(
+        &mut self,
+        _: &OpenFileAtCursor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
+        editor.update(cx, |editor, cx| editor.open_excerpts(&OpenExcerpts, window, cx));
+        discard_vim_count(window, cx);
+    }
+
     fn has_visual_selection(&self, cx: &mut App) -> bool {
         let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
         editor.update(cx, |editor, cx| {
@@ -194,6 +306,12 @@ impl Render for ReviewView {
             .key_context("CodeReview")
             .on_action(cx.listener(Self::scroll_left))
             .on_action(cx.listener(Self::scroll_right))
+            .on_action(cx.listener(Self::next_file))
+            .on_action(cx.listener(Self::previous_file))
+            .on_action(cx.listener(Self::next_unreviewed_file))
+            .on_action(cx.listener(Self::previous_unreviewed_file))
+            .on_action(cx.listener(Self::toggle_single_file_mode))
+            .on_action(cx.listener(Self::open_file_at_cursor))
             .size_full()
             .child(self.diff.clone())
     }
@@ -546,5 +664,169 @@ mod tests {
             assert_eq!(workspace.items_of_type::<ReviewView>(cx).count(), 0);
             assert!(workspace.active_item(cx).is_none());
         });
+    }
+
+    mod navigation {
+        use super::*;
+        use crate::test_support::{
+            cursor_line, cursor_point, init_vim_test, lhs_editor, move_to_row_with_text,
+            open_review_fixture, path_at_cursor, rhs_editor, splittable,
+        };
+        use fs::Fs as _;
+        use gpui::VisualTestContext;
+
+        fn excerpt_paths(review: &Entity<ReviewView>, cx: &mut VisualTestContext) -> Vec<String> {
+            review.read_with(cx, |review, cx| review.diff().read(cx).excerpt_file_paths(cx))
+        }
+
+        #[gpui::test]
+        async fn test_file_navigation(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let editor = rhs_editor(&review, cx);
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("a.rs"));
+
+            for (keystrokes, path, line) in [
+                ("] f", "added.txt", "new 1"),
+                ("}", "deleted.txt", "gone 1"),
+                ("] f", "long.txt", "short"),
+                ("] f", "modified.txt", "one"),
+                // The last file is a stop.
+                ("] f", "modified.txt", "one"),
+                ("[ f", "long.txt", "short"),
+                ("{", "deleted.txt", "gone 1"),
+                ("[ f", "added.txt", "new 1"),
+                ("[ f", "a.rs", "line 1"),
+                ("[ f", "a.rs", "line 1"),
+            ] {
+                cx.simulate_keystrokes(keystrokes);
+                assert_eq!(
+                    path_at_cursor(&review, cx).as_deref(),
+                    Some(path),
+                    "after {keystrokes:?}"
+                );
+                assert_eq!(cursor_line(&editor, cx), line, "after {keystrokes:?}");
+            }
+
+            // `[ f` goes to the previous file, not to the start of the current one.
+            move_to_row_with_text(&editor, "line 36", cx);
+            cx.simulate_keystrokes("[ f");
+            assert_eq!(cursor_line(&editor, cx), "line 36");
+            cx.simulate_keystrokes("] f");
+            assert_eq!(cursor_line(&editor, cx), "new 1");
+
+            // Counts are discarded rather than applied to the next motion.
+            cx.simulate_keystrokes("3 ] f");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("deleted.txt"));
+            let row = cursor_point(&editor, cx).row;
+            cx.simulate_keystrokes("j");
+            assert_eq!(cursor_point(&editor, cx).row, row + 1);
+            assert_eq!(cursor_line(&editor, cx), "gone 2");
+        }
+
+        #[gpui::test]
+        async fn test_file_navigation_on_the_old_side(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Split);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let lhs = lhs_editor(&review, cx);
+            cx.simulate_keystrokes("ctrl-w h");
+            assert!(splittable(&review, cx).read_with(cx, |editor, _| editor.focused_editor() == &lhs));
+
+            cx.simulate_keystrokes("] f");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("added.txt"));
+            cx.simulate_keystrokes("] f");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("deleted.txt"));
+            assert_eq!(cursor_line(&lhs, cx), "gone 1");
+            cx.simulate_keystrokes("[ f [ f");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("a.rs"));
+            assert_eq!(cursor_line(&lhs, cx), "line 1");
+        }
+
+        #[gpui::test]
+        async fn test_unreviewed_file_navigation_wraps(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+
+            cx.simulate_keystrokes("[ u");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("modified.txt"));
+            cx.simulate_keystrokes("] u");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("a.rs"));
+            cx.simulate_keystrokes("] u");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("added.txt"));
+        }
+
+        #[gpui::test]
+        async fn test_single_file_mode(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let editor = rhs_editor(&review, cx);
+            let all_files = ["a.rs", "added.txt", "deleted.txt", "long.txt", "modified.txt"];
+
+            cx.simulate_keystrokes("] f j");
+            cx.simulate_keystrokes("; f");
+            assert_eq!(excerpt_paths(&review, cx), ["added.txt"]);
+            assert_eq!(cursor_line(&editor, cx), "new 2");
+
+            cx.simulate_keystrokes("] f");
+            assert_eq!(excerpt_paths(&review, cx), ["deleted.txt"]);
+            assert_eq!(cursor_line(&editor, cx), "gone 1");
+            cx.update(|window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
+            cx.simulate_keystrokes("[ f [ f");
+            assert_eq!(excerpt_paths(&review, cx), ["a.rs"]);
+            assert_eq!(cursor_line(&editor, cx), "line 1");
+            cx.simulate_keystrokes("] f");
+
+            cx.simulate_keystrokes("; f");
+            assert_eq!(excerpt_paths(&review, cx), all_files);
+            assert_eq!(cursor_line(&editor, cx), "new 1");
+
+            // Files that change while in single-file mode stay hidden.
+            cx.simulate_keystrokes("; f");
+            fs.insert_file(path!("/project/later.txt"), "later\n".into())
+                .await;
+            cx.run_until_parked();
+            assert_eq!(excerpt_paths(&review, cx), ["added.txt"]);
+            cx.simulate_keystrokes("] f ] f");
+            assert_eq!(excerpt_paths(&review, cx), ["later.txt"]);
+            cx.simulate_keystrokes("[ f [ f");
+            assert_eq!(excerpt_paths(&review, cx), ["added.txt"]);
+
+            // When the shown file has no changes left, every file is shown again.
+            fs.remove_file(path!("/project/added.txt").as_ref(), Default::default())
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                excerpt_paths(&review, cx),
+                ["a.rs", "deleted.txt", "later.txt", "long.txt", "modified.txt"]
+            );
+            cx.update(|window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
+        }
+
+        #[gpui::test]
+        async fn test_open_file_at_cursor(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+            let editor = rhs_editor(&review, cx);
+
+            move_to_row_with_text(&editor, "three", cx);
+            cx.simulate_keystrokes("e");
+            cx.run_until_parked();
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.active_item_as::<ReviewView>(cx).is_none());
+                assert_eq!(workspace.items_of_type::<ReviewView>(cx).count(), 1);
+                let opened = workspace.active_item_as::<Editor>(cx).unwrap();
+                let opened = opened.read(cx);
+                let buffer = opened.buffer().read(cx).as_singleton().unwrap();
+                assert_eq!(
+                    buffer.read(cx).file().unwrap().path().as_unix_str(),
+                    "modified.txt"
+                );
+            });
+            let opened = workspace.update(cx, |workspace, cx| {
+                workspace.active_item_as::<Editor>(cx).unwrap()
+            });
+            assert_eq!(cursor_point(&opened, cx).row, 2);
+        }
     }
 }

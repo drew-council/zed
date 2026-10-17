@@ -4,7 +4,7 @@ use buffer_diff::{BufferDiff, BufferDiffEvent};
 use collections::{HashMap, HashSet};
 use editor::{
     EditorEvent, EditorSettings, HiddenUnstagedDiffHunkRenderer, SelectionEffects,
-    SplittableEditor, multibuffer_context_lines,
+    SplittableEditor, multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
@@ -39,8 +39,10 @@ fn diff_base(target: &ReviewTarget) -> DiffBase {
 }
 
 struct BufferSubscriptions {
+    path_key: PathKey,
     display_buffer: Entity<Buffer>,
-    _diff: Entity<BufferDiff>,
+    diff: Entity<BufferDiff>,
+    has_hunks: bool,
     _diff_subscription: Subscription,
 }
 
@@ -52,6 +54,8 @@ pub struct ReviewDiff {
     diff_buffer_list: Entity<DiffBufferList>,
     editor: Entity<SplittableEditor>,
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
+    /// Single-file mode: only this file's excerpts are in the multibuffer.
+    single_file: Option<PathKey>,
     focus_handle: FocusHandle,
     empty_label: SharedString,
     refresh_task: Task<Result<()>>,
@@ -107,6 +111,7 @@ impl ReviewDiff {
             diff_buffer_list,
             editor,
             buffer_subscriptions: HashMap::default(),
+            single_file: None,
             focus_handle: cx.focus_handle(),
             empty_label: target.empty_label(),
             refresh_task: Task::ready(Ok(())),
@@ -169,39 +174,42 @@ impl ReviewDiff {
     ) {
         let diff_subscription = cx.subscribe_in(&diff, window, {
             let repo_path = repo_path.clone();
-            let path_key = path_key.clone();
-            let display_buffer = display_buffer.clone();
-            let diff = diff.clone();
             move |this, _, event, window, cx| match event {
                 BufferDiffEvent::DiffChanged(_) => {
                     // Unsaved edits made in another editor don't reshape the excerpts; the
                     // refresh that follows saving does.
-                    if display_buffer.read(cx).is_dirty() {
-                        return;
+                    let is_dirty = this
+                        .buffer_subscriptions
+                        .get(&repo_path)
+                        .is_some_and(|entry| entry.display_buffer.read(cx).is_dirty());
+                    if !is_dirty {
+                        this.sync_excerpts(&repo_path, window, cx);
                     }
-                    this.register_buffer(
-                        repo_path.clone(),
-                        path_key.clone(),
-                        display_buffer.clone(),
-                        diff.clone(),
-                        window,
-                        cx,
-                    );
                 }
                 BufferDiffEvent::BaseTextChanged => {}
             }
         });
         self.buffer_subscriptions.insert(
-            repo_path,
+            repo_path.clone(),
             BufferSubscriptions {
-                display_buffer: display_buffer.clone(),
-                _diff: diff.clone(),
+                path_key,
+                display_buffer,
+                diff,
+                has_hunks: false,
                 _diff_subscription: diff_subscription,
             },
         );
+        self.sync_excerpts(&repo_path, window, cx);
+    }
 
-        let snapshot = display_buffer.read(cx).snapshot();
-        let excerpt_ranges = diff
+    /// Shows the file's hunks, or removes its excerpts when it has none or is hidden.
+    fn sync_excerpts(&mut self, repo_path: &RepoPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.buffer_subscriptions.get_mut(repo_path) else {
+            return;
+        };
+        let snapshot = entry.display_buffer.read(cx).snapshot();
+        let excerpt_ranges = entry
+            .diff
             .read(cx)
             .snapshot(cx)
             .hunks_intersecting_range(
@@ -210,17 +218,31 @@ impl ReviewDiff {
             )
             .map(|hunk| hunk.buffer_range.to_point(&snapshot))
             .collect::<Vec<_>>();
+        entry.has_hunks = !excerpt_ranges.is_empty();
+        let path_key = entry.path_key.clone();
+        let display_buffer = entry.display_buffer.clone();
+        let diff = entry.diff.clone();
 
+        if !entry.has_hunks && self.single_file.as_ref() == Some(&path_key) {
+            self.set_single_file(None, window, cx);
+            return;
+        }
+
+        let is_visible = self.is_visible(&path_key);
         let was_empty = self.multibuffer.read(cx).is_empty();
         self.editor.update(cx, |editor, cx| {
-            editor.update_excerpts_for_path(
-                path_key,
-                display_buffer,
-                excerpt_ranges,
-                multibuffer_context_lines(cx),
-                diff,
-                cx,
-            );
+            if is_visible {
+                editor.update_excerpts_for_path(
+                    path_key,
+                    display_buffer,
+                    excerpt_ranges,
+                    multibuffer_context_lines(cx),
+                    diff,
+                    cx,
+                );
+            } else {
+                editor.remove_excerpts_for_path(path_key, cx);
+            }
             if was_empty {
                 editor.rhs_editor().update(cx, |editor, cx| {
                     editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
@@ -236,6 +258,113 @@ impl ReviewDiff {
         } else if !is_empty && self.focus_handle.is_focused(window) {
             self.editor.focus_handle(cx).focus(window, cx);
         }
+    }
+
+    fn is_visible(&self, path_key: &PathKey) -> bool {
+        self.single_file
+            .as_ref()
+            .is_none_or(|single_file| single_file == path_key)
+    }
+
+    /// The changed files in review order, including those hidden by single-file mode.
+    pub(crate) fn file_order(&self) -> Vec<PathKey> {
+        let mut order = self
+            .buffer_subscriptions
+            .values()
+            .filter(|entry| entry.has_hunks)
+            .map(|entry| entry.path_key.clone())
+            .collect::<Vec<_>>();
+        order.sort();
+        order
+    }
+
+    pub(crate) fn single_file(&self) -> Option<&PathKey> {
+        self.single_file.as_ref()
+    }
+
+    /// The file under the cursor of the focused side.
+    pub(crate) fn path_at_cursor(&self, cx: &App) -> Option<PathKey> {
+        let editor = self.editor.read(cx).focused_editor().read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let (anchor, _) = snapshot.anchor_to_buffer_anchor(editor.selections.newest_anchor().head())?;
+        snapshot.path_for_buffer(anchor.buffer_id).cloned()
+    }
+
+    /// Moves the cursor to the first row of the file (showing only that file in single-file
+    /// mode).
+    pub(crate) fn move_to_path(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
+        if self.single_file.is_some() {
+            self.set_single_file(Some(path_key), window, cx);
+        } else {
+            self.select_path_start(&path_key, window, cx);
+        }
+    }
+
+    fn select_path_start(&mut self, path_key: &PathKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |splittable, cx| {
+            // Both sides have an excerpt for every path, under the same keys.
+            let focused = splittable.focused_editor().clone();
+            let editors = [focused, splittable.rhs_editor().clone()];
+            for editor in editors {
+                let moved = editor.update(cx, |editor, cx| {
+                    let Some(position) = editor.buffer().read(cx).location_for_path(path_key, cx)
+                    else {
+                        return false;
+                    };
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::focused()),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([position..position]),
+                    );
+                    true
+                });
+                if moved {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Enters single-file mode on `path_key`, or leaves it with `None`.
+    pub(crate) fn set_single_file(
+        &mut self,
+        path_key: Option<PathKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.single_file = path_key.clone();
+        let repo_paths = self
+            .buffer_subscriptions
+            .iter()
+            .map(|(repo_path, entry)| (repo_path.clone(), entry.path_key.clone()))
+            .collect::<Vec<_>>();
+        let mut moved = false;
+        if let Some(path_key) = &path_key {
+            // Show the file before hiding the others: an empty multibuffer would move focus to
+            // the placeholder.
+            if let Some((repo_path, _)) = repo_paths.iter().find(|(_, key)| key == path_key) {
+                self.sync_excerpts(repo_path, window, cx);
+            }
+            if self.path_at_cursor(cx).as_ref() != Some(path_key) {
+                self.select_path_start(path_key, window, cx);
+                moved = true;
+            }
+        }
+        for (repo_path, key) in &repo_paths {
+            if path_key.as_ref() != Some(key) {
+                self.sync_excerpts(repo_path, window, cx);
+            }
+        }
+        if !moved {
+            // The scroll position may have been in a file that was just hidden.
+            self.editor.update(cx, |editor, cx| {
+                editor.focused_editor().update(cx, |editor, cx| {
+                    editor.request_autoscroll(Autoscroll::fit(), cx)
+                })
+            });
+        }
+        cx.notify();
     }
 
     async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncWindowContext) -> Result<()> {
@@ -280,6 +409,14 @@ impl ReviewDiff {
             });
             this.buffer_subscriptions
                 .retain(|repo_path, _| live_repo_paths.contains(repo_path));
+            // The loads below show every file again.
+            if this
+                .single_file
+                .as_ref()
+                .is_some_and(|single_file| !entries.contains_key(single_file))
+            {
+                this.single_file = None;
+            }
 
             entries
         })?;
