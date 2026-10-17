@@ -26,8 +26,9 @@ GitHub's comment gate (see "Milestone 7, slice (c)"), then a third hardening pas
 (b) review: token scoping, safe checkouts, Restricted Mode (see "Hardening 3"), then slice (d),
 submitting reviews, with the M7 (c) review's fixes (see "Milestone 7, slice (d)"). M7 is complete,
 and so is M8, the CLI: `zed [-n|-e|-a] [--wait] --review TARGET [REPO_DIR]` and `zed://review` links
-(see "Milestone 8"). Next: the final validation (`plans/FINAL-validation.md`), then M9 (fork
-ops).** The
+(see "Milestone 8"). M9 (fork ops) is done too: the rebase skill, a `releaseChannel` knob in
+`nix/build.nix` and the install guide; applying the install to `~/nixconf` awaits the user (see
+"Milestone 9"). Next: the final validation (`plans/FINAL-validation.md`).** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
@@ -98,6 +99,8 @@ What exists:
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
 | `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks. M8: `zh cli [-C DIR] ARGS` runs the fork's CLI against the isolated instance only |
+| `.claude/skills/rebase-code-review/SKILL.md` | M9: the fork rebase procedure (§2.1) as a Claude Code project skill: exact old tag, backup, per-commit keep/adapt/drop, the conflict table for every upstream file the fork touches, `range-diff`, capped build/tests and a Nix evaluation, DESIGN refresh, push only after the user confirms |
+| `crates/code_review/INSTALL.md` | M9: installing the fork as the user's only Zed from `~/nixconf` (flake input, overlay with `releaseChannel = "stable"`, removing the `zed` alias), first launch, updates, Cachix, rollback. Not applied |
 | `target/` (gitignored) | **Warm build cache** (see §8.3): `release-fast` for `-p zed` plus `debug` test artifacts, 43 GB |
 | `.rules` ("Drew's Zed fork" section) | Pointer to this file for agent sessions (`CLAUDE.md`/`AGENTS.md` symlink to it) |
 | `README.md` first two lines | `> [!IMPORTANT]` banner required by the `.rules` HARD RULE; never remove it (the user does) |
@@ -110,7 +113,8 @@ after the base keymap and `code_review::vim_key_bindings` right after `vim.json`
 open_listener.rs` (+27: `OpenRequestKind::Review`, the link in `parse`, the CLI request routed to
 `code_review::cli::handle_cli_review`), `crates/zed/src/main.rs` (+11: the `Review` arm of
 `handle_open_request`), `crates/cli/src/main.rs` (+53/−3: `--review`, help, `try_parse`, the link
-and path, "Zed exited before the review finished") and the new `crates/cli/src/review.rs`. Core patches #1 and #2 are
+and path, "Zed exited before the review finished") and the new `crates/cli/src/review.rs`; M9:
+`nix/build.nix` (`releaseChannel`, §3.10). Core patches #1 and #2 are
 applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10). M3 and M4 added
 no upstream glue (M4: new deps `db`, `file_icons`, `fs`, `ignore`, `regex`, `smallvec`, all already in
 `zed`'s graph; dev-deps `db` and `buffer_diff` with `test-support`).
@@ -1273,6 +1277,39 @@ dependency `cli` (lib only, already in `zed`'s graph):
   request review (V6.18, left to the final validation: posting), Wayland window activation, a
   symlinked repository path (the CLI canonicalizes; a lookup miss would open a second workspace).
 
+**Milestone 9 (fork ops)** — the user was away, so everything is prepared in the repo and nothing
+touches `~/nixconf` (decisions by the agent, can be vetoed):
+
+- **Rebase skill** at `.claude/skills/rebase-code-review/SKILL.md` (Claude Code's project skill
+  path; a fork-only directory, so it can't conflict and isn't in the Nix source). Its footprint
+  check excludes `crates/code_review`, `assets/keymaps/code_review*.json`, `script/live-harness`
+  and `.claude`; at M9 that leaves 14 files: §3.10's list plus `.rules`, `README.md` and
+  `Cargo.lock`. It builds with `-p zed -p cli` and checks the Nix package by evaluation only.
+- **`nix/build.nix` knob** (§3.10): upstream's flake always wrote `nightly` into
+  `RELEASE_CHANNEL` and installed `dev.zed.Zed-Nightly.desktop`, so a flake build never was the
+  stable app §2.1 assumes. The new `releaseChannel ? "nightly"` argument keeps upstream's output
+  by default; `.override { releaseChannel = "stable"; }` gives `RELEASE_CHANNEL` `stable`, version
+  `1.25.0+<sha7>`, the stable icons and `dev.zed.Zed.desktop` ("Zed"). `preview` works too; on
+  Darwin anything but nightly fails an assert (its install phase hard-codes the nightly bundle).
+  This replaces the draft's `overrideAttrs` that patched `preBuild`/`postInstall` from the user's
+  config.
+- **Verified by evaluation only** (no Nix build; `allow-import-from-derivation false`): with
+  `commitSha = null`, `packages.x86_64-linux.default` and its deps derivation have the same `.drv`
+  paths before and after the change (`…hxg15nqi…-zed-editor-1.25.0-nightly.drv`,
+  `…f90wncdj…-zed-editor-deps-1.25.0-nightly.drv`), i.e. upstream behaviour is byte-identical; the
+  stable override evaluates to `zed-editor-1.25.0` with `echo stable > crates/zed/RELEASE_CHANNEL`,
+  `app-icon.png`/`app-icon@2x.png`, `APP_NAME="Zed"` and `dev.zed.Zed.desktop`; `preview` →
+  `zed-editor-1.25.0-preview`; Darwin + stable → assert; an unknown channel → "attribute missing".
+  INSTALL.md's overlay snippet, evaluated against this checkout, stops with "code-review is on a
+  preview tag" (as intended until the stable rebase) and evaluates to `zed-editor-1.25.0`,
+  `mainProgram = "zed"` with the channel forced to stable.
+- **Install guide** `crates/code_review/INSTALL.md` (from the orchestrator's draft): `zed-fork`
+  flake input without `follows`, an inline `zed-editor` overlay entry in `overlays.nix` (Linux
+  only, asserting the fork's `RELEASE_CHANNEL` is `stable`), removing the `zed` alias in
+  `modules/packages/graphical.nix` (lines 14–24 and 91; the fork ships `bin/zed`);
+  `home/xdg-mime.nix`, `vars.defaults.editor`, the `zed` shell alias and lazygit keep working.
+  **Not applied: waits for the user** (and for the push and the stable rebase).
+
 **Known issues / notes for the next slices:**
 
 - **Notes for the final validation (V6)**:
@@ -1354,7 +1391,11 @@ dependency `cli` (lib only, already in `zed`'s graph):
 
 - Branch: **`code-review`**, one long-lived branch rebased onto each upstream stable tag (§2.1).
 - Base: **`v1.25.0-pre`** (`aa9c16803d`) for now, because it matches the warm `target/` cache. Rebase
-  onto `v1.25.0` once that stable tag ships; until then `crates/zed/RELEASE_CHANNEL` is `preview`.
+  onto the first 1.25 stable tag once it ships; until then `crates/zed/RELEASE_CHANNEL` is `preview`.
+  That tag may well be `v1.25.N` rather than `v1.25.0` (1.23 first shipped stable as `v1.23.1`,
+  1.24 as `v1.24.2`). Always name the exact old tag: `git rebase --onto <new> v1.25.0-pre
+  code-review`; a merge-base is wrong because each minor's release branch gets cherry-picks and the
+  next minor's tags don't descend from it (`.claude/skills/rebase-code-review`).
 - Agent build cap: **`-j8` under `nice -n 10`** for every cargo invocation. Never run cargo without
   these limits. This applies to agent sessions only; the Nix package build stays uncapped (§2.1).
 - Core patch #2 (horizontal-autoscroll opt-out in `editor`) accepted; batch core edits so `editor`
@@ -1397,6 +1438,14 @@ dependency `cli` (lib only, already in `zed`'s graph):
     nice -n 10 cargo build -j8 --profile release-fast -p zed -p cli
   ./target/release-fast/zed   # agents: only through script/live-harness/zh
   ```
+
+  **After the first stable rebase**, dev builds are stable-channel: run directly,
+  `target/release-fast/zed` and `cli` open the user's real database
+  (`~/.local/share/zed/db/0-stable`) and talk to the user's running Zed (nixpkgs' or the installed
+  fork, `INSTALL.md`) through `zed-stable.sock`. Always run them through `script/live-harness/zh`
+  (isolated HOME) or with `--user-data-dir <tmpdir>` (the socket lives in the data dir too); never
+  directly. (On `v1.25.0-pre` they are preview-channel: their own `0-preview` DB and
+  `zed-preview.sock`, but still the user's display and settings.)
 
 - **Type-check a crate:** run the same `-p zed` build. Every crate we touch is in `zed`'s graph,
   errors show before the link step, and only the `-p zed` selection hits the warm cache. **Don't**
@@ -1485,12 +1534,15 @@ over `git rev-parse HEAD`).
   namespace (clear of upstream's `git::ReviewDiff` / `agent::ReviewBranchDiff`). No "guicr" branding.
 - Fork follows **upstream stable tags** (`vX.Y.Z`, weekly), rebasing one long-lived branch onto each
   new tag. Write a rebase skill modelled on tuicr's `.pi/skills/rebase-bizmythy-tweaks/SKILL.md`
-  (backup branch, review each commit, drop obsolete ones, `range-diff`, run checks).
+  (backup branch, review each commit, drop obsolete ones, `range-diff`, run checks). Done (M9):
+  `.claude/skills/rebase-code-review/SKILL.md`.
 - **Install:** the fork's own Nix flake (Zed's standard crane build, `packages.default`) replaces
   nixpkgs' `zed-editor` as the user's only Zed. Use the normal Nix build settings — no `-j` caps.
   Built from a stable tag, `crates/zed/RELEASE_CHANNEL` is `stable`, so it shares the user's
   existing settings/keymap/DB and the CLI single-instance socket works (dev-channel builds do not
-  start the socket listener — `crates/zed/src/main.rs:360-364`).
+  start the socket listener — `crates/zed/src/main.rs:360-364`). Upstream's `nix/build.nix`
+  overwrites `RELEASE_CHANNEL` with `nightly`, so the install uses the fork's
+  `.override { releaseChannel = "stable"; }` (M9, §3.10, `crates/code_review/INSTALL.md`).
 - Settings: no `code_review` settings block until the first setting needs to persist; then add it
   (requires editing `crates/settings_content`, accepted).
 
@@ -1930,6 +1982,9 @@ content repeats (`src/model/review.rs`).
    (read-only, filters, bots hidden), submit modal + review creation.
 8. **CLI:** `--review`, `zed://review`, `--wait` + exit codes.
 9. **Fork ops:** rebase skill, flake install wiring in the user's NixOS config (ask the user where).
+   Done: `.claude/skills/rebase-code-review`, `releaseChannel` in `nix/build.nix`,
+   `crates/code_review/INSTALL.md` (the `~/nixconf` edits, documented; applying them awaits the
+   user).
 
 Post-v1: thread replies/resolve → suggestion blocks → §2.9 list.
 
@@ -1950,7 +2005,8 @@ Post-v1: thread replies/resolve → suggestion blocks → §2.9 list.
 - Zed's `minimum_split_diff_width` auto-toggling recreates the LHS — test comment re-hosting heavily.
 - Release channel comes from `crates/zed/RELEASE_CHANNEL` (`stable` on stable tags, `preview` on
   `-pre` tags, `dev` on main). Building from `main` gives a dev-channel app (separate DB, no CLI
-  socket) — another reason to base the fork branch on stable tags.
+  socket) — another reason to base the fork branch on stable tags. The Nix package overwrites it
+  (`nightly` unless `releaseChannel` says otherwise, M9).
 - Remote (SSH) projects: `Repository::send_job` local-only path; v1 is local-only.
 
 ---
