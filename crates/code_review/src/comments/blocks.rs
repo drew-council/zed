@@ -1581,6 +1581,16 @@ impl CommentBlocks {
             return;
         };
         let comment_type = CommentType::cycle(current, forward);
+        self.set_type(id, comment_type, cx);
+    }
+
+    /// The type chosen in a comment editor's type menu.
+    pub(crate) fn set_type(
+        &mut self,
+        id: CommentId,
+        comment_type: Option<CommentType>,
+        cx: &mut Context<Self>,
+    ) {
         self.session.update(cx, |session, cx| {
             session.set_comment_type(id, comment_type, cx)
         });
@@ -4959,5 +4969,90 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         assert!(plus_button(false, row + 1, false, cx).is_some());
         assert!(cx.debug_bounds("ICON-DebugBreakpoint").is_none());
         assert!(cx.debug_bounds("ICON-Bookmark").is_none());
+    }
+
+    fn click_drawn(selector: &'static str, cx: &mut VisualTestContext) {
+        draw(cx);
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} isn't drawn"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// The comment editor's footer: Save, Cancel (a new comment goes away, an edit is undone),
+    /// the type menu and, for a saved comment, Delete (after asking, like `dd`).
+    #[gpui::test]
+    async fn test_comment_editor_footer(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("c");
+        cx.simulate_input("saved");
+        draw(cx);
+        assert!(cx.debug_bounds("review-comment-delete").is_none());
+        // The Save button's key.
+        let editor = open_editor(&review, cx).unwrap();
+        let binding = cx.update(|window, cx| {
+            window
+                .highest_precedence_binding_for_action_in(
+                    &crate::SaveComment,
+                    &editor.focus_handle(cx),
+                )
+                .map(|binding| {
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.unparse())
+                        .collect::<Vec<_>>()
+                })
+        });
+        assert_eq!(binding, Some(vec!["ctrl-enter".to_string()]));
+        click_drawn("review-comment-save", cx);
+        assert!(open_editor(&review, cx).is_none());
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(bodies(&review, cx), ["saved"]);
+
+        move_to_row_with_text(&rhs, "line 4", cx);
+        cx.simulate_keystrokes("c");
+        cx.simulate_input("gone");
+        click_drawn("review-comment-cancel", cx);
+        assert!(open_editor(&review, cx).is_none());
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(bodies(&review, cx), ["saved"]);
+
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("i");
+        cx.simulate_input("changed ");
+        click_drawn("review-comment-cancel", cx);
+        assert!(open_editor(&review, cx).is_none());
+        assert_eq!(bodies(&review, cx), ["saved"]);
+
+        cx.simulate_keystrokes("i");
+        let editor = open_editor(&review, cx).unwrap();
+        click_drawn("review-comment-type", cx);
+        click_drawn("MENU_ITEM-Issue", cx);
+        assert_eq!(
+            comments(&review, cx)[0].2,
+            Some(CommentType::Issue),
+            "the menu sets the type"
+        );
+        assert_eq!(open_editor(&review, cx), Some(editor));
+        click_drawn("review-comment-type", cx);
+        click_drawn("MENU_ITEM-No Type", cx);
+        assert_eq!(comments(&review, cx)[0].2, None);
+
+        click_drawn("review-comment-delete", cx);
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(bodies(&review, cx), ["saved"]);
+        click_drawn("review-comment-delete", cx);
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(comments(&review, cx).is_empty());
+        assert!(open_editor(&review, cx).is_none());
+        assert_back_in_diff(&rhs, cx);
     }
 }

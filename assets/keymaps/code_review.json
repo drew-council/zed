@@ -47,8 +47,9 @@
     // own; vim's normal mode binds it later, so this only applies while typing.
     "context": "ReviewComment > Editor",
     "bindings": {
-      "ctrl-enter": "code_review::SaveComment",
+      // Last, so that the Save button shows it.
       "ctrl-s": "code_review::SaveComment",
+      "ctrl-enter": "code_review::SaveComment",
       "enter": "editor::Newline",
     },
   },

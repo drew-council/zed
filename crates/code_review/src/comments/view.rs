@@ -4,11 +4,11 @@ use super::{
 };
 use crate::{CycleCommentType, CycleCommentTypeBackward, DiscardCommentChanges, SaveComment};
 use editor::Editor;
-use gpui::{Entity, Subscription, WeakEntity};
+use gpui::{Entity, Focusable as _, Subscription, WeakEntity};
 use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement};
 use std::sync::Arc;
-use ui::{Tooltip, prelude::*};
+use ui::{ContextMenu, IconPosition, KeyBinding, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{CloseActiveItem, CloseItemInAllPanes, SaveIntent};
 
@@ -179,6 +179,127 @@ impl CommentView {
         )
     }
 
+    /// Below the editor: the type menu, and the buttons that leave the editor (and delete a saved
+    /// comment), like GitHub's comment box.
+    fn render_footer(&self, editing: &EditingState, cx: &App) -> impl IntoElement {
+        let id = self.id;
+        let focus_handle = editing.editor.focus_handle(cx);
+        let current = self.comment_type;
+        let type_menu = PopoverMenu::new(("review-comment-type-menu", id.0))
+            .trigger_with_tooltip(
+                Button::new(("review-comment-type", id.0), type_name(current))
+                    .label_size(LabelSize::Small)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                Tooltip::for_action_title_in("Comment Type", &CycleCommentType, &focus_handle),
+            )
+            .menu({
+                let blocks = self.blocks.clone();
+                move |window, cx| {
+                    let blocks = blocks.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for comment_type in CommentType::CYCLE {
+                            let blocks = blocks.clone();
+                            menu = menu.toggleable_entry(
+                                type_name(comment_type),
+                                comment_type == current,
+                                IconPosition::Start,
+                                None,
+                                move |_, cx| {
+                                    blocks
+                                        .update(cx, |blocks, cx| {
+                                            blocks.set_type(id, comment_type, cx)
+                                        })
+                                        .log_err();
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                }
+            })
+            .anchor(gpui::Anchor::TopLeft);
+        let blocks = self.blocks.clone();
+        h_flex()
+            .w_full()
+            .pt_1()
+            .gap_1()
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .debug_selector(|| "review-comment-type".into())
+                            .child(type_menu),
+                    )
+                    .when(!editing.is_new, |footer| {
+                        let blocks = blocks.clone();
+                        footer.child(
+                            div()
+                                .debug_selector(|| "review-comment-delete".into())
+                                .child(
+                                    Button::new(("review-comment-footer-delete", id.0), "Delete")
+                                        .label_size(LabelSize::Small)
+                                        .color(Color::Error)
+                                        .tooltip(Tooltip::text("Delete This Comment"))
+                                        .on_click(move |_, window, cx| {
+                                            blocks
+                                                .update(cx, |blocks, cx| {
+                                                    blocks.confirm_delete(id, window, cx)
+                                                })
+                                                .log_err();
+                                        }),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .debug_selector(|| "review-comment-cancel".into())
+                            .child(
+                                Button::new(("review-comment-cancel", id.0), "Cancel")
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::for_action_title_in(
+                                        if editing.is_new {
+                                            "Discard Comment"
+                                        } else {
+                                            "Discard Changes"
+                                        },
+                                        &DiscardCommentChanges,
+                                        &focus_handle,
+                                    ))
+                                    .on_click({
+                                        let blocks = blocks.clone();
+                                        move |_, window, cx| {
+                                            leave(&blocks, id, Leave::Discard, window, cx)
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div().debug_selector(|| "review-comment-save".into()).child(
+                            Button::new(("review-comment-save", id.0), "Save")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Filled)
+                                .key_binding(
+                                    KeyBinding::for_action_in(&SaveComment, &focus_handle, cx)
+                                        .size(rems_from_px(12_f32)),
+                                )
+                                .on_click(move |_, window, cx| {
+                                    leave(&blocks, id, Leave::Keep, window, cx)
+                                }),
+                        ),
+                    ),
+            )
+    }
+
     fn render_buttons(&self) -> Option<impl IntoElement> {
         if self.editing.is_some() || self.is_submitted {
             return None;
@@ -228,6 +349,17 @@ fn leave(
     blocks
         .update(cx, |blocks, cx| blocks.leave(id, leave, window, cx))
         .log_err();
+}
+
+/// A type's name in the comment editor's type menu.
+fn type_name(comment_type: Option<CommentType>) -> &'static str {
+    match comment_type {
+        None => "No Type",
+        Some(CommentType::Issue) => "Issue",
+        Some(CommentType::Suggestion) => "Suggestion",
+        Some(CommentType::Note) => "Note",
+        Some(CommentType::Praise) => "Praise",
+    }
 }
 
 fn cycle_type(blocks: &WeakEntity<CommentBlocks>, id: CommentId, forward: bool, cx: &mut App) {
@@ -301,10 +433,15 @@ impl Render for CommentView {
             colors.border_variant
         };
         let body = match &self.editing {
-            Some(editing) => div()
+            Some(editing) => v_flex()
                 .w_full()
-                .min_h(window.line_height())
-                .child(editing.editor.clone())
+                .child(
+                    div()
+                        .w_full()
+                        .min_h(window.line_height())
+                        .child(editing.editor.clone()),
+                )
+                .child(self.render_footer(editing, cx))
                 .into_any_element(),
             None => div()
                 .w_full()
