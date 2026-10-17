@@ -1,7 +1,11 @@
-use crate::session::ReviewKey;
+use crate::{
+    forge::{ForgeRepo, ForgeRepoRef},
+    session::ReviewKey,
+};
 use anyhow::{Result, bail};
 use git::Oid;
 use gpui::SharedString;
+use http_client::Url;
 use project::git_store::RepositorySnapshot;
 use std::fmt;
 
@@ -14,6 +18,30 @@ pub enum ReviewTarget {
     Branch { base: BranchBase },
     /// One commit or a contiguous range of commits.
     Commits(CommitRange),
+    /// A pull request checked out in the repository: merge-base(base, HEAD) → working tree, which
+    /// is the pull request's diff while HEAD is its head.
+    PullRequest(PullRequestTarget),
+}
+
+/// A pull request of a forge repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestTarget {
+    /// The repository the pull request belongs to (not the one its head branch is in).
+    pub repo: ForgeRepo,
+    pub number: u64,
+    /// The base branch's commit when the pull request was loaded. It comes from the forge, so it
+    /// goes through the same check as a typed branch base.
+    pub base: BranchBase,
+}
+
+impl PullRequestTarget {
+    pub fn new(repo: ForgeRepo, number: u64, base_oid: Oid) -> Result<Self> {
+        Ok(Self {
+            repo,
+            number,
+            base: BranchBase::new(base_oid.to_string())?,
+        })
+    }
 }
 
 /// The ref a branch review compares against, e.g. "origin/main". It is passed by name to
@@ -68,8 +96,14 @@ impl ReviewTarget {
     }
 
     /// Whether a review of `other` is the same review as one of `self`, so its tab can be reused.
+    /// A pull request is the same review whatever its base commit is now.
     pub fn is_same_review(&self, other: &Self) -> bool {
-        self == other
+        match (self, other) {
+            (ReviewTarget::PullRequest(this), ReviewTarget::PullRequest(other)) => {
+                this.repo.is_same_repo(&other.repo) && this.number == other.number
+            }
+            _ => self == other,
+        }
     }
 
     /// The key review state (reviewed marks, later drafts) is stored under. Paths come last, and
@@ -100,6 +134,15 @@ impl ReviewTarget {
                     repo.common_dir_abs_path.display()
                 )
             }
+            // Independent of the checkout, so a review follows its pull request into another
+            // worktree or clone. GitHub ignores the case of owners and names.
+            ReviewTarget::PullRequest(pull_request) => format!(
+                "pr:{}/{}/{}#{}",
+                pull_request.repo.host.to_lowercase(),
+                pull_request.repo.owner.to_lowercase(),
+                pull_request.repo.name.to_lowercase(),
+                pull_request.number
+            ),
         };
         ReviewKey(key.into())
     }
@@ -109,8 +152,122 @@ impl ReviewTarget {
             ReviewTarget::Uncommitted => "No uncommitted changes".into(),
             ReviewTarget::Branch { base } => format!("No changes against {base}").into(),
             ReviewTarget::Commits(_) => "No changes in these commits".into(),
+            ReviewTarget::PullRequest(_) => "No changes in this pull request".into(),
         }
     }
+}
+
+/// A pull request as the user named it: `123`, `#123`, `pr:123`, `owner/repo#123` or its URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestReference {
+    /// The repository, when the reference names one; otherwise the checkout's pull requests.
+    pub repo: Option<ForgeRepoRef>,
+    pub number: u64,
+}
+
+impl fmt::Display for PullRequestReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.repo {
+            Some(repo) => write!(formatter, "{repo}#{}", self.number),
+            None => write!(formatter, "#{}", self.number),
+        }
+    }
+}
+
+/// Parses `123`, `#123`, `pr:123`, `owner/repo#123` and `https://host/owner/repo/pull/123[/…]`.
+pub fn parse_pull_request_reference(input: &str) -> Result<PullRequestReference> {
+    let input = input.trim();
+    let invalid = || {
+        anyhow::anyhow!(
+            "{input:?} isn't a pull request: use a number, owner/repo#123 or a pull request URL"
+        )
+    };
+    if input.starts_with("https://") || input.starts_with("http://") {
+        let url = Url::parse(input).map_err(|_| invalid())?;
+        let host = url.host_str().ok_or_else(invalid)?.to_ascii_lowercase();
+        let mut segments = url
+            .path_segments()
+            .ok_or_else(invalid)?
+            .filter(|segment| !segment.is_empty());
+        let (Some(owner), Some(name), Some("pull"), Some(number)) = (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) else {
+            return Err(invalid());
+        };
+        return Ok(PullRequestReference {
+            repo: Some(repo_reference(Some(host), owner, name).ok_or_else(invalid)?),
+            number: parse_pull_request_number(number).ok_or_else(invalid)?,
+        });
+    }
+    if let Some(number) = input
+        .strip_prefix("pr:")
+        .or_else(|| input.strip_prefix('#'))
+    {
+        return Ok(PullRequestReference {
+            repo: None,
+            number: parse_pull_request_number(number).ok_or_else(invalid)?,
+        });
+    }
+    if let Some((repo, number)) = input.split_once('#') {
+        let (owner, name) = repo.split_once('/').ok_or_else(invalid)?;
+        return Ok(PullRequestReference {
+            repo: Some(repo_reference(None, owner, name).ok_or_else(invalid)?),
+            number: parse_pull_request_number(number).ok_or_else(invalid)?,
+        });
+    }
+    Ok(PullRequestReference {
+        repo: None,
+        number: parse_pull_request_number(input).ok_or_else(invalid)?,
+    })
+}
+
+/// A positive number in plain digits (`u64::from_str` would also take a `+`).
+fn parse_pull_request_number(number: &str) -> Option<u64> {
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok().filter(|number| *number > 0)
+}
+
+fn repo_reference(host: Option<String>, owner: &str, name: &str) -> Option<ForgeRepoRef> {
+    let is_valid = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    };
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    (is_valid(owner) && is_valid(name)).then(|| ForgeRepoRef {
+        host: host.map(SharedString::from),
+        owner: owner.to_string().into(),
+        name: name.to_string().into(),
+    })
+}
+
+/// Checks a branch name that comes from a forge (a pull request's head or base branch) before it
+/// reaches git: git's `check-ref-format --branch` rules, and nothing git could read as an option.
+pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
+    let is_valid = is_plain_revision(name)
+        && name != "@"
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && !name.chars().any(|character| "~^:?*[\\".contains(character))
+        && name
+            .split('/')
+            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"));
+    if !is_valid {
+        bail!("Invalid branch name {name:?}");
+    }
+    Ok(())
 }
 
 /// A commit or commit range as typed by the user.
@@ -186,6 +343,121 @@ mod tests {
         ] {
             assert!(
                 parse_commit_spec(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_pull_request_reference() {
+        let parse = |input: &str| parse_pull_request_reference(input).unwrap();
+        let in_repo = |host: Option<&str>, owner: &str, name: &str, number| PullRequestReference {
+            repo: Some(ForgeRepoRef {
+                host: host.map(|host| host.to_string().into()),
+                owner: owner.to_string().into(),
+                name: name.to_string().into(),
+            }),
+            number,
+        };
+        let here = |number| PullRequestReference { repo: None, number };
+        assert_eq!(parse("123"), here(123));
+        assert_eq!(parse(" #7 "), here(7));
+        assert_eq!(parse("pr:42"), here(42));
+        assert_eq!(
+            parse("zed-industries/zed#41"),
+            in_repo(None, "zed-industries", "zed", 41)
+        );
+        assert_eq!(
+            parse("https://github.com/drew-council/code-review-sandbox/pull/2"),
+            in_repo(Some("github.com"), "drew-council", "code-review-sandbox", 2)
+        );
+        assert_eq!(
+            parse("https://GitHub.com/o/r.js/pull/9/files?diff=split#r123"),
+            in_repo(Some("github.com"), "o", "r.js", 9)
+        );
+        assert_eq!(
+            parse("http://ghe.example.com/team/app/pull/3/"),
+            in_repo(Some("ghe.example.com"), "team", "app", 3)
+        );
+        assert_eq!(parse(&format!("#{}", u64::MAX)), here(u64::MAX));
+        assert_eq!(parse("#1").to_string(), "#1");
+        assert_eq!(parse("o/r#1").to_string(), "o/r#1");
+
+        for invalid in [
+            "",
+            "#",
+            "0",
+            "#0",
+            "pr:",
+            "+5",
+            "-5",
+            "1.5",
+            "12a",
+            "abc",
+            "18446744073709551616",
+            "o/r#",
+            "o#1",
+            "o/r/x#1",
+            "/r#1",
+            "o/../r#1",
+            "o/r#1#2",
+            "pr:#1",
+            "https://github.com/o/r/issues/1",
+            "https://github.com/o/r/pull/",
+            "https://github.com/o/r/pull/x",
+            "https://github.com/o/pull/1",
+            "ftp://github.com/o/r/pull/1",
+        ] {
+            assert!(
+                parse_pull_request_reference(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_branch_name() {
+        for valid in [
+            "main",
+            "feature/template-filters",
+            "fix/truncate-ellipsis",
+            "release-1.0",
+            "user@host",
+            "a.b",
+            "ünïcode",
+            "x+y",
+        ] {
+            assert!(validate_branch_name(valid).is_ok(), "{valid:?} should pass");
+        }
+        for invalid in [
+            "",
+            "-x",
+            "--upload-pack=x",
+            "@",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\u{7f}",
+            "/a",
+            "a/",
+            "a//b",
+            "a..b",
+            "a.",
+            ".a",
+            "a/.b",
+            "a.lock",
+            "a.lock/b",
+            "a@{1}",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?",
+            "a*",
+            "a[b",
+            "a\\b",
+        ] {
+            assert!(
+                validate_branch_name(invalid).is_err(),
                 "{invalid:?} should be rejected"
             );
         }

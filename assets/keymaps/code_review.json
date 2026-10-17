@@ -1,9 +1,12 @@
 [
   {
     // `tab` toggles the commit under the cursor and moves on, so a range is a run of `tab`s.
+    // `ctrl-r` (deeper than the workspace's `projects::OpenRecent`) switches the pull requests
+    // between open ones and those requesting your review.
     "context": "StartReview > Picker > Editor",
     "bindings": {
       "tab": "picker::MultiSelectNext",
+      "ctrl-r": "code_review::TogglePullRequestFilter",
     },
   },
   {

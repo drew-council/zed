@@ -1,3 +1,4 @@
+mod checkout;
 mod comments;
 mod commits;
 mod diff;
@@ -9,6 +10,7 @@ mod line_cursor;
 mod panel;
 mod persistence;
 mod picker;
+mod pull_request;
 mod reviewed;
 mod session;
 mod target;
@@ -24,8 +26,12 @@ use workspace::Workspace;
 pub use diff::ReviewDiff;
 pub use panel::ReviewPanel;
 pub use picker::StartReviewModal;
+pub use pull_request::{OpenPullRequestOptions, PullRequestState, open_pull_request};
 pub use session::ReviewKey;
-pub use target::{CommitRange, ReviewTarget};
+pub use target::{
+    CommitRange, PullRequestReference, PullRequestTarget, ReviewTarget,
+    parse_pull_request_reference,
+};
 pub use view::ReviewView;
 
 actions!(
@@ -35,8 +41,11 @@ actions!(
         /// repository.
         ReviewUncommitted,
         /// Chooses what to review: the uncommitted changes, the current branch against its base,
-        /// or recent commits (select several for a range).
+        /// recent commits (select several for a range), or a pull request.
         StartReview,
+        /// In the Start Review picker: lists the open pull requests, or those requesting your
+        /// review.
+        TogglePullRequestFilter,
         /// Changes the base the current branch review compares against.
         ChangeBase,
         /// Shows or hides the commit messages at the top of a commit review.
@@ -160,6 +169,17 @@ pub struct ReviewBranch {
 pub struct ReviewCommits {
     #[serde(default)]
     pub commits: Option<String>,
+}
+
+/// Opens a review of a pull request of the repository's GitHub remote (for a fork, of its
+/// parent), checking it out. `reference` is a number ("123", "#123"), "owner/repo#123" or the pull
+/// request's URL; without it, the Start Review picker opens at the pull requests.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = code_review)]
+#[serde(deny_unknown_fields)]
+pub struct OpenPullRequest {
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 // Embedded here instead of read through `settings::SettingsAssets`: rust-embed doesn't notice new

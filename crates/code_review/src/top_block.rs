@@ -1,6 +1,6 @@
 use crate::{
-    comments::CommentBlocks, commits::CommitChain, diff::ReviewDiff, target::CommitRange,
-    view::ReviewView,
+    comments::CommentBlocks, commits::CommitChain, diff::ReviewDiff, forge::ForgeRepo,
+    pull_request::PullRequestState, target::CommitRange, view::ReviewView,
 };
 use anyhow::Result;
 use editor::hover_markdown_style;
@@ -38,6 +38,11 @@ pub(crate) enum TopBlockContent {
         range: CommitRange,
         commits: CommitsState,
     },
+    PullRequest {
+        repo: ForgeRepo,
+        number: u64,
+        state: Option<Entity<PullRequestState>>,
+    },
 }
 
 pub(crate) enum CommitsState {
@@ -64,11 +69,17 @@ impl ReviewTopBlock {
         comments: Entity<CommentBlocks>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             // The snapshot label appears once the commit diff knows its mode.
             cx.observe(&diff, |_, _, cx| cx.notify()),
             cx.observe(&comments, |_, _, cx| cx.notify()),
         ];
+        if let TopBlockContent::PullRequest {
+            state: Some(state), ..
+        } = &content
+        {
+            subscriptions.push(cx.observe(state, |_, _, cx| cx.notify()));
+        }
         Self {
             content,
             expanded: false,
@@ -228,6 +239,42 @@ impl ReviewTopBlock {
             .into_any_element()
     }
 
+    fn render_pull_request(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        state: Option<&Entity<PullRequestState>>,
+        cx: &App,
+    ) -> AnyElement {
+        let details = state.map(|state| state.read(cx).details());
+        h_flex()
+            .gap_1()
+            .min_w_0()
+            .child(
+                Label::new(format!("{repo}#{number}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .flex_none(),
+            )
+            .when_some(details, |line, details| {
+                line.child(
+                    Label::new(details.title.clone())
+                        .size(LabelSize::Small)
+                        .truncate(),
+                )
+                .child(
+                    Label::new(format!(
+                        "{} wants to merge {} into {}",
+                        details.author.login, details.head_ref, details.base_ref
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_commits(
         &self,
         commits: &CommitsState,
@@ -365,6 +412,11 @@ impl Render for ReviewTopBlock {
             TopBlockContent::Commits { commits, .. } => {
                 Some(self.render_commits(commits, window, cx))
             }
+            TopBlockContent::PullRequest {
+                repo,
+                number,
+                state,
+            } => Some(self.render_pull_request(repo, *number, state.as_ref(), cx)),
         };
         let review_comments = self.comments.read(cx).review_comment_views(cx);
         if content.is_none() && review_comments.is_empty() {

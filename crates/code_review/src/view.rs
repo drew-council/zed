@@ -15,6 +15,7 @@ use crate::{
     gitattributes::{FileAttributes, GitAttributes},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
+    pull_request::PullRequestState,
     reviewed::paint_reviewed_hunks,
     session::{ReviewKey, ReviewSession, ReviewSessionEvent},
     target::{BranchBase, ReviewTarget, parse_commit_spec},
@@ -45,7 +46,7 @@ use std::{
     sync::Arc,
 };
 use ui::{KeyBinding, prelude::*};
-use util::ResultExt as _;
+use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
     ItemNavHistory, Toast, Workspace,
     item::{Item, ItemEvent, SaveOptions},
@@ -386,6 +387,8 @@ pub struct ReviewView {
     /// anchors are parked in [`CommentBlocks`]).
     previous_sessions: HashMap<ReviewKey, Entity<ReviewSession>>,
     comments: Entity<CommentBlocks>,
+    /// The pull request a pull request review is of, shared with its other tabs.
+    pull_request: Option<Entity<PullRequestState>>,
     filters: ReviewFilters,
     /// The generated and vendored files among the review's files.
     attributes: HashMap<RepoPath, FileAttributes>,
@@ -421,6 +424,8 @@ impl ReviewView {
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         if let Some(existing) = find_review(workspace, &target, &repo, cx) {
+            // A pull request's base may have moved since its tab opened.
+            existing.update(cx, |view, cx| view.update_pull_request_base(&target, cx));
             workspace.activate_item(&existing, true, true, window, cx);
             return existing;
         }
@@ -455,6 +460,13 @@ impl ReviewView {
                 cx,
             )
         });
+        let key = target.review_key(&repo.read(cx));
+        let pull_request = match &target {
+            ReviewTarget::PullRequest(_) => PullRequestState::for_key(&key, cx),
+            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
+                None
+            }
+        };
         let content = match &target {
             ReviewTarget::Uncommitted => TopBlockContent::None,
             ReviewTarget::Branch { base } => TopBlockContent::Branch {
@@ -465,8 +477,13 @@ impl ReviewView {
                 range: *range,
                 commits: CommitsState::Loading,
             },
+            ReviewTarget::PullRequest(target) => TopBlockContent::PullRequest {
+                repo: target.repo.clone(),
+                number: target.number,
+                state: pull_request.clone(),
+            },
         };
-        let session = ReviewSession::for_key(target.review_key(&repo.read(cx)), cx);
+        let session = ReviewSession::for_key(key, cx);
         let comments = cx.new(|cx| {
             CommentBlocks::new(
                 session.clone(),
@@ -505,7 +522,9 @@ impl ReviewView {
                     .log_err();
                 })
             }
-            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } => Task::ready(()),
+            ReviewTarget::Uncommitted
+            | ReviewTarget::Branch { .. }
+            | ReviewTarget::PullRequest(_) => Task::ready(()),
         };
 
         let mut subscriptions = vec![
@@ -520,27 +539,40 @@ impl ReviewView {
                 cx.emit(EditorEvent::TitleChanged);
                 cx.notify();
             }),
-            // A branch review is titled and keyed after the checked-out branch.
+            // A branch review is titled and keyed after the checked-out branch. The merge base of
+            // a branch or pull request review depends on HEAD.
             cx.subscribe_in(
                 &repo,
                 window,
                 |this, repo, event: &RepositoryEvent, window, cx| {
-                    if let (RepositoryEvent::HeadChanged, ReviewTarget::Branch { base }) =
-                        (event, &this.target)
-                    {
-                        let branch = branch_name(repo, cx);
-                        let base = base.name().clone();
-                        this.top_block
-                            .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
-                        // The merge base depends on HEAD.
-                        this.diff.update(cx, |diff, cx| diff.check_base(cx));
-                        this.update_session(window, cx);
-                        cx.emit(EditorEvent::TitleChanged);
-                        cx.notify();
+                    if !matches!(event, RepositoryEvent::HeadChanged) {
+                        return;
                     }
+                    match &this.target {
+                        ReviewTarget::Branch { base } => {
+                            let branch = branch_name(repo, cx);
+                            let base = base.name().clone();
+                            this.top_block
+                                .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
+                            this.diff.update(cx, |diff, cx| diff.check_base(cx));
+                            this.update_session(window, cx);
+                        }
+                        ReviewTarget::PullRequest(_) => {
+                            this.diff.update(cx, |diff, cx| diff.check_base(cx));
+                        }
+                        ReviewTarget::Uncommitted | ReviewTarget::Commits(_) => return,
+                    }
+                    cx.emit(EditorEvent::TitleChanged);
+                    cx.notify();
                 },
             ),
         ];
+        if let Some(pull_request) = &pull_request {
+            subscriptions.push(cx.observe(pull_request, |_, _, cx| {
+                cx.emit(EditorEvent::TitleChanged);
+                cx.notify();
+            }));
+        }
         let splittable = diff.read(cx).editor().clone();
         subscriptions.extend([
             cx.subscribe_in(
@@ -574,6 +606,7 @@ impl ReviewView {
             session,
             previous_sessions: HashMap::default(),
             comments,
+            pull_request,
             filters: ReviewFilters::default(),
             attributes: HashMap::default(),
             project,
@@ -1150,7 +1183,40 @@ impl ReviewView {
                 .read(cx)
                 .commits_title()
                 .unwrap_or_else(|| range.head.display_short().into()),
+            ReviewTarget::PullRequest(target) => match &self.pull_request {
+                Some(pull_request) => format!(
+                    "PR #{}: {}",
+                    target.number,
+                    pull_request.read(cx).details().title
+                )
+                .into(),
+                None => format!("PR #{}", target.number).into(),
+            },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pull_request(&self) -> Option<&Entity<PullRequestState>> {
+        self.pull_request.as_ref()
+    }
+
+    /// Moves a pull request review to the pull request's base commit in `target`, when it's
+    /// another one (the pull request was rebased, or its base branch changed).
+    fn update_pull_request_base(&mut self, target: &ReviewTarget, cx: &mut Context<Self>) {
+        let (ReviewTarget::PullRequest(current), ReviewTarget::PullRequest(new)) =
+            (&mut self.target, target)
+        else {
+            return;
+        };
+        if current.base == new.base {
+            return;
+        }
+        current.base = new.base.clone();
+        let base = new.base.clone();
+        let empty_label = target.empty_label();
+        self.diff
+            .update(cx, |diff, cx| diff.set_branch_base(base, empty_label, cx));
+        cx.notify();
     }
 
     /// The files the review panel lists (those the filters don't hide), in review order.
@@ -1256,8 +1322,9 @@ impl ReviewView {
         }
         self.target = target;
         let base_name = base.name().clone();
+        let empty_label = self.target.empty_label();
         self.diff
-            .update(cx, |diff, cx| diff.set_branch_base(base, cx));
+            .update(cx, |diff, cx| diff.set_branch_base(base, empty_label, cx));
         self.update_session(window, cx);
         let branch = branch_name(&self.repo, cx);
         self.top_block.update(cx, |top_block, cx| {
@@ -1679,6 +1746,23 @@ impl ReviewView {
                     scope: "selected commit range".into(),
                 }
             }
+            ReviewTarget::PullRequest(target) => {
+                let name = format!("{}#{}", target.repo, target.number);
+                let mut banner = Vec::new();
+                match &self.pull_request {
+                    Some(pull_request) => {
+                        let details = pull_request.read(cx).details();
+                        banner.push(format!("Reviewing pull request {name}: {}", details.title));
+                        banner.push(format!("URL: {}", details.url));
+                        banner.push(format!("Head: {}", details.head_oid.display_short()));
+                    }
+                    None => banner.push(format!("Reviewing pull request {name}")),
+                }
+                ExportPreamble {
+                    banner,
+                    scope: format!("pull request {name}"),
+                }
+            }
         }
     }
 
@@ -1886,11 +1970,24 @@ impl Item for ReviewView {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        format!("Review: {}", self.title(cx)).into()
+        match &self.target {
+            // "PR #N: …" already says what the tab is.
+            ReviewTarget::PullRequest(_) => truncate_and_trailoff(&self.title(cx), 48).into(),
+            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
+                format!("Review: {}", self.title(cx)).into()
+            }
+        }
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
-        let title = self.tab_content_text(0, cx);
+        let title = match &self.target {
+            ReviewTarget::PullRequest(target) => {
+                format!("Review: {} ({})", self.title(cx), target.repo).into()
+            }
+            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
+                self.tab_content_text(0, cx)
+            }
+        };
         Some(if self.diff.read(cx).is_snapshot(cx) {
             format!("{title}\nRead-only snapshot (no language server)").into()
         } else {

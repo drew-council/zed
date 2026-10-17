@@ -65,6 +65,11 @@ impl DiffSource {
             ReviewTarget::Branch { base } => DiffBase::Merge {
                 base_ref: base.name().clone(),
             },
+            // The base commit, so the review shows what the pull request changes even when the
+            // base branch has moved on locally.
+            ReviewTarget::PullRequest(pull_request) => DiffBase::Merge {
+                base_ref: pull_request.base.name().clone(),
+            },
             ReviewTarget::Commits(range) => {
                 let range = *range;
                 return Self::Commits(commits.unwrap_or_else(|| {
@@ -183,8 +188,9 @@ pub struct ReviewDiff {
     /// A merge-base list has no files until its first tree diff; until that starts, the review
     /// is loading rather than empty.
     awaiting_tree_diff: bool,
-    /// The base of a branch review. `DiffBufferList` only logs a failed comparison and then
-    /// lists no files, so the review checks the base itself rather than claim "No changes".
+    /// The base of a branch or pull request review. `DiffBufferList` only logs a failed
+    /// comparison and then lists no files, so the review checks the base itself rather than claim
+    /// "No changes".
     branch_base: Option<BranchBase>,
     base_check: BaseCheck,
     base_check_task: Task<()>,
@@ -274,6 +280,7 @@ impl ReviewDiff {
 
         let branch_base = match target {
             ReviewTarget::Branch { base } => Some(base.clone()),
+            ReviewTarget::PullRequest(pull_request) => Some(pull_request.base.clone()),
             ReviewTarget::Uncommitted | ReviewTarget::Commits(_) => None,
         };
         let mut this = Self {
@@ -383,13 +390,19 @@ impl ReviewDiff {
         });
     }
 
-    /// Changes the base of a branch review. The list empties and reloads against the new base.
-    pub(crate) fn set_branch_base(&mut self, base: BranchBase, cx: &mut Context<Self>) {
+    /// Changes the base of a branch or pull request review. The list empties and reloads against
+    /// the new base.
+    pub(crate) fn set_branch_base(
+        &mut self,
+        base: BranchBase,
+        empty_label: SharedString,
+        cx: &mut Context<Self>,
+    ) {
         let DiffSource::BufferList(list) = &self.source else {
             return;
         };
         let base_ref = base.name().clone();
-        self.empty_label = ReviewTarget::Branch { base: base.clone() }.empty_label();
+        self.empty_label = empty_label;
         self.awaiting_tree_diff = true;
         self.branch_base = Some(base);
         self.base_check = BaseCheck::Pending;

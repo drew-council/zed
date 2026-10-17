@@ -1553,10 +1553,10 @@ impl Forge for GitHubForge {
 
 /// A remote of the checkout that points at GitHub.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GitHubRemote {
-    name: String,
-    repo: ForgeRepo,
-    is_ssh: bool,
+pub(crate) struct GitHubRemote {
+    pub(crate) name: String,
+    pub(crate) repo: ForgeRepo,
+    pub(crate) is_ssh: bool,
 }
 
 /// The GitHub remotes, preferred first: the current branch's upstream remote, `origin`,
@@ -1607,6 +1607,33 @@ fn choose_remote<'a>(
         return Ok((remote, false));
     }
     Ok((preferred, true))
+}
+
+/// The checkout's GitHub remotes, preferred first (see [`github_remotes`]).
+pub(crate) fn remotes(
+    repository: &Entity<Repository>,
+    cx: &mut App,
+) -> Task<anyhow::Result<Vec<GitHubRemote>>> {
+    let branch_remote = repository
+        .read(cx)
+        .branch
+        .as_ref()
+        .and_then(|branch| branch.upstream.as_ref())
+        .and_then(|upstream| upstream.remote_name())
+        .map(str::to_string);
+    let remote_urls = repository.update(cx, |repository, _| repository.remote_urls());
+    let registry = GitHostingProviderRegistry::try_global(cx);
+    cx.spawn(async move |_| {
+        let remote_urls = remote_urls
+            .await
+            .map_err(|_| anyhow!("the repository was closed"))?
+            .map_err(|error| error.context("listing the repository's remotes"))?;
+        Ok(github_remotes(
+            &remote_urls,
+            branch_remote.as_deref(),
+            registry.as_deref(),
+        ))
+    })
 }
 
 /// What a resolved forge depends on; any change resolves it again.
@@ -1719,64 +1746,56 @@ pub(crate) fn set_fake_token_source(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::forge::{error_message, github_error, resolve_forge};
-    use anyhow::Context as _;
-    use futures::{AsyncWriteExt as _, executor::block_on};
-    use gpui::TestAppContext;
-    use http_client::{FakeHttpClient, Response, Url};
-    use project::FakeFs;
+    use http_client::{FakeHttpClient, Response};
     use serde_json::Value;
-    use std::{
-        cell::Cell,
-        sync::{Mutex, atomic::AtomicUsize},
-    };
-    use util::{command::Stdio, path};
+    use std::sync::Mutex;
 
-    const PR1_THREADS: &str = include_str!("../test_data/github/pr1-threads.json");
-    const PR1_SUMMARIES: &str = include_str!("../test_data/github/pr1-summaries.json");
-    const PR1_DETAILS: &str = include_str!("../test_data/github/pr1-details.json");
-    const PR1_HEAD: &str = include_str!("../test_data/github/pr1-head.json");
-    const PR1_FILES: &str = include_str!("../test_data/github/pr1-files.json");
-    const PR4_FILES: &str = include_str!("../test_data/github/pr4-files.json");
-    const PR999_DETAILS: &str = include_str!("../test_data/github/pr999-details.json");
-    const OPEN_PULL_REQUESTS: &str = include_str!("../test_data/github/open-pull-requests.json");
-    const FORK_CONTEXT: &str = include_str!("../test_data/github/fork-context.json");
+    pub(crate) const PR1_THREADS: &str = include_str!("../test_data/github/pr1-threads.json");
+    pub(crate) const PR1_SUMMARIES: &str = include_str!("../test_data/github/pr1-summaries.json");
+    pub(crate) const PR1_DETAILS: &str = include_str!("../test_data/github/pr1-details.json");
+    pub(crate) const PR1_HEAD: &str = include_str!("../test_data/github/pr1-head.json");
+    pub(crate) const PR1_FILES: &str = include_str!("../test_data/github/pr1-files.json");
+    pub(crate) const PR4_FILES: &str = include_str!("../test_data/github/pr4-files.json");
+    pub(crate) const PR999_DETAILS: &str = include_str!("../test_data/github/pr999-details.json");
+    pub(crate) const OPEN_PULL_REQUESTS: &str =
+        include_str!("../test_data/github/open-pull-requests.json");
+    pub(crate) const FORK_CONTEXT: &str = include_str!("../test_data/github/fork-context.json");
 
-    const PR1_HEAD_OID: &str = "3f22f1b3bd52ed79a655a055209707e356fa8253";
-    const PR1_BASE_OID: &str = "deea36cf8fa38276ef75801d05773c4c35c48d45";
-    const TOKEN: &str = "secret-token-value";
+    pub(crate) const PR1_HEAD_OID: &str = "3f22f1b3bd52ed79a655a055209707e356fa8253";
+    pub(crate) const PR1_BASE_OID: &str = "deea36cf8fa38276ef75801d05773c4c35c48d45";
+    pub(crate) const TOKEN: &str = "secret-token-value";
 
-    struct SentRequest {
-        method: Method,
-        uri: String,
-        headers: HeaderMap,
-        body: Value,
+    pub(crate) struct SentRequest {
+        pub(crate) method: Method,
+        pub(crate) uri: String,
+        pub(crate) headers: HeaderMap,
+        pub(crate) body: Value,
     }
 
     impl SentRequest {
-        fn operation(&self) -> Option<&str> {
+        pub(crate) fn operation(&self) -> Option<&str> {
             self.body["operationName"].as_str()
         }
 
-        fn variables(&self) -> &Value {
+        pub(crate) fn variables(&self) -> &Value {
             &self.body["variables"]
         }
     }
 
-    struct Reply {
-        status: u16,
-        headers: Vec<(&'static str, String)>,
-        body: String,
+    pub(crate) struct Reply {
+        pub(crate) status: u16,
+        pub(crate) headers: Vec<(&'static str, String)>,
+        pub(crate) body: String,
     }
 
     impl Reply {
-        fn json(body: impl Into<String>) -> Self {
+        pub(crate) fn json(body: impl Into<String>) -> Self {
             Self::status(200, body)
         }
 
-        fn status(status: u16, body: impl Into<String>) -> Self {
+        pub(crate) fn status(status: u16, body: impl Into<String>) -> Self {
             Self {
                 status,
                 headers: Vec::new(),
@@ -1784,16 +1803,16 @@ mod tests {
             }
         }
 
-        fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        pub(crate) fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
             self.headers.push((name, value.into()));
             self
         }
     }
 
-    type SentRequests = Arc<Mutex<Vec<SentRequest>>>;
+    pub(crate) type SentRequests = Arc<Mutex<Vec<SentRequest>>>;
 
     /// A fake GitHub that answers every request with `respond` and records the requests.
-    fn fake_github(
+    pub(crate) fn fake_github(
         respond: impl Fn(&SentRequest) -> Reply + Send + Sync + 'static,
     ) -> (Arc<dyn HttpClient>, SentRequests) {
         let requests = SentRequests::default();
@@ -1829,6 +1848,53 @@ mod tests {
         });
         (client, requests)
     }
+
+    pub(crate) fn repository_context_reply(request: &SentRequest) -> Reply {
+        let variables = request.variables();
+        let repository = |name_with_owner: &str, parent: Value| {
+            json!({ "data": {
+                "viewer": { "login": "drew-council" },
+                "repository": {
+                    "nameWithOwner": name_with_owner,
+                    "url": format!("https://github.com/{name_with_owner}"),
+                    "sshUrl": format!("git@github.com:{name_with_owner}.git"),
+                    "isFork": !parent.is_null(),
+                    "parent": parent,
+                },
+            } })
+            .to_string()
+        };
+        match (variables["owner"].as_str(), variables["name"].as_str()) {
+            (Some("drew-council"), Some("zed")) => Reply::json(FORK_CONTEXT),
+            (Some("drew-council"), Some("code-review-sandbox")) => {
+                Reply::json(repository("drew-council/code-review-sandbox", Value::Null))
+            }
+            (Some("zed-industries"), Some("zed")) => {
+                Reply::json(repository("zed-industries/zed", Value::Null))
+            }
+            _ => Reply::json(
+                r#"{"data":{"viewer":{"login":"drew-council"},"repository":null},"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository"}]}"#,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::forge::{error_message, github_error, resolve_forge};
+    use anyhow::Context as _;
+    use futures::{AsyncWriteExt as _, executor::block_on};
+    use gpui::TestAppContext;
+    use http_client::{FakeHttpClient, Response, Url};
+    use project::FakeFs;
+    use serde_json::Value;
+    use std::{
+        cell::Cell,
+        sync::{Mutex, atomic::AtomicUsize},
+    };
+    use util::{command::Stdio, path};
 
     fn sandbox() -> ForgeRepo {
         ForgeRepo {
@@ -3062,32 +3128,6 @@ mod tests {
         fail.store(false, Ordering::SeqCst);
         assert_eq!(&*token("github.com", cx).await.unwrap().value, "token-5");
         assert_eq!(lookups.load(Ordering::SeqCst), 5);
-    }
-
-    fn repository_context_reply(request: &SentRequest) -> Reply {
-        let variables = request.variables();
-        let repository = |name_with_owner: &str, parent: Value| {
-            json!({ "data": {
-                "viewer": { "login": "drew-council" },
-                "repository": {
-                    "nameWithOwner": name_with_owner,
-                    "url": format!("https://github.com/{name_with_owner}"),
-                    "sshUrl": format!("git@github.com:{name_with_owner}.git"),
-                    "isFork": !parent.is_null(),
-                    "parent": parent,
-                },
-            } })
-            .to_string()
-        };
-        match (variables["owner"].as_str(), variables["name"].as_str()) {
-            (Some("drew-council"), Some("zed")) => Reply::json(FORK_CONTEXT),
-            (Some("zed-industries"), Some("zed")) => {
-                Reply::json(repository("zed-industries/zed", Value::Null))
-            }
-            _ => Reply::json(
-                r#"{"data":{"viewer":{"login":"drew-council"},"repository":null},"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository"}]}"#,
-            ),
-        }
     }
 
     #[gpui::test]
