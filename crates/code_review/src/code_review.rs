@@ -382,6 +382,16 @@ pub(crate) mod test_support {
         Path::new(path!("/project/.git"))
     }
 
+    /// Makes `name` resolve to the commit `sha` in the fake repository, which answers
+    /// `revparse_batch` from its refs only.
+    pub(crate) fn insert_commit_ref(fs: &FakeFs, name: &str, sha: &str) {
+        fs.with_git_state(dot_git(), true, |state| {
+            state.refs.insert(name.into(), sha.into());
+            state.refs.insert(format!("{name}^{{commit}}"), sha.into());
+        })
+        .unwrap();
+    }
+
     pub(crate) fn oid(sha: &str) -> git::Oid {
         sha.parse().unwrap()
     }

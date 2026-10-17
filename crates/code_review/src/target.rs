@@ -3,18 +3,52 @@ use anyhow::{Result, bail};
 use git::Oid;
 use gpui::SharedString;
 use project::git_store::RepositorySnapshot;
+use std::fmt;
 
 /// What a review covers. Pull request targets will be added alongside these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReviewTarget {
     /// HEAD → working tree, staged and unstaged changes together.
     Uncommitted,
-    /// merge-base(base, HEAD) → working tree, uncommitted and untracked changes included. `base`
-    /// is a ref passed verbatim to `git diff --merge-base` (e.g. "origin/main"), so the review
-    /// follows fetches.
-    Branch { base: SharedString },
+    /// merge-base(base, HEAD) → working tree, uncommitted and untracked changes included.
+    Branch { base: BranchBase },
     /// One commit or a contiguous range of commits.
     Commits(CommitRange),
+}
+
+/// The ref a branch review compares against, e.g. "origin/main". It is passed by name to
+/// `git diff --merge-base`, so the review follows fetches. Every base is built by
+/// [`BranchBase::new`], which rejects anything git would parse as an option.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BranchBase(SharedString);
+
+impl BranchBase {
+    pub fn new(base: impl Into<SharedString>) -> Result<Self> {
+        let base = base.into();
+        if !is_plain_revision(&base) {
+            bail!("Invalid base {base:?}");
+        }
+        Ok(Self(base))
+    }
+
+    pub fn name(&self) -> &SharedString {
+        &self.0
+    }
+}
+
+impl fmt::Display for BranchBase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Revisions end up in git's arguments and in line-based `git cat-file --batch` input.
+fn is_plain_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && !revision.starts_with('-')
+        && !revision
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
 }
 
 /// The commits reachable from `head` but not from `base`, like git's `base..head`.
@@ -27,6 +61,12 @@ pub struct CommitRange {
 }
 
 impl ReviewTarget {
+    pub fn branch(base: impl Into<SharedString>) -> Result<Self> {
+        Ok(Self::Branch {
+            base: BranchBase::new(base)?,
+        })
+    }
+
     /// Whether a review of `other` is the same review as one of `self`, so its tab can be reused.
     pub fn is_same_review(&self, other: &Self) -> bool {
         self == other
@@ -78,8 +118,7 @@ pub(crate) enum CommitSpec {
     },
 }
 
-/// Parses "abc1234", "HEAD~2" or "A..B". Revisions end up in line-based `git cat-file --batch`
-/// input and in git arguments, so whitespace and leading dashes are rejected.
+/// Parses "abc1234", "HEAD~2" or "A..B".
 pub(crate) fn parse_commit_spec(input: &str) -> Result<CommitSpec> {
     let input = input.trim();
     if input.is_empty() {
@@ -102,10 +141,7 @@ fn validate_revision(revision: &str) -> Result<String> {
     if revision.is_empty() {
         bail!("A commit range needs a commit on both sides of \"..\"");
     }
-    if revision.chars().any(char::is_whitespace) {
-        bail!("Invalid revision {revision:?}");
-    }
-    if revision.starts_with('-') {
+    if !is_plain_revision(revision) {
         bail!("Invalid revision {revision:?}");
     }
     Ok(revision.to_string())
@@ -140,10 +176,23 @@ mod tests {
             }
         );
         for invalid in [
-            "", "  ", "-x", "A..-x", "A...B", "a b", "a\nb", "..B", "A..", "..",
+            "", "  ", "-x", "A..-x", "A...B", "a b", "a\nb", "a\0b", "..B", "A..", "..",
         ] {
             assert!(
                 parse_commit_spec(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_branch_base() {
+        for valid in ["origin/main", "main", "HEAD~2", "v1.0^{commit}"] {
+            assert_eq!(BranchBase::new(valid).unwrap().name(), valid);
+        }
+        for invalid in ["", "-x", "--output=/tmp/x", "a b", "main\n", "a\tb", "a\0b"] {
+            assert!(
+                BranchBase::new(invalid).is_err(),
                 "{invalid:?} should be rejected"
             );
         }

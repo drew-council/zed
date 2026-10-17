@@ -1,9 +1,10 @@
 use crate::{
     StartReview,
     commits::{RECENT_COMMITS_LIMIT, first_parent_chain},
-    target::{CommitRange, ReviewTarget},
+    target::{BranchBase, CommitRange, ReviewTarget},
     view::{ReviewView, active_repository, pick_base_for_new_review},
 };
+use anyhow::Context as _;
 use fuzzy::StringMatchCandidate;
 use git::repository::CommitData;
 use gpui::{
@@ -80,14 +81,18 @@ impl StartReviewModal {
 
         let load_tasks = vec![
             cx.spawn_in(window, async move |this, cx| {
-                let base = match default_branch.await {
-                    Ok(Ok(Some(base))) => BaseState::Found(base),
-                    Ok(Ok(None)) => BaseState::Missing,
-                    Ok(Err(error)) => {
+                let base = match default_branch
+                    .await
+                    .context("the git job was canceled")
+                    .flatten()
+                    .and_then(|base| base.map(BranchBase::new).transpose())
+                {
+                    Ok(Some(base)) => BaseState::Found(base),
+                    Ok(None) => BaseState::Missing,
+                    Err(error) => {
                         log::error!("finding the default branch: {error:#}");
-                        BaseState::Missing
+                        BaseState::Failed(format!("No default branch: {error}").into())
                     }
-                    Err(_) => BaseState::Missing,
                 };
                 this.update_in(cx, |this, window, cx| {
                     this.picker.update(cx, |picker, cx| {
@@ -149,8 +154,9 @@ impl Render for StartReviewModal {
 
 enum BaseState {
     Loading,
-    Found(SharedString),
+    Found(BranchBase),
     Missing,
+    Failed(SharedString),
 }
 
 pub(crate) enum RecentCommits {
@@ -297,7 +303,7 @@ impl StartReviewDelegate {
         match &self.default_base {
             BaseState::Loading => "Branch vs …".to_string(),
             BaseState::Found(base) => format!("Branch vs {base}"),
-            BaseState::Missing => "Branch vs (choose base)".to_string(),
+            BaseState::Missing | BaseState::Failed(_) => "Branch vs (choose base)".to_string(),
         }
     }
 
@@ -357,7 +363,13 @@ impl StartReviewDelegate {
         let mut entries = Vec::new();
         if !local_entries.is_empty() || status.is_some() {
             entries.push(Entry::Header(Section::Local));
-            entries.extend(local_entries);
+            for entry in local_entries {
+                let is_branch = matches!(entry, Entry::Branch { .. });
+                entries.push(entry);
+                if is_branch && let BaseState::Failed(error) = &self.default_base {
+                    entries.push(Entry::Status(error.clone()));
+                }
+            }
             entries.extend(status.map(Entry::Status));
         }
         // Milestone 7 appends the pull request section here.
@@ -407,8 +419,8 @@ impl StartReviewDelegate {
         let workspace = self.workspace.clone();
         let repo = self.repo.clone();
         let selected_base = match &self.default_base {
-            BaseState::Found(base) => Some(base.clone()),
-            BaseState::Loading | BaseState::Missing => None,
+            BaseState::Found(base) => Some(base.name().clone()),
+            BaseState::Loading | BaseState::Missing | BaseState::Failed(_) => None,
         };
         // The branch picker is another modal: it can only open once this one is gone.
         window.defer(cx, move |window, cx| {
@@ -918,9 +930,7 @@ mod tests {
         dispatch(menu::Confirm, cx);
         assert_eq!(
             active_review(&workspace, cx).read_with(cx, |review, _| review.target().clone()),
-            ReviewTarget::Branch {
-                base: "origin/main".into()
-            }
+            ReviewTarget::branch("origin/main").unwrap()
         );
     }
 

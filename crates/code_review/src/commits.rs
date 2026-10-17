@@ -1,4 +1,4 @@
-use crate::target::{CommitRange, CommitSpec};
+use crate::target::{BranchBase, CommitRange, CommitSpec};
 use anyhow::{Context as _, Result, anyhow, bail};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
@@ -133,7 +133,9 @@ pub(crate) fn first_parent_chain(
     )
 }
 
-/// Resolves a typed commit or range. A single commit is reviewed against its first parent.
+/// Resolves a typed commit or range. A single commit is reviewed against its first parent. In a
+/// range `A..B`, A must be on B's first-parent history: otherwise the diff from A would also
+/// revert A's own changes, and the range has no list of consecutive commits to show.
 pub(crate) fn resolve_commit_spec(
     repo: &Entity<Repository>,
     spec: CommitSpec,
@@ -145,7 +147,13 @@ pub(crate) fn resolve_commit_spec(
         move |backend| async move {
             match spec {
                 CommitSpec::Single(revision) => {
-                    let head = resolve_revision(backend.as_ref(), &revision).await?;
+                    let head = match resolve_commits(backend.as_ref(), &[&revision])
+                        .await?
+                        .as_slice()
+                    {
+                        [head] => *head,
+                        _ => bail!("Unknown revision {revision}"),
+                    };
                     let commit = backend
                         .commit_data_reader()?
                         .read(head)
@@ -156,58 +164,141 @@ pub(crate) fn resolve_commit_spec(
                         head,
                     })
                 }
-                CommitSpec::Range { from, to } => Ok(CommitRange {
-                    base: Some(resolve_revision(backend.as_ref(), &from).await?),
-                    head: resolve_revision(backend.as_ref(), &to).await?,
-                }),
+                CommitSpec::Range { from, to } => {
+                    let (base, head) = match resolve_commits(backend.as_ref(), &[&from, &to])
+                        .await?
+                        .as_slice()
+                    {
+                        [base, head] => (*base, *head),
+                        _ => bail!("Unknown revision {from}..{to}"),
+                    };
+                    if base == head {
+                        bail!("{from}..{to} has no commits");
+                    }
+                    if !is_first_parent_ancestor(backend.as_ref(), base, head).await? {
+                        bail!(
+                            "{from}..{to} isn't a range of consecutive commits: {from} is not \
+                             on {to}'s first-parent history"
+                        );
+                    }
+                    Ok(CommitRange {
+                        base: Some(base),
+                        head,
+                    })
+                }
             }
         },
         cx,
     )
 }
 
-async fn resolve_revision(backend: &dyn GitRepository, revision: &str) -> Result<Oid> {
-    // `Oid::from_str` also accepts abbreviated shas, padding them with zeros.
-    if is_full_sha(revision) {
-        return revision.parse();
+/// Resolves typed revisions to the commits they name (peeling tags), all in one
+/// `git cat-file --batch-check`.
+async fn resolve_commits(backend: &dyn GitRepository, revisions: &[&str]) -> Result<Vec<Oid>> {
+    let requests = revisions
+        .iter()
+        .flat_map(|revision| [revision.to_string(), format!("{revision}^{{commit}}")])
+        .collect();
+    let mut resolved = backend.revparse_batch(requests).await?.into_iter();
+    revisions
+        .iter()
+        .map(|revision| {
+            let object = resolved.next().flatten();
+            let commit = resolved.next().flatten();
+            resolved_commit(revision, object, commit)
+        })
+        .collect()
+}
+
+/// `git cat-file --batch-check` answers "‹name› missing" (which `revparse_batch` turns into
+/// `None`) or "‹name› ambiguous" instead of an object name. A tree or blob has no `^{commit}`.
+fn resolved_commit(revision: &str, object: Option<String>, commit: Option<String>) -> Result<Oid> {
+    if let Some(oid) = commit.as_deref().and_then(|sha| sha.parse::<Oid>().ok()) {
+        return Ok(oid);
     }
-    let resolved = backend
-        .revparse_batch(vec![format!("{revision}^{{commit}}")])
-        .await?;
-    resolved
-        .into_iter()
-        .next()
-        .flatten()
-        .and_then(|sha| sha.parse::<Oid>().ok())
-        .with_context(|| format!("Unknown revision {revision}"))
+    let is_ambiguous =
+        |answer: &Option<String>| answer.as_deref().is_some_and(|answer| answer.ends_with(" ambiguous"));
+    if is_ambiguous(&object) || is_ambiguous(&commit) {
+        bail!("Ambiguous revision {revision}");
+    }
+    if object.is_some() {
+        bail!("{revision} is not a commit");
+    }
+    bail!("Unknown revision {revision}")
 }
 
-fn is_full_sha(revision: &str) -> bool {
-    matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+/// How far back a range's oldest commit may be.
+const RANGE_COMMIT_LIMIT: usize = 10_000;
+
+/// Whether following first parents from `descendant` reaches `ancestor`.
+async fn is_first_parent_ancestor(
+    backend: &dyn GitRepository,
+    ancestor: Oid,
+    descendant: Oid,
+) -> Result<bool> {
+    let reader = backend.commit_data_reader()?;
+    let mut next = Some(descendant);
+    for _ in 0..RANGE_COMMIT_LIMIT {
+        let Some(sha) = next else {
+            return Ok(false);
+        };
+        if sha == ancestor {
+            return Ok(true);
+        }
+        next = match reader.read(sha).await {
+            Ok(commit) => commit.parents.first().copied(),
+            // A shallow clone's history ends at a commit whose parent is missing.
+            Err(error) if sha != descendant => {
+                log::info!("commit history ends before {sha}: {error:#}");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(false)
 }
 
-/// Checks that `base` names something git can diff against, so a typo in a keymap gives an error
-/// rather than an empty review.
-pub(crate) fn validate_ref(
+/// Checks that a branch review can compare HEAD with `base`: the base names a commit that has one
+/// merge base with HEAD. `DiffBufferList` only logs a failed comparison and then lists no files.
+pub(crate) fn check_branch_base(
     repo: &Entity<Repository>,
-    base: SharedString,
+    base: BranchBase,
     cx: &mut App,
 ) -> Task<Result<()>> {
-    if base.is_empty() || base.starts_with('-') || base.chars().any(char::is_whitespace) {
-        return Task::ready(Err(anyhow!("Invalid base {base:?}")));
-    }
     local_job(
         repo,
         "code review: check base",
         move |backend| async move {
-            let resolved = backend.revparse_batch(vec![base.to_string()]).await?;
-            if resolved.into_iter().next().flatten().is_none() {
-                bail!("Unknown base {base}");
-            }
+            let base_commit = match resolve_commits(backend.as_ref(), &[base.name().as_ref()])
+                .await?
+                .as_slice()
+            {
+                [base_commit] => *base_commit,
+                _ => bail!("Unknown revision {base}"),
+            };
+            backend
+                .diff_tree(DiffTreeType::MergeBase {
+                    base: base_commit.to_string().into(),
+                    head: "HEAD".into(),
+                })
+                .await
+                .map_err(|error| merge_base_error(&base, &error))?;
             Ok(())
         },
         cx,
     )
+}
+
+/// Git's `diff --merge-base` stops with "no merge base found" or "multiple merge bases found".
+fn merge_base_error(base: &BranchBase, error: &anyhow::Error) -> anyhow::Error {
+    let message = format!("{error:#}");
+    if message.contains("no merge base") {
+        anyhow!("{base} and HEAD have no common history")
+    } else if message.contains("multiple merge bases") {
+        anyhow!("{base} and HEAD have more than one merge base")
+    } else {
+        anyhow!("Can't compare HEAD with {base}: {}", message.trim())
+    }
 }
 
 fn base_tree(range: &CommitRange) -> SharedString {
@@ -734,8 +825,8 @@ mod tests {
         ReviewCommits, ReviewView,
         test_support::{
             C1, C2, C3, active_review, commit_data, cursor_line, cursor_point, dispatch, dot_git,
-            excerpt_paths, init_vim_test, move_to_row_with_text, open_workspace, path_at_cursor,
-            record_commit, repository, rhs_editor, tab_title,
+            excerpt_paths, init_vim_test, insert_commit_ref, move_to_row_with_text, open_workspace,
+            path_at_cursor, record_commit, repository, rhs_editor, tab_title,
         },
     };
     use editor::{Editor, test::editor_test_context::assert_state_with_diff};
@@ -817,6 +908,9 @@ mod tests {
                 (commit_data(C3, Some(C2), "Tweak b"), false),
             ],
         );
+        for sha in [C1, C2, C3] {
+            insert_commit_ref(&fs, sha, sha);
+        }
         cx.run_until_parked();
         (fs, workspace, cx)
     }

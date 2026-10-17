@@ -3,14 +3,14 @@ use crate::{
     PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
     ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
     ToggleHunkReviewed, ToggleSingleFileMode,
-    commits::{TOP_BLOCK_COMMIT_LIMIT, first_parent_chain, resolve_commit_spec, validate_ref},
+    commits::{TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain, resolve_commit_spec},
     diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
     gitattributes::{FileAttributes, GitAttributes},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
     reviewed::paint_reviewed_hunks,
     session::{ReviewSession, ReviewSessionEvent},
-    target::{ReviewTarget, parse_commit_spec},
+    target::{BranchBase, ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
 use collections::{HashMap, HashSet};
@@ -42,7 +42,7 @@ use util::ResultExt as _;
 use workspace::{
     ItemNavHistory, Toast, Workspace,
     item::{Item, ItemEvent},
-    notifications::{NotificationId, NotifyTaskExt as _},
+    notifications::{NotificationId, NotifyResultExt as _, NotifyTaskExt as _},
     searchable::SearchableItemHandle,
 };
 
@@ -94,13 +94,16 @@ fn review_branch(
     };
     let workspace_handle = cx.weak_entity();
     let task = match base {
+        // A base typed into a keymap is checked before the review opens, so a typo is an error
+        // rather than a tab explaining it.
         Some(base) => {
-            let base = SharedString::from(base);
-            let validation = validate_ref(&repo, base.clone(), cx);
+            let check = BranchBase::new(base)
+                .map(|base| (base.clone(), check_branch_base(&repo, base, cx)));
             window.spawn(cx, {
                 let workspace_handle = workspace_handle.clone();
                 async move |cx| {
-                    validation.await?;
+                    let (base, check) = check?;
+                    check.await?;
                     workspace_handle.update_in(cx, |workspace, window, cx| {
                         ReviewView::deploy_in_repo(
                             workspace,
@@ -118,7 +121,7 @@ fn review_branch(
             window.spawn(cx, {
                 let workspace_handle = workspace_handle.clone();
                 async move |cx| {
-                    let base = default_branch.await??;
+                    let base = default_branch.await??.map(BranchBase::new).transpose()?;
                     workspace_handle.update_in(cx, |workspace, window, cx| match base {
                         Some(base) => {
                             ReviewView::deploy_in_repo(
@@ -180,16 +183,12 @@ pub(crate) fn pick_base_for_new_review(
         let workspace_handle = workspace_handle.clone();
         let repo = repo.clone();
         move |branch, window, cx| {
-            let base = SharedString::from(branch.name().to_owned());
+            let target = ReviewTarget::branch(branch.name().to_owned());
             workspace_handle
                 .update(cx, |workspace, cx| {
-                    ReviewView::deploy_in_repo(
-                        workspace,
-                        ReviewTarget::Branch { base },
-                        repo.clone(),
-                        window,
-                        cx,
-                    );
+                    if let Some(target) = target.notify_err(workspace, cx) {
+                        ReviewView::deploy_in_repo(workspace, target, repo.clone(), window, cx);
+                    }
                 })
                 .log_err();
         }
@@ -416,7 +415,7 @@ impl ReviewView {
             ReviewTarget::Uncommitted => TopBlockContent::None,
             ReviewTarget::Branch { base } => TopBlockContent::Branch {
                 branch: branch_name(&repo, cx),
-                base: base.clone(),
+                base: base.name().clone(),
             },
             ReviewTarget::Commits(range) => TopBlockContent::Commits {
                 range: *range,
@@ -469,7 +468,7 @@ impl ReviewView {
                         (event, &this.target)
                     {
                         let branch = branch_name(repo, cx);
-                        let base = base.clone();
+                        let base = base.name().clone();
                         this.top_block
                             .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
                         this.update_session(window, cx);
@@ -1080,18 +1079,20 @@ impl ReviewView {
         let on_select: SelectBranchCallback = Arc::new({
             let workspace_handle = workspace_handle.clone();
             move |branch, window, cx| {
-                let base = SharedString::from(branch.name().to_owned());
+                let base = BranchBase::new(branch.name().to_owned());
                 let Some(view) = view.upgrade() else {
                     return;
                 };
                 workspace_handle
                     .update(cx, |workspace, cx| {
-                        Self::select_base(view, base, workspace, window, cx)
+                        if let Some(base) = base.notify_err(workspace, cx) {
+                            Self::select_base(view, base, workspace, window, cx)
+                        }
                     })
                     .log_err();
             }
         });
-        let selected_base = Some(base.clone());
+        let selected_base = Some(base.name().clone());
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
                 branch_picker::select_modal(
@@ -1110,7 +1111,7 @@ impl ReviewView {
     /// `base` is activated, otherwise `view` changes its base.
     pub(crate) fn select_base(
         view: Entity<Self>,
-        base: SharedString,
+        base: BranchBase,
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -1128,7 +1129,7 @@ impl ReviewView {
     /// Reviews the branch against `base` instead, in this tab.
     pub(crate) fn change_base(
         &mut self,
-        base: SharedString,
+        base: BranchBase,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1137,12 +1138,13 @@ impl ReviewView {
             return;
         }
         self.target = target;
+        let base_name = base.name().clone();
         self.diff
-            .update(cx, |diff, cx| diff.set_branch_base(base.clone(), cx));
+            .update(cx, |diff, cx| diff.set_branch_base(base, cx));
         self.update_session(window, cx);
         let branch = branch_name(&self.repo, cx);
         self.top_block
-            .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
+            .update(cx, |top_block, cx| top_block.set_branch(branch, base_name, cx));
         cx.emit(EditorEvent::TitleChanged);
         cx.notify();
     }
@@ -1873,8 +1875,8 @@ mod tests {
             diff::DiffSource,
             target::CommitRange,
             test_support::{
-                C1, C2, C3, active_review, commit_data, dispatch, dot_git, excerpt_paths, oid,
-                open_workspace, repository, review_count, tab_title,
+                C1, C2, C3, active_review, commit_data, dispatch, dot_git, excerpt_paths,
+                insert_commit_ref, oid, open_workspace, repository, review_count, tab_title,
             },
         };
         use gpui::VisualTestContext;
@@ -1930,11 +1932,8 @@ mod tests {
                 ],
             );
             fs.set_branch_name(dot_git(), Some("feature"));
-            fs.with_git_state(dot_git(), true, |state| {
-                state.refs.insert("origin/main".into(), C1.into());
-                state.refs.insert("main".into(), C2.into());
-            })
-            .unwrap();
+            insert_commit_ref(&fs, "origin/main", C1);
+            insert_commit_ref(&fs, "main", C2);
             let (workspace, cx) = open_workspace(fs.clone(), cx).await;
             (fs, workspace, cx)
         }
@@ -1942,16 +1941,14 @@ mod tests {
         #[gpui::test]
         async fn test_review_branch_shows_merge_base_to_working_tree(cx: &mut TestAppContext) {
             crate::init_test(cx);
-            let (_fs, workspace, cx) = branch_fixture(cx).await;
+            let (fs, workspace, cx) = branch_fixture(cx).await;
 
             dispatch(ReviewBranch::default(), cx);
             let review = active_review(&workspace, cx);
             assert_eq!(tab_title(&review, cx), "Review: feature vs origin/main");
             assert_eq!(
                 review.read_with(cx, |review, _| review.target().clone()),
-                ReviewTarget::Branch {
-                    base: "origin/main".into()
-                }
+                ReviewTarget::branch("origin/main").unwrap()
             );
             // Committed, uncommitted and untracked changes since the merge base, and deletions.
             assert_eq!(
@@ -2008,16 +2005,27 @@ mod tests {
             assert_eq!(review_count(&workspace, cx), 1);
             assert_eq!(active_review(&workspace, cx), review);
 
-            // An unknown base is an error, not an empty review.
+            // A base that isn't one commit is an error, not an empty review. The fake repository
+            // answers like `git cat-file --batch-check` would.
+            fs.with_git_state(dot_git(), true, |state| {
+                state.refs.insert("abc1".into(), "abc1 ambiguous".into());
+                state
+                    .refs
+                    .insert("abc1^{commit}".into(), "abc1^{commit} ambiguous".into());
+                state.refs.insert("HEAD:both.txt".into(), C3.into());
+            })
+            .unwrap();
             assert_eq!(take_notifications(&workspace, cx), 0);
-            dispatch(
-                ReviewBranch {
-                    base: Some("nope".into()),
-                },
-                cx,
-            );
-            assert_eq!(review_count(&workspace, cx), 1);
-            assert_eq!(take_notifications(&workspace, cx), 1);
+            for base in ["nope", "abc1", "HEAD:both.txt", "--output=/tmp/x", "a b"] {
+                dispatch(
+                    ReviewBranch {
+                        base: Some(base.into()),
+                    },
+                    cx,
+                );
+                assert_eq!(review_count(&workspace, cx), 1, "{base:?}");
+                assert_eq!(take_notifications(&workspace, cx), 1, "{base:?}");
+            }
 
             dispatch(
                 ReviewBranch {
@@ -2050,14 +2058,13 @@ mod tests {
             dispatch(menu::Cancel, cx);
 
             workspace.update_in(cx, |workspace, window, cx| {
-                ReviewView::select_base(review.clone(), "main".into(), workspace, window, cx)
+                let base = BranchBase::new("main").unwrap();
+                ReviewView::select_base(review.clone(), base, workspace, window, cx)
             });
             cx.run_until_parked();
             assert_eq!(
                 review.read_with(cx, |review, _| review.target().clone()),
-                ReviewTarget::Branch {
-                    base: "main".into()
-                }
+                ReviewTarget::branch("main").unwrap()
             );
             assert_eq!(tab_title(&review, cx), "Review: feature vs main");
             assert_eq!(
@@ -2076,9 +2083,7 @@ mod tests {
             let other = workspace.update_in(cx, |workspace, window, cx| {
                 ReviewView::deploy_in_repo(
                     workspace,
-                    ReviewTarget::Branch {
-                        base: "origin/main".into(),
-                    },
+                    ReviewTarget::branch("origin/main").unwrap(),
                     repo,
                     window,
                     cx,
@@ -2088,15 +2093,14 @@ mod tests {
             assert_ne!(other, review);
             workspace.update_in(cx, |workspace, window, cx| {
                 workspace.activate_item(&review, true, true, window, cx);
-                ReviewView::select_base(review.clone(), "origin/main".into(), workspace, window, cx)
+                let base = BranchBase::new("origin/main").unwrap();
+                ReviewView::select_base(review.clone(), base, workspace, window, cx)
             });
             cx.run_until_parked();
             assert_eq!(active_review(&workspace, cx), other);
             assert_eq!(
                 review.read_with(cx, |review, _| review.target().clone()),
-                ReviewTarget::Branch {
-                    base: "main".into()
-                }
+                ReviewTarget::branch("main").unwrap()
             );
             assert_eq!(review_count(&workspace, cx), 2);
         }
@@ -2127,7 +2131,10 @@ mod tests {
                     ),
                 ],
             );
-            let (workspace, cx) = open_workspace(fs, cx).await;
+            for sha in [C1, C2, C3] {
+                insert_commit_ref(&fs, sha, sha);
+            }
+            let (workspace, cx) = open_workspace(fs.clone(), cx).await;
 
             let range = format!("{C1}..{C3}");
             dispatch(
@@ -2202,12 +2209,27 @@ mod tests {
                 "Review: 3333333 Write three, which i…"
             );
 
-            // Typos are errors.
+            // Typos, revisions that aren't commits and ranges that aren't consecutive commits are
+            // errors.
+            const MISSING: &str = "4444444444444444444444444444444444444444";
+            const TREE: &str = "5555555555555555555555555555555555555555";
+            fs.with_git_state(dot_git(), true, |state| {
+                state.refs.insert(TREE.into(), TREE.into());
+            })
+            .unwrap();
             assert_eq!(take_notifications(&workspace, cx), 0);
-            for commits in ["nope..HEAD", "a b"] {
+            for commits in [
+                "nope..HEAD".to_string(),
+                "a b".to_string(),
+                MISSING.to_string(),
+                TREE.to_string(),
+                format!("{TREE}..{C3}"),
+                format!("{C3}..{C1}"),
+                format!("{C2}..{C2}"),
+            ] {
                 dispatch(
                     ReviewCommits {
-                        commits: Some(commits.into()),
+                        commits: Some(commits.clone()),
                     },
                     cx,
                 );

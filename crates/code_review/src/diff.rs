@@ -3,7 +3,7 @@ use crate::{
     commits::CommitDiffList,
     reviewed::{ReviewHunkRenderer, render_file_checkbox},
     session::{FileDigest, file_digest},
-    target::ReviewTarget,
+    target::{BranchBase, ReviewTarget},
 };
 use anyhow::Result;
 use buffer_diff::{BufferDiff, BufferDiffEvent};
@@ -58,7 +58,7 @@ impl DiffSource {
         let diff_base = match target {
             ReviewTarget::Uncommitted => DiffBase::Head,
             ReviewTarget::Branch { base } => DiffBase::Merge {
-                base_ref: base.clone(),
+                base_ref: base.name().clone(),
             },
             ReviewTarget::Commits(range) => {
                 let range = *range;
@@ -312,14 +312,15 @@ impl ReviewDiff {
     }
 
     /// Changes the base of a branch review. The list empties and reloads against the new base.
-    pub(crate) fn set_branch_base(&mut self, base: SharedString, cx: &mut Context<Self>) {
+    pub(crate) fn set_branch_base(&mut self, base: BranchBase, cx: &mut Context<Self>) {
         let DiffSource::BufferList(list) = &self.source else {
             return;
         };
-        self.empty_label = ReviewTarget::Branch { base: base.clone() }.empty_label();
+        let base_ref = base.name().clone();
+        self.empty_label = ReviewTarget::Branch { base }.empty_label();
         self.awaiting_tree_diff = true;
         list.update(cx, |list, cx| {
-            list.set_diff_base(DiffBase::Merge { base_ref: base }, cx)
+            list.set_diff_base(DiffBase::Merge { base_ref }, cx)
         });
         cx.notify();
     }
