@@ -17,7 +17,9 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 **Status: milestones 1–6 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
-persistence, panel list" with the M5 part 1 review fixes) and M6 (export, see "Milestone 6").** The
+persistence, panel list" with the M5 part 1 review fixes) and M6 (export, see "Milestone 6"); M7 in
+progress: slice (a), the GitHub client (see "Milestone 7, slice (a)"), is done; slices (b) PR
+picker + checkout, (c) description + threads and (d) submit are next.** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
@@ -35,7 +37,9 @@ whole review (`;c`) open vim editors in insert mode, render as markdown, have ty
 deleted and navigated with `i`/`Enter`, `dd` and `]t`/`[t`/`m`/`M`; they are stored in Zed's DB per
 review, follow the code while the review is open and are flagged outdated when their lines changed
 while it was closed. `y` copies the review as Markdown in tuicr's format, `Y` the comment at the
-cursor, visual `y` the selected lines. Next: M7 (GitHub), then M8 (CLI).
+cursor, visual `y` the selected lines. A GitHub client (no UI yet) resolves a checkout's GitHub
+repository (a fork's parent), lists and reads its pull requests, threads, reviews and commentable
+lines. Next: M7 slices (b)–(d), then M8 (CLI).
 
 What exists:
 
@@ -52,6 +56,10 @@ What exists:
 | `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment blocks on both sides of the diff (`reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), anchors for stored comments + the outdated check (`resolve_anchors`), live line numbers (`sync_positions`), comment editors (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
+| `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`), the `Forge` trait, `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
+| `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, remote parsing, token lookup and cache, `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache; tests with a fake `HttpClient` and an ignored live test |
+| `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
+| `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header checkbox, `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
@@ -537,6 +545,88 @@ state dir):**
 - `ReviewView::review_markdown(&self, cx) -> Option<String>` (pub) is the text M8's `--wait` finish
   prints.
 
+**Milestone 7, slice (a) (GitHub client)** — `plans/M7-github-v2.md` §2 with the live verification
+(`plans/M7-live-verification.md`, "LV") unless noted. No upstream file changed (new deps
+`http_client`; dev-deps `http_client/test-support`, `git_hosting_providers`):
+
+- **`forge.rs`/`github.rs`** as in the plan; `Forge` methods return `BoxFuture<'static,
+  anyhow::Result<_>>` whose errors are a `GitHubError` (`forge::error_message` finds it in the chain
+  and returns its hint, else `{error:#}`; `Display` of `GitHubError` is the hint, so
+  `detach_and_notify_err` shows it too). `forge::show_error_toast(workspace, &error, cx)` is the toast
+  helper (SSO errors get an "Authorize" button). No `submit_review` yet (slice d).
+- **Resolution** (`resolve_forge(repo, reference, project, cx)`): GitHub remotes from
+  `Repository::remote_urls()`, preferred: the branch's upstream remote, `origin`, `upstream`, then by
+  name. A remote is GitHub when its host is `github.com`, ends in `.ghe.com`, or matches the base URL
+  of a hosting provider named "GitHub"/"GitHub Self-Hosted" (Zed registers a self-hosted one from
+  `origin` only when its host contains "github"; providers configured in settings with other names
+  aren't recognised). `RepositoryContext` query → `canonical` = `parent` when `isFork` (**user
+  decision: a fork's checkout lists the upstream's PRs**). A `reference` that names a remote's
+  repository (case-insensitive) uses that repository as is (no parent); otherwise it must equal the
+  canonical repository, else `GitHubError::OtherRepository` ("Open this pull request from a checkout of
+  o/r."). No GitHub remote → `GitHubError::Unsupported`. `canonical_https_url` is GitHub's `url`
+  (no `.git`), `canonical_ssh_url` its `sshUrl`.
+- **Caches**: forges per (work dir, origin/upstream URLs, branch remote, reference) in the
+  `GitHubForges` global; tokens per host in `GitHubTokens` (`Shared` tasks, so parallel callers share
+  one lookup). A failed lookup or resolution is retried on the next call. A 401 marks the token
+  revoked (`GitHubToken` clones share the flag): the next `resolve_forge` resolves the forge and looks
+  the token up again. **Holders of an `Arc<dyn Forge>` (slice b/c's `PullRequestState`) must call
+  `resolve_forge` again after a `GitHubError::Auth`** to pick up a new token.
+- **Token** (never logged; `GitHubToken`'s `Debug` redacts it; requests are logged at debug level
+  with method, URL, operation and status only): `GITHUB_TOKEN` of Zed's process, then of the
+  project's directory environment (`ProjectEnvironment::directory_environment(work_dir)`, direnv), then
+  `gh auth token --hostname <host>` run with that environment (`kill_on_drop`, 10 s executor timer;
+  stdout trimmed). `GitHubError::Auth { host, failure: Rejected | NoToken | NoTokenNoCli }`: the last
+  one (gh missing) says "or install the GitHub CLI". Tests install a fake source
+  (`github::set_fake_token_source`), so they never read the real environment or run `gh`.
+- **Transport**: endpoints `api.github.com` / `api.{H}` (`*.ghe.com`) / `{H}/api/v3` +
+  `{H}/api/graphql` (GHES); headers `Authorization: Bearer`, `Accept: application/vnd.github+json`,
+  `X-GitHub-Api-Version: 2022-11-28` (also on GraphQL, accepted live), `Content-Type` on bodies, 30 s
+  timeout; GraphQL body `{query: <whole document>, operationName, variables}`. GraphQL connections
+  are paged at `hasNextPage` (cap 20 pages); `pulls/N/files?per_page=100&page=k` until a short page
+  (cap 30 pages → `truncated`).
+- **Queries** (C12, C14): `OpenPullRequests` = `repository.pullRequests(states: OPEN, first: 50,
+  UPDATED_AT DESC)`; review-requested = `search` "repo:o/r is:pr is:open review-requested:@me
+  sort:updated-desc" (`{}` and null nodes skipped); `PullRequestDetails` and `PullRequestHead` select
+  the viewer's pending review through an aliased `pendingReviews: reviews(states: [PENDING], first:
+  1)` (filtered on `viewerDidAuthor`); thread comments select `state` and `commit { oid }`. Commit ids
+  from GitHub must be full 40/64-hex ids (they become git arguments in slice b).
+- **Thread parsing** (C6/C7/C12, pure `parse_thread`): FILE first; `line == null` → `Outdated
+  { original_line, original_start }`; single-line iff `startDiffSide == null`; a range starts at
+  `startLine` (RIGHT) or `originalStartLine` (LEFT); `(startSide, start) == (side, line)` → single
+  line. `anchor_commit` = the first comment's `commit.oid` (placement compares it with the local HEAD in
+  slice c). Threads whose first comment is PENDING are dropped, and so are pending replies
+  (`total_comments` excludes them). `Actor.is_bot` = `__typename == "Bot"` or a `[bot]` suffix; a
+  deleted author is "ghost". `RemoteThread::is_by_bot` (its first comment's author) is what the bot
+  toggle hides (**user decision: bot threads hidden by default, like bot summaries**; the filtering
+  itself is slice c). Summaries drop empty/whitespace bodies and PENDING reviews.
+- **Commentable lines** (LV §5.2): GitHub's `patch` hunks (`Hunk { old, new, rows }`; `rows` are the
+  patch body's runs of context/deleted/added rows). `allows(path, side, line)` = inside a hunk's
+  range on that side (context rows on both); no `patch` → no lines (file comments only).
+  `allows_range` = both ends allowed and the start not after the end **in the patch's row order**
+  (a hunk with several changes interleaves deletions and additions, so "deletions first" isn't
+  enough); ranges may span hunks. Paths: a renamed file is found by its old path too;
+  `current_path` gives the new path for submit. `contains_file` is true for files of the PR, and for
+  any file when the list is `truncated` (they might be in the PR; lines stay refused).
+- **Errors** (`GitHubError::hint`, LV §5.6 wording verbatim): 401 → Auth (token revoked); 403/429
+  with `x-ratelimit-remaining: 0`, `retry-after` or a "rate limit" message → `RateLimited { reset }`
+  ("Try again in N minutes"); 403 with `X-GitHub-SSO` → `Sso { url }`; other 403 → `Forbidden`; 404
+  and GraphQL `NOT_FOUND` (HTTP 200 + `errors`) → `NotFound { what: "o/r#N" }`; GraphQL
+  `RATE_LIMITED` → `RateLimited`; GraphQL `FORBIDDEN` (+ `X-GitHub-SSO`) → `Forbidden`/`Sso`; other
+  GraphQL errors → `GraphQl`; 422 → `Validation { messages, raw_message }` (string or object
+  `errors`, `message` fallback, empty strings kept); anything else (5xx, network, unparsable
+  responses) → `Transport`. Deviation: the commitOID hint has no sha and the pending-review hint no
+  PR link yet; slice (d) knows both and should add them when it maps its errors.
+- **Live check (a)** (read-only): every query of `queries.graphql` run with `gh api graphql --input`
+  against the sandbox (no `errors`; PR A threads match LV §3 exactly; `drew-council/zed` → `isFork`,
+  parent `zed-industries/zed`); the fixtures in `test_data/github/` are those responses (REST files
+  trimmed to `filename`, `previous_filename`, `status`, `patch`). Then the ignored test
+  `github::tests::live_github_sandbox` ran the real code path (`resolve_forge` → every `Forge`
+  method, PR #999 → NotFound) against the sandbox, once with `GITHUB_TOKEN=$(gh auth token)` and once
+  without it (the `gh auth token` path): both passed. Its HTTP client is a test shim that runs `curl
+  --config -` (the token goes through stdin, not argv) to avoid a `reqwest_client` dev-dependency.
+  Run it by hand with `cargo test -p code_review live_github -- --ignored`.
+- Tests: 21 new (110 total + 1 ignored live test). Clippy clean.
+
 **Known issues / notes for the next slices:**
 
 - **M7 hooks** (`plans/M7-github-v2.md` §6):
@@ -586,8 +676,8 @@ state dir):**
   `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
   in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 89 tests
-  (after M6), stable under `ITERATIONS=5`.
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 110 tests
+  + 1 ignored live GitHub test (after M7 slice a; 89 after M6, stable under `ITERATIONS=5`).
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
   snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
   `]f`/`]c`/line cursor/`e` in branch, live and snapshot reviews.
@@ -597,6 +687,16 @@ state dir):**
   keeps its last tree diff when a reload fails, so a base deleted (or HEAD switched to an unrelated
   branch) after a review opened shows the stale file list; the error label only replaces an empty
   list (the base is re-checked on `HeadChanged`).
+- **M7 slice (b) entry points** (from slice a): `forge::resolve_forge(&repo, reference, &project,
+  cx)` (call it on the picker's open and on `OpenPullRequest`; `GitHubError::Unsupported` → hide the
+  PR section), `Forge::list_pull_requests(Open | ReviewRequested)`, `Forge::pull_request(n)`;
+  `forge::error_message(&error)` for status rows, `forge::show_error_toast` for toasts.
+  `PullRequestDetails.base_oid`/`head_oid` are already full-length `Oid`s (still pass `base_oid`
+  through `BranchBase::new`); `head_ref`/`base_ref` are untrusted (validate them). For C15 compare a
+  remote's repository (`ForgeRepo`, from the same remote parsing: expose `github_repo_for_remote` or
+  re-parse) with `details.head_repository` via `ForgeRepo::is_same_repo` (case-insensitive).
+  `RepositoryContext` has `canonical_https_url`/`canonical_ssh_url`/`origin_is_ssh` for the refspec
+  fetch source.
 - M7 slots: `Section` in `picker.rs` (add the pull request section after the Local entries in
   `StartReviewDelegate::set_matches`), `StartReviewFocus` (add
   `PullRequests` for `OpenPullRequest { number: None }`), `ReviewTarget` (add `PullRequest`; override
@@ -858,7 +958,10 @@ move line by line; there is no column.
 
 - Existing review threads render inline, **read-only**; resolved and outdated hidden by default
   (toggle). **Bot review summaries hidden by default** (tuicr `050f0f8`: `is_bot` via
-  `__typename == "Bot"` or `[bot]` login, `src/forge/github/review_summaries.rs:138`).
+  `__typename == "Bot"` or `[bot]` login, `src/forge/github/review_summaries.rs:138`), and **bot
+  threads too, behind the same toggle** (user decision during M7).
+- A fork's checkout (e.g. `drew-council/zed`) lists the **upstream parent's** pull requests (user
+  decision during M7); `owner/repo#N` or a URL still reaches the fork's own.
 - **Submit modal:** Comment / Approve / Request changes; counts; body preview (from review-level
   comments); stale-head warning (head moved since load); when GitHub requires a body (Request changes,
   and Comment with no inline comments — verify) and none exists, prompt to add a review-level comment.
@@ -889,7 +992,7 @@ covers it), tuicr's `tuicr review` CLI protocol.
 
 ## 3. Architecture
 
-### 3.1 Crate layout (proposed; as of M6 `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,view}.rs` and `export.rs` exist too; `github/`, `checkout.rs`, `submit.rs`, `cli.rs` don't yet)
+### 3.1 Crate layout (proposed; as of M7 slice (a) `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,view}.rs`, `export.rs`, `forge.rs`, `github.rs` + `github/queries.graphql` exist too; `pull_request.rs`, `checkout.rs`, `submit.rs`, `cli.rs` don't yet)
 
 ```
 crates/code_review/
@@ -908,7 +1011,9 @@ crates/code_review/
   src/comments/         # model, blocks, CommentEditor (vim child editor), focus/keys
   src/panel.rs          # ReviewPanel (dock): file tree, filters, comment list
   src/picker.rs         # StartReview picker (Local section; PR section in M7)
-  src/github/           # provider trait + GitHub impl (GraphQL/REST via HttpClient), auth
+  src/forge.rs          # forge-neutral PR types, Forge trait, resolve_forge, error helpers (M7a)
+  src/github.rs         # GitHub impl (GraphQL/REST via HttpClient), auth, parsing (M7a)
+  src/github/queries.graphql  # every GraphQL operation (M7a)
   src/checkout.rs       # PR checkout (change_branch / refs/pull fetch / worktree)
   src/submit.rs         # submit modal + payload mapping
   src/export.rs         # markdown export
@@ -1120,7 +1225,7 @@ Port behaviour (not code) from tuicr's `gh`-based backend; implement with `HttpC
 | Review threads | `src/forge/github/review_threads.rs:244` (`reviewThreads{isResolved isOutdated path line originalLine diffSide comments{…}}`) | anchors are on the **thread**, not the comment; tuicr doesn't fetch `startLine` (fetch it) |
 | Review summaries / bots | `src/forge/github/review_summaries.rs` (`__typename`, `is_bot_login`) | bots hidden by default |
 | Viewer + last-review commit | `src/forge/github/review_metadata.rs` | deferred (since-last-review) |
-| Create review | `src/forge/github/submit.rs:17` `build_review_payload`; `gh.rs:571` | REST `POST repos/{o}/{r}/pulls/{n}/reviews` `{commit_id, body, event, comments:[{path, line, side, start_line?, start_side?, body}]}`; file comments: use `subject_type: "file"` (tuicr fakes them) |
+| Create review | `src/forge/github/submit.rs:17` `build_review_payload`; `gh.rs:571` | REST `POST repos/{o}/{r}/pulls/{n}/reviews` `{commit_id, body, event, comments:[{path, line, side, start_line?, start_side?, body}]}`; file comments: not possible there (LV L10): pending review, then `addPullRequestReviewThread(subjectType: FILE)` per file, then `/events` (LV §5.3) |
 | Error handling | `gh.rs:1050` (permission / pending-review / commit_id hints) | a user can have only one pending review per PR |
 
 Gotchas carried over: `commit_id` must be the reviewed head (stale-head check before submit); GitHub
@@ -1167,10 +1272,11 @@ Post-v1: thread replies/resolve → suggestion blocks → §2.9 list.
 
 ## 7. Open technical questions / risks (decide during implementation)
 
-- Which context lines GitHub accepts for inline comments (only lines inside GitHub's diff hunks?
-  expanded lines?) — determines which rows allow `c` in PR reviews. Verify against the API.
-- Exact GitHub body requirement for COMMENT with inline comments (docs say required for
-  REQUEST_CHANGES/COMMENT) — verify.
+- ~~Which context lines GitHub accepts~~ — answered (LV §5.2, `plans/M7-live-verification.md`): only
+  rows inside GitHub's own patch hunks (context rows on either side), ranges may span hunks; built
+  into `CommentableLines` (M7a).
+- ~~Exact GitHub body requirement~~ — answered (LV §5.1): `body_required = comment_count == 0 && event
+  != Approve` (slice d).
 - Upstream `diff-review` prototype: keep the flag off; watch for upstream turning it on in diff views
   (its gutter "+" would appear in our editor if we used `set_show_diff_review_button`; don't).
 - `HighlightKey` is a closed enum (`display_map.rs:160-193`) — use row highlights (TypeId-keyed) only.
