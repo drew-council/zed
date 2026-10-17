@@ -1521,7 +1521,7 @@ impl CommentBlocks {
         let current = self
             .items_at_cursor(cx)
             .and_then(|at_cursor| self.selected.clone().filter(|key| at_cursor.contains(key)))
-            .and_then(|key| items.iter().find(|item| item.4 == key).cloned());
+            .and_then(|key| items.iter().find(|item| item.5 == key).cloned());
         let target = match &current {
             Some(current) => match direction {
                 Direction::Next => items.iter().find(|item| *item > current),
@@ -1555,11 +1555,11 @@ impl CommentBlocks {
     }
 
     /// The line and file comments and the threads in the order of the diff: by file, file
-    /// comments first, then by the new file's line (old lines at the new line they face), then
-    /// in the order their blocks show at one place (threads in GitHub's order, then comments).
-    /// Comments in files the filters hide, and comments on lines the diff doesn't show, are left
-    /// out.
-    fn comment_order(&self, cx: &App) -> Vec<(usize, i64, Side, usize, ItemKey)> {
+    /// comments first, then by the new file's line (old lines at the new line they face, by
+    /// their old line), then in the order their blocks show at one place (threads in GitHub's
+    /// order, then comments). Comments in files the filters hide, and comments on lines the
+    /// diff doesn't show, are left out.
+    fn comment_order(&self, cx: &App) -> Vec<(usize, i64, Side, u32, usize, ItemKey)> {
         let diff = self.diff.read(cx);
         let order = diff.file_order();
         let rhs = self.rhs_editor(cx);
@@ -1568,24 +1568,26 @@ impl CommentBlocks {
         let position = |target: &CommentTarget, anchor: Option<&Range<language::Anchor>>| {
             let path_key = review_path_key(target.path()?);
             let file_index = order.iter().position(|key| key == &path_key)?;
-            let (row, side) = match target {
-                CommentTarget::File { .. } => (-1, Side::Old),
+            let (row, side, side_row) = match target {
+                CommentTarget::File { .. } => (-1, Side::Old, 0),
                 CommentTarget::Lines { side, .. } => {
                     let anchor = anchor?;
-                    // Files hidden by single-file mode have no excerpts to check.
+                    // Files hidden by single-file mode have no excerpts to check. Folded
+                    // (reviewed) files count: landing on a comment unfolds its file.
                     if diff.is_shown(&path_key) {
-                        line_row_anchor(target, anchor, &hosts, diff, cx)?;
+                        line_row_in_excerpts(target, anchor, &hosts, diff, cx)?;
                     }
                     let (buffer, file_diff) = diff.file_diff(&path_key)?;
                     let buffer = buffer.read(cx).snapshot();
                     // An anchor into a buffer that was replaced since (the file left the
                     // review and came back) can't be resolved.
-                    let row = match side {
+                    let (row, side_row) = match side {
                         Side::New => {
                             if !buffer.can_resolve(&anchor.end) {
                                 return None;
                             }
-                            anchor.end.to_point(&buffer).row
+                            let row = anchor.end.to_point(&buffer).row;
+                            (row, row)
                         }
                         Side::Old => {
                             let file_diff = file_diff.read(cx).snapshot(cx);
@@ -1593,16 +1595,17 @@ impl CommentBlocks {
                                 return None;
                             }
                             let point = anchor.end.to_point(file_diff.base_text());
-                            file_diff
+                            let row = file_diff
                                 .base_text_point_to_buffer_point(Point::new(point.row, 0), &buffer)
-                                .row
+                                .row;
+                            (row, point.row)
                         }
                     };
-                    (i64::from(row), *side)
+                    (i64::from(row), *side, side_row)
                 }
                 CommentTarget::Review => return None,
             };
-            Some((file_index, row, side))
+            Some((file_index, row, side, side_row))
         };
         let comments = self
             .session
@@ -1616,21 +1619,24 @@ impl CommentBlocks {
                     .lines
                     .get(&comment.id)
                     .map(|anchor| &anchor.range);
-                let (file_index, row, side) = position(&comment.target, anchor)?;
+                let (file_index, row, side, side_row) = position(&comment.target, anchor)?;
                 Some((
                     file_index,
                     row,
                     side,
+                    side_row,
                     comment_block_priority(comment.id),
                     ItemKey::Comment(comment.id),
                 ))
             });
         let remote = self.remote.iter().filter_map(|(key, block)| {
-            let (file_index, row, side) = position(&block.target, block.anchor.as_ref())?;
+            let (file_index, row, side, side_row) =
+                position(&block.target, block.anchor.as_ref())?;
             Some((
                 file_index,
                 row,
                 side,
+                side_row,
                 block.order,
                 ItemKey::Remote(key.clone()),
             ))
@@ -2114,14 +2120,27 @@ fn line_row_anchor(
     diff: &ReviewDiff,
     cx: &App,
 ) -> Option<(Host, Anchor)> {
-    let CommentTarget::Lines { path, side, .. } = target else {
-        return None;
-    };
+    let path = target.path()?;
     let buffer_id = diff.buffer_id_for(&review_path_key(path), cx)?;
     // Folding the right side folds the left side too.
     if hosts.rhs.is_buffer_folded(buffer_id, cx) {
         return None;
     }
+    line_row_in_excerpts(target, anchor, hosts, diff, cx)
+}
+
+/// Like [`line_row_anchor`], also while the file is folded: its excerpts are still there.
+fn line_row_in_excerpts(
+    target: &CommentTarget,
+    anchor: &Range<language::Anchor>,
+    hosts: &Hosts,
+    diff: &ReviewDiff,
+    cx: &App,
+) -> Option<(Host, Anchor)> {
+    let CommentTarget::Lines { path, side, .. } = target else {
+        return None;
+    };
+    let buffer_id = diff.buffer_id_for(&review_path_key(path), cx)?;
     match (side, &hosts.lhs_snapshot) {
         (Side::New, _) => Some((Host::Rhs, hosts.rhs_snapshot.anchor_in_excerpt(anchor.end)?)),
         // The left side shows the diff base.
@@ -2163,9 +2182,11 @@ fn old_row_in_unified_diff(
                 .anchor_in_excerpt(buffer.anchor_before(hunk.range.start))?
                 .with_diff_base_anchor(base_text.anchor_before(row_start)),
         ),
+        // Right-biased: after a pure deletion the removed rows sit at the same place in the new
+        // file, and a left-biased anchor would resolve to the first of them.
         None => {
             let point = file_diff.base_text_point_to_buffer_point(row_start, buffer);
-            snapshot.anchor_in_excerpt(buffer.anchor_before(point))
+            snapshot.anchor_in_excerpt(buffer.anchor_after(point))
         }
     }
 }
@@ -2940,6 +2961,38 @@ mod tests {
         assert_eq!(targeted(cx), None);
         cx.simulate_keystrokes("j");
         assert_eq!(targeted(cx), None);
+
+        // The line comments of a reviewed (folded) file are visited too, unfolding the file
+        // (V3.15).
+        move_to_row_with_text(&rhs, "line 1", cx);
+        cx.simulate_keystrokes("r");
+        assert!(is_folded(&review, "a.rs", cx));
+        let a_rs = review.read_with(cx, |review, cx| {
+            let diff = review.diff().read(cx);
+            diff.buffer_id_for(&review_path_key(&RepoPath::new("a.rs").unwrap()), cx)
+                .unwrap()
+        });
+        for (start, keys, body) in [
+            ("new 1", "[ t", "line 36"),
+            ("new 1", "shift-m", "line 36"),
+            ("three", "] t ] t", "line 3"),
+            ("three", "m m", "line 3"),
+        ] {
+            rhs.update(cx, |editor, cx| editor.fold_buffer(a_rs, cx));
+            cx.run_until_parked();
+            move_to_row_with_text(&rhs, start, cx);
+            cx.simulate_keystrokes(keys);
+            assert_eq!(targeted(cx).as_deref(), Some(body), "after {keys}");
+            assert_eq!(cursor_line(&rhs, cx), body, "after {keys}");
+            assert!(!is_folded(&review, "a.rs", cx), "after {keys}");
+            assert_back_in_diff(&rhs, cx);
+        }
+        assert!(review.read_with(cx, |review, cx| {
+            review
+                .session()
+                .read(cx)
+                .is_file_reviewed(&RepoPath::new("a.rs").unwrap())
+        }));
     }
 
     #[gpui::test]
@@ -3281,6 +3334,78 @@ mod tests {
         rhs.update(cx, |editor, cx| editor.unfold_buffer(buffer_id, cx));
         cx.run_until_parked();
         assert_eq!(on_sides(cx), [true]);
+    }
+
+    /// In a unified diff, an old-side comment on the unchanged row right after a pure deletion
+    /// sits below that row, not below the removed row facing the same place in the new file,
+    /// and `]t` visits it after the removed row's comment (V7.X3).
+    #[gpui::test]
+    async fn test_old_side_comment_after_a_pure_deletion(cx: &mut TestAppContext) {
+        use crate::test_support::{dot_git, open_workspace};
+        use project::FakeFs;
+
+        init(cx, DiffViewStyle::Split);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            serde_json::json!({ ".git": {}, "a.txt": "one\nthree\nfour\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(dot_git(), &[("a.txt", "one\ntwo\nthree\nfour\n".into())]);
+        let (workspace, cx) = open_workspace(fs, cx).await;
+        dispatch(crate::ReviewUncommitted, cx);
+        let review = active_review(&workspace, cx);
+        cx.focus(&review);
+        cx.run_until_parked();
+        let rhs = rhs_editor(&review, cx);
+
+        cx.simulate_keystrokes("ctrl-w h");
+        let lhs = lhs_editor(&review, cx);
+        for text in ["three", "two"] {
+            move_to_row_with_text(&lhs, text, cx);
+            cx.simulate_keystrokes("c");
+            cx.simulate_input(text);
+            cx.simulate_keystrokes("ctrl-enter");
+        }
+        assert_eq!(
+            comments(&review, cx),
+            [
+                (old_lines("a.txt", 3..=3), "three".to_string(), None),
+                (old_lines("a.txt", 2..=2), "two".to_string(), None),
+            ]
+        );
+        let ids = comment_ids(&review, cx);
+
+        cx.update(|window, cx| {
+            lhs.focus_handle(cx)
+                .dispatch_action(&editor::ToggleSplitDiff, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!splittable(&review, cx).read_with(cx, |editor, _| editor.is_split()));
+        let three_row = move_to_row_with_text(&rhs, "three", cx);
+        let two_row = move_to_row_with_text(&rhs, "two", cx);
+        let mut hosted = hosted_rows(&review, cx);
+        hosted.sort();
+        assert_eq!(
+            hosted,
+            [
+                (ids[0], display_row(&rhs, three_row, cx) + 1),
+                (ids[1], display_row(&rhs, two_row, cx) + 1),
+            ]
+        );
+
+        let targeted = |cx: &mut VisualTestContext| {
+            let blocks = blocks(&review, cx);
+            cx.update(|_, cx| blocks.update(cx, |blocks, cx| blocks.comment_at_cursor(cx)))
+        };
+        cx.simulate_keystrokes("g g ] t");
+        assert_eq!(targeted(cx), Some(ids[1]));
+        assert_eq!(cursor_line(&rhs, cx), "two");
+        cx.simulate_keystrokes("] t");
+        assert_eq!(targeted(cx), Some(ids[0]));
+        assert_eq!(cursor_line(&rhs, cx), "three");
+        cx.simulate_keystrokes("[ t");
+        assert_eq!(targeted(cx), Some(ids[1]));
     }
 
     /// A review opened from outside its pane (the panel here, or the palette) gets the focus
