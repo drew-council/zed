@@ -527,9 +527,28 @@ pub(crate) fn filter_regex(pattern: &str) -> anyhow::Result<Option<Regex>> {
     if pattern.is_empty() {
         return Ok(None);
     }
-    Ok(Some(
-        RegexBuilder::new(pattern).case_insensitive(true).build()?,
-    ))
+    match RegexBuilder::new(pattern).case_insensitive(true).build() {
+        Ok(regex) => Ok(Some(regex)),
+        Err(error) => Err(anyhow::anyhow!(
+            "Invalid regex: {}",
+            regex_error_summary(&error)
+        )),
+    }
+}
+
+/// A syntax error spans several lines (the pattern with a caret under the problem, then what is
+/// wrong), which a one-line prompt can't show.
+fn regex_error_summary(error: &regex::Error) -> String {
+    match error {
+        regex::Error::Syntax(message) => message
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("error: "))
+            .unwrap_or(message)
+            .trim()
+            .to_string(),
+        error => error.to_string(),
+    }
 }
 
 /// What the review panel says about the review's files.

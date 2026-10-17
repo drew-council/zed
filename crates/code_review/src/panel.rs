@@ -1919,7 +1919,7 @@ mod tests {
         cx.simulate_keystrokes("enter");
         let (text, error) = prompt(&panel, cx).unwrap();
         assert_eq!(text, "mod_(");
-        assert!(error.is_some());
+        assert_eq!(error.as_deref(), Some("Invalid regex: unclosed group"));
         cx.simulate_keystrokes("escape");
         assert_eq!(excerpt_paths(&review, cx), ["src/a/b/c.rs", "src/lib.rs"]);
 
