@@ -12,17 +12,22 @@ use workspace::{
 
 /// Puts a [`ReviewToolbar`] in every pane of the workspace, including the panes split off later.
 /// Zed adds its own toolbar items the same way (`zed::initialize_pane`), so `zed.rs` needs no
-/// change.
+/// change. Ours are added after Zed's (whose handlers run after ours), so that the search bar's
+/// buttons come first in the row.
 pub(crate) fn register(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    for pane in workspace.panes().to_vec() {
-        add_to_pane(&pane, window, cx);
-    }
+    let panes = workspace.panes().to_vec();
+    cx.defer_in(window, move |_, window, cx| {
+        for pane in &panes {
+            add_to_pane(pane, window, cx);
+        }
+    });
     cx.subscribe_in(
         &cx.entity(),
         window,
         |_, _, event: &workspace::Event, window, cx| {
             if let workspace::Event::PaneAdded(pane) = event {
-                add_to_pane(pane, window, cx);
+                let pane = pane.clone();
+                cx.defer_in(window, move |_, window, cx| add_to_pane(&pane, window, cx));
             }
         },
     )
@@ -37,9 +42,10 @@ fn add_to_pane(pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Worksp
     });
 }
 
-/// The review tab's row in the pane's toolbar (on the right; Zed's search bar puts the diff's
-/// collapse and split/unified buttons on the left): what is reviewed and commented so far, the
-/// navigation buttons, the review's own actions and, last, submitting or finishing the review.
+/// The review tab's part of the pane's toolbar row, after the search bar's collapse and
+/// split/unified buttons: what is reviewed and commented so far (cut short when the pane is
+/// narrow), then at the right end the navigation buttons, the review's own actions and, last,
+/// submitting or finishing the review.
 #[derive(Default)]
 pub(crate) struct ReviewToolbar {
     review: Option<WeakEntity<ReviewView>>,
@@ -132,8 +138,10 @@ impl ToolbarItemView for ReviewToolbar {
             .map(|review| cx.observe(review, |_, _, cx| cx.notify()));
         self.review = review.as_ref().map(Entity::downgrade);
         cx.notify();
+        // On the left, which takes the row's width: the right side doesn't shrink, and would
+        // squeeze the search bar's buttons out of a narrow pane.
         if review.is_some() {
-            ToolbarItemLocation::PrimaryRight
+            ToolbarItemLocation::PrimaryLeft
         } else {
             ToolbarItemLocation::Hidden
         }
@@ -202,18 +210,16 @@ impl Render for ReviewToolbar {
                     ))
             };
 
-        h_flex()
+        // What the single-file bar said: which file of how many, and its path.
+        let summary = match &single_file {
+            Some((position, count, path)) => {
+                format!("{summary} · single file {position} of {count}: {path}")
+            }
+            None => summary,
+        };
+        let controls = h_flex()
+            .flex_none()
             .gap_2()
-            .child(
-                div()
-                    .debug_selector(|| "review-toolbar-summary".into())
-                    .child(
-                        Label::new(summary)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(Divider::vertical())
             .child(navigation(
                 "File",
                 (
@@ -274,43 +280,23 @@ impl Render for ReviewToolbar {
                     ),
             )
             .child(
-                h_flex()
-                    .gap_1()
+                div()
+                    .debug_selector(|| "review-toolbar-single-file".into())
                     .child(
-                        div()
-                            .debug_selector(|| "review-toolbar-single-file".into())
-                            .child(
-                                IconButton::new("review-toolbar-single-file", IconName::File)
-                                    .icon_size(IconSize::Small)
-                                    .toggle_state(single_file.is_some())
-                                    .tooltip(Tooltip::for_action_title_in(
-                                        if single_file.is_some() {
-                                            "Show All Files"
-                                        } else {
-                                            "Show Only the File at the Cursor"
-                                        },
-                                        &ToggleSingleFileMode,
-                                        &focus_handle,
-                                    ))
-                                    .on_click(dispatcher(ToggleSingleFileMode.boxed_clone())),
-                            ),
-                    )
-                    // What the single-file bar said: which file of how many, and its path.
-                    .when_some(single_file, |row, (position, count, path)| {
-                        row.child(
-                            Label::new(format!("{position} of {count}"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            div().max_w(rems(16.)).child(
-                                Label::new(path)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate_start(),
-                            ),
-                        )
-                    }),
+                        IconButton::new("review-toolbar-single-file", IconName::File)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(single_file.is_some())
+                            .tooltip(Tooltip::for_action_title_in(
+                                if single_file.is_some() {
+                                    "Show All Files"
+                                } else {
+                                    "Show Only the File at the Cursor"
+                                },
+                                &ToggleSingleFileMode,
+                                &focus_handle,
+                            ))
+                            .on_click(dispatcher(ToggleSingleFileMode.boxed_clone())),
+                    ),
             )
             .child(toolbar_button(
                 "review-toolbar-copy-markdown",
@@ -355,7 +341,26 @@ impl Render for ReviewToolbar {
                                 .log_err();
                         }),
                     ),
+            );
+
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .child(Divider::vertical())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .debug_selector(|| "review-toolbar-summary".into())
+                    .child(
+                        Label::new(summary)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
             )
+            .child(controls)
             .into_any_element()
     }
 }
