@@ -15,7 +15,10 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
+**Status: implementation complete, ready for final validation.** Milestones 1–9 and polish A/B
+are done; next is the final validation (`plans/FINAL-validation.md`, orchestrator's state dir).
+
+**History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
 persistence, panel list" with the M5 part 1 review fixes), M6 (export, see "Milestone 6") and M7
 (GitHub): slice (a), the GitHub client (see "Milestone 7, slice (a)"), is done, followed by a second
@@ -29,7 +32,9 @@ and so is M8, the CLI: `zed [-n|-e|-a] [--wait] --review TARGET [REPO_DIR]` and 
 (see "Milestone 8"). M9 (fork ops) is done too: the rebase skill, a `releaseChannel` knob in
 `nix/build.nix` and the install guide; applying the install to `~/nixconf` awaits the user (see
 "Milestone 9"). Polish A fixed the M7d (submit) and M8 (CLI) review findings (see "Polish A").
-Next: the final validation (`plans/FINAL-validation.md`).** The
+Polish B reverted core patch #1, added the opt-in core patch #3 (no cursor highlight on spacers
+below an empty row), made Outdated clear when a comment's lines get their text back (stash/pop),
+and fixed three small known issues (see "Polish B").** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
@@ -48,8 +53,9 @@ old lines on the left side of a split diff or the removed rows of a unified one)
 whole review (`;c`) open vim editors in insert mode, render as markdown, have types, and are edited,
 deleted and navigated with `i`/`Enter`, `dd` and `]t`/`[t`/`m`/`M`; they are stored in Zed's DB per
 review, follow the code while the review is open and are flagged outdated when their lines changed
-while it was closed. `y` copies the review as Markdown in tuicr's format, `Y` the comment at the
-cursor, visual `y` the selected lines. A GitHub client resolves a checkout's GitHub repository (a
+while it was closed or were deleted (current again once their text is back, e.g. after a stash
+pop). `y` copies the review as Markdown in tuicr's format, `Y` the comment at the cursor, visual `y`
+the selected lines. A GitHub client resolves a checkout's GitHub repository (a
 fork's parent), lists and reads its pull requests, threads, reviews and commentable lines; the
 picker lists pull requests; a pull request review shows the description and review summaries in its
 top block, the existing review threads read-only below their lines (resolved, outdated and bot
@@ -72,10 +78,10 @@ What exists:
 | `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
 | `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange), PullRequest(PullRequestTarget)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`), `PullRequestReference` + `parse_pull_request_reference`, `validate_branch_name` (forge branch names); M8: `TargetSpec` + `parse_target_spec` (the CLI's TARGET grammar) |
 | `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `check_branch_base`, `resolve_commits`) |
-| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
+| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path` (polish B: `file_start_autoscroll`), single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
 | `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned; M7d: `mark_submitted`, `ReviewOutcome` + `wait_for_outcome`/`has_outcome_waiters`/`resolve_outcome` for `--wait`; polish A: `shown_by` + `show`/`hide` (waiters follow the tabs showing the review), submitted comments immutable), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
 | `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
-| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch) with the outdated check, deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
+| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch; polish B: each holds its buffer, and remembers where deleted lines were, `restored_lines`) with the outdated check (both ways since polish B), deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
 | `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered) |
 | `crates/code_review/src/submit.rs` | M7d: `comment_body`/`review_body` (`[TYPE] ` prefixes), `needs_body` (LV §5.1), `plan_review` → `PlannedReview` (the payload mapping, counts, outdated and refused drafts), `SubmitReviewModal` (events, blockers, warnings, body prompt; polish A: re-plans on every change, starts `PullRequestState::submit`/`check_uncertain_submit` and shows their reply, can't be dismissed while its submit runs), `finish_local_review`; payload/flow/modal tests |
@@ -116,8 +122,9 @@ open_listener.rs` (+27: `OpenRequestKind::Review`, the link in `parse`, the CLI 
 `handle_open_request`), `crates/cli/src/main.rs` (+58/−4 after polish A: `--review` and its
 conflicts, help, `try_parse`, the link and path, the ping marker, "Zed exited before the review
 finished") and the new `crates/cli/src/review.rs`; M9:
-`nix/build.nix` (`releaseChannel`, §3.10). Core patches #1 and #2 are
-applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10). M3 and M4 added
+`nix/build.nix` (`releaseChannel`, §3.10). Core patches #2 and #3 are
+applied (`crates/editor/src/scroll.rs`, `scroll/autoscroll.rs`, `editor.rs`; §3.10); #1 was reverted
+in polish B. M3 and M4 added
 no upstream glue (M4: new deps `db`, `file_icons`, `fs`, `ignore`, `regex`, `smallvec`, all already in
 `zed`'s graph; dev-deps `db` and `buffer_diff` with `test-support`).
 
@@ -521,9 +528,10 @@ state dir):**
   are per id).
 - **Outdated**: a stored line comment's lines are compared with its file once per run, by the first tab
   that has the file loaded (its buffer; old side: the diff base, which must exist): the rows of `lines` must
-  exist and their text equal `line_text`, else the comment becomes `Outdated` (stored; sticky until `dd`)
-  on the clamped rows: an OUTDATED badge with a tooltip, "outdated" in the panel, ` (outdated)` in the
-  export, still navigable. Other tabs anchor it on its lines without comparing. A comment whose lines
+  exist and their text equal `line_text`, else the comment becomes `Outdated` (stored; until its
+  lines have that text again, see "Polish B", or `dd`) on the clamped rows: an OUTDATED badge with
+  a tooltip, "outdated" in the panel, ` (outdated)` in the export, still navigable. Other tabs
+  anchor it on its lines without comparing. A comment whose lines
   were deleted while the review is open, or whose buffer was replaced (the file left the review and
   came back, a snapshot or diff base rebuilt), is anchored on its line numbers again and compared the
   same way. Anchors are never resolved against another buffer. Comments on files not in the review stay
@@ -689,7 +697,8 @@ state dir):**
   same text there → kept (a multi-line comment stays multi-line), else `Outdated` on those lines,
   immediately (it doesn't move onto the next line). So `cc`/`S` on a commented line, or deleting its
   whole text, also outdates it; a comment on an empty line can't tell and still moves with the next
-  line. A `git stash` while the file stays in the review outdates its comments (sticky after the pop).
+  line. A `git stash` while the file stays in the review outdates its comments (since polish B the
+  pop makes them current again).
 - **M1**: `CommentStore::restore` takes the largest stored id, including unreadable rows. **L1/L2**:
   above ("Pruning"). **L3**: a panel selection whose row went away moves to the nearest selectable
   row (the earlier of two), never the "Comments (N)" heading. **L4**: one `Moved` event per update and
@@ -1416,6 +1425,73 @@ marker check and two more `--review` conflicts), no new dependency:
   window. Not live: the old-Zed marker (no older Zed to pair with), the 2000-file prompt, ambiguous
   failures (fake HTTP tests).
 
+**Polish B (core patches, sticky Outdated, small fixes)** — orchestrator slice; upstream glue only
+in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs` tests:
+
+- **Core patches** (one `editor` commit): #1 (`set_number_deleted_lines` → `pub`) is reverted,
+  nothing outside `editor` calls it (`git diff v1.25.0-pre -- crates/editor/src/config.rs` is
+  empty). #3, opt-in (§3.10): `RowHighlightOptions::include_end_row` (default `false`, so every
+  existing caller is unchanged) keeps the row a highlight ends in when the range ends at column 0.
+  The line cursor sets it and ends its ranges at the end of the last row's text, so the cursor on an
+  empty row directly above spacer rows (a blank line before a pure addition, a file's last empty
+  line before an added file) no longer paints the spacers, focused or mirrored; a line-wise
+  selection still covers the spacers it spans. Reviewed-hunk dimming is unchanged.
+- **Outdated is no longer sticky** (the stash/pop backlog item): `ReviewSession::check_comment(id,
+  false)` turns `Outdated` back into `Draft` (stored; `Submitted` is never touched). A comment is
+  current again when (a) the once-per-run check finds its text at its stored lines (the file
+  changed back while the review was closed, e.g. a stash popped then); (b) a tab anchors it on its
+  line numbers (its lines were deleted, its buffer replaced, or the tab anchors it for the first
+  time) and finds its text there; (c) the text of a tab's anchored lines changes *to* the comment's
+  text (an edit putting it back); (d) the tab that outdated it because its lines were deleted kept
+  their collapsed anchor (`LineAnchor::deleted_from`, `restored_lines`), and the comment's text is
+  back at that place (an undo, or a pop re-inserting the lines right before the place its anchor
+  on the line numbers had moved to). Only the exact text at that exact place counts: the same text
+  elsewhere, or other text there, keeps it outdated. Existing tabs only react to changes in their
+  own buffers, so a window whose buffer never lost the lines doesn't clear what another window's
+  unsaved deletion outdated, and clearing never makes another tab re-check (no ping-pong; the
+  two-window test covers it).
+- **Buffers of commented files stay open** (found live): in an uncommitted review a stash empties
+  the review and the files' buffers were released, so after the pop the comments came back on new
+  buffers with only their line numbers from the stashed text, and a comment below lines the pop put
+  back above it was anchored on the wrong line and outdated. Each `LineAnchor` now holds its buffer
+  (`_buffer`), so `open_buffer` hands the review the same buffer when the file comes back, and the
+  anchors have followed its edits. Costs one open buffer per commented file per tab.
+- **Small known issues fixed**: the hovered link's destination (pull request description, review
+  summaries, commit messages) hangs below the top block (a `deferred` overlay over the top of the
+  diff) instead of covering its bottom row (thread toggles, Reload, review comments); thread cards
+  keep it in their bottom-left corner. `]f`/`[f`/`]u`/`[u` and the panel's `l`/Enter put the file's
+  header at the top of the view (`diff::file_start_autoscroll`) when the file's first row still fits
+  below it with the scroll margin (else the old focused scroll), so file comments, file threads and
+  the "Outdated / moved threads" block aren't under the sticky header (the end of the review still
+  clamps the scroll). Filter regex errors are one line ("Invalid regex: unclosed group") instead of
+  the regex crate's caret diagram.
+- Tests: 4 new (184 total + 1 ignored; the new and changed ones stable under `ITERATIONS=5`): the
+  cursor on an empty row above spacers (both sides, mirrored, a line-wise selection), outdated
+  comments coming back with their text (a pop at the same place, the text elsewhere, other text
+  there, an undo, a replaced line put back), a stash and pop in an uncommitted review (it passes
+  without the buffer hold too: something else keeps the buffer alive in tests; the live check
+  covers that), `]f` putting the header at the top with a file comment in view; extended: the
+  session's stored Outdated → Draft,
+  reopening after the file changed back and an edit putting a line back, two windows (one window's
+  deletion outdates, the other doesn't clear it, putting the line back clears it in both, no
+  ping-pong), the regex error text. `cargo test -p editor highlight`: 30 passed (incl.
+  `test_highlighted_display_rows_in_range` and the bookmark row-highlight tests).
+  `cargo test -p zed test_action_namespaces`: passed (cold test build of `zed`: 3m18s, 878 crates,
+  about 30 GB of `target/`). `cargo test -p cli`: 8 passed. Clippy (`-p code_review -p cli -p
+  editor`) clean after fixing two `cloned_ref_to_slice_refs` in `cli/src/review.rs`'s tests;
+  `cargo shear` clean.
+- **Live check** (harness, `validation/polishB/`, fixture `mkfixture.sh`: a feature branch with a
+  committed change, uncommitted added/modified lines, a blank line before a pure addition; split
+  view): the cursor on the blank row above the spacers highlights only that row, on the right side
+  (mirrored on the left) and with the left side focused; uncommitted review with comments on an
+  added line and a modified line: `git stash` → the added line's comment OUTDATED, `git stash pop` →
+  both current on their lines (before the buffer fix the modified line's comment came back OUTDATED
+  on the wrong line); branch review (the file stays in it): stash → OUTDATED, pop → current on
+  "added line A"; `]f` to a file with a file comment → its header at the top, the comment in view;
+  exclude prompt `(` → "Invalid regex: unclosed group"; a commit review's message link hovered →
+  the destination below the top block, over the file header. No errors in the log beyond the known
+  noise.
+
 **Known issues / notes for the next slices:**
 
 - **Notes for the final validation (V6)**:
@@ -1444,24 +1520,16 @@ marker check and two more `--review` conflicts), no new dependency:
   excerpt is mirrored above the facing row (no next row to anchor to). Both are upstream
   `balancing_block` behaviour.
 - Harness: `zh type` turns newlines into a key that isn't Enter for Zed; use `zh keys Return`.
-- **Empty-row bleed** (visible in the live check): on an empty row directly followed by a spacer — the
-  last empty line of a file before an added/deleted file, or a blank context line before a pure
-  addition — the cursor highlight also covers the spacer rows. `highlight_rows` excludes an end at
-  column 0 and an empty row has no other column, so its range must reach the next row. Proposed core
-  patch #3 (not applied, needs approval): in `Editor::highlighted_display_rows_in_range`
-  (`editor.rs:9483` on `code-review`) only exclude the end row when `end.row() > start.row()`, so an
-  empty range highlights its own row; `line_cursor::highlight_run` would then pass `start..start` for
-  an empty last row. Comment blocks are opaque, so they hide it.
 - Upstream quirks seen live: vim relative line numbers apply to the focused side only and count across
   file sections; on the LHS the current line shows 0 instead of its number; after toggling soft wrap in
   split view the LHS is mis-laid-out until the next frame.
 - M4 cosmetics: the line cursor's colors blend the full diff color, also on dimmed rows; the file row
-  tooltip can overlap the panel's context menu; regex errors show the regex crate's multi-line message;
-  `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
-  in `diff.rs`.
+  tooltip can overlap the panel's context menu; `e` on a folded header opens the file at its last
+  row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p cli`: 8 passed (polish
-  A). `cargo test -p code_review`: 180 tests + 1 ignored live GitHub test (after polish A; 166 after
+- `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
+  `cargo test -p cli`: 8 passed (polish B). `cargo test -p code_review`: 184 tests + 1 ignored live
+  GitHub test (after polish B; 180 after polish A; 166 after
   M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
@@ -1509,6 +1577,8 @@ marker check and two more `--review` conflicts), no new dependency:
   these limits. This applies to agent sessions only; the Nix package build stays uncapped (§2.1).
 - Core patch #2 (horizontal-autoscroll opt-out in `editor`) accepted; batch core edits so `editor`
   rebuilds once.
+- Polish B (orchestrator): core patch #3 (the empty-row highlight) only as an opt-in that leaves
+  every existing caller unchanged; core patch #1 reverted (no caller).
 - M2 (orchestrator): `]f`/`[f` stop at the ends and `]u`/`[u` wrap, as in tuicr; `h` at the left edge of
   the right side in split view focuses the panel; no counted `3}`-style jumps (no vim patch).
 - M7 (user): a fork's checkout lists the upstream parent's pull requests; bot threads hide behind the
@@ -1873,8 +1943,9 @@ crates/code_review/
   context rows' old line via `BufferDiffSnapshot::buffer_point_to_base_text_point`
   (`buffer_diff.rs:811-823`). Unified deleted rows are real rows (`DiffTransform::DeletedHunk`,
   `multi_buffer.rs:715-727`).
-- **Core patch #1:** old-side line numbers on unified deleted rows need `set_number_deleted_lines`
-  made `pub` (`crates/editor/src/config.rs:373`).
+- ~~**Core patch #1:** old-side line numbers on unified deleted rows need `set_number_deleted_lines`
+  made `pub` (`crates/editor/src/config.rs:373`).~~ Never called by `code_review` (only the split
+  editor sets it, for its own left side: `split.rs:735`); reverted in polish B.
 
 ### 3.3 Split view specifics
 
@@ -1894,8 +1965,9 @@ crates/code_review/
 - Hide Zed's caret/selection painting: set `editor.show_local_selections = false` (public field,
   `editor.rs:1013`) on both RHS and LHS editors. Vim keeps working; only painting stops.
 - Paint our own: `editor.highlight_rows::<ReviewCursorRow>(row, color_fn, RowHighlightOptions{
-  include_gutter: true, autoscroll: false})` (`editor.rs:9284-9362`) on the cursor row; separate marker
-  types for visual-range rows. Refresh on `SelectionsChanged`. Keep `autoscroll: false` (else autoscroll
+  include_gutter: true, autoscroll: false, include_end_row: true})` (`editor.rs:9284-9362`; the last
+  field is core patch #3) on the cursor row; separate marker types for visual-range rows. Refresh on
+  `SelectionsChanged`. Keep `autoscroll: false` (else autoscroll
   chases the highlight). Mirror onto the companion editor only when display rows match (spacer rows
   can't be highlighted without a core change — skip).
 - ~~Column pinning~~: dropped in M2 — it breaks search repeat (`n`); see §0.
@@ -2028,8 +2100,8 @@ change, so mismatched CLI/app versions don't break).
 | `crates/zed/src/zed/open_listener.rs` | review URL kind + routing (M8, +27: `OpenRequestKind::Review` + Debug arm, `parse`, the CLI request → `code_review::cli::handle_cli_review`) |
 | `crates/cli/src/main.rs` | `--review` flag (M8 + polish A, +58/−4: `mod review`, help example, the flag and its help and conflicts, `try_parse` (usage errors exit 1), link + path, the ping marker check, "Zed exited before the review finished") |
 | `crates/cli/src/review.rs` | new file (M8): the `--review` request and `check_exit` (95 lines + tests) |
-| `crates/editor/src/config.rs` | `set_number_deleted_lines` → `pub` (core patch #1) |
 | `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs` | `Editor::set_forbid_horizontal_autoscroll` (core patch #2): a `ScrollManager` flag checked first in `autoscroll_horizontally`, so the review tab's `h`/`l` scroll survives `j`/`k` |
+| `crates/editor/src/editor.rs` | `RowHighlightOptions::include_end_row` (core patch #3, polish B, +9/−1): an opt-in field (default `false`, every existing caller unchanged) that keeps the row a highlight ends in when the range ends at column 0, so the line cursor on an empty row doesn't paint the spacers below it. Core patch #1 (`set_number_deleted_lines` → `pub` in `config.rs`) was reverted in polish B: `git diff v1.25.0-pre -- crates/editor/src/config.rs` is empty |
 | `assets/keymaps/code_review*.json` | new files |
 | `nix/build.nix` | `releaseChannel ? "nightly"` argument (M9, +30/−7): a `channel` table (stable/preview/nightly), an assert that only Linux builds other channels than nightly, and the channel in `version`, `preBuild`'s `RELEASE_CHANNEL` and the Linux icons and desktop entry. The default derivation is unchanged (same `.drv`); `crates/code_review/INSTALL.md` uses `.override { releaseChannel = "stable"; }` |
 | (later) `crates/settings_content` + `assets/settings/default.json` | settings block |
