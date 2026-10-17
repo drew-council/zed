@@ -185,6 +185,11 @@ pub fn parse_pull_request_reference(input: &str) -> Result<PullRequestReference>
     if input.starts_with("https://") || input.starts_with("http://") {
         let url = Url::parse(input).map_err(|_| invalid())?;
         let host = url.host_str().ok_or_else(invalid)?.to_ascii_lowercase();
+        // An Enterprise Server's web server (and API) may be on another port.
+        let host = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
         let mut segments = url
             .path_segments()
             .ok_or_else(invalid)?
@@ -378,6 +383,14 @@ mod tests {
         assert_eq!(
             parse("http://ghe.example.com/team/app/pull/3/"),
             in_repo(Some("ghe.example.com"), "team", "app", 3)
+        );
+        assert_eq!(
+            parse("https://ghe.example.com:8443/team/app/pull/3"),
+            in_repo(Some("ghe.example.com:8443"), "team", "app", 3)
+        );
+        assert_eq!(
+            parse("https://github.com:443/o/r/pull/3"),
+            in_repo(Some("github.com"), "o", "r", 3)
         );
         assert_eq!(parse(&format!("#{}", u64::MAX)), here(u64::MAX));
         assert_eq!(parse("#1").to_string(), "#1");

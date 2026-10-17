@@ -1474,7 +1474,7 @@ mod tests {
         });
         cx.update(|cx| {
             cx.set_http_client(http);
-            set_fake_token_source(cx, |_| Ok("token".into()));
+            set_fake_token_source(cx, |_| Some("token".into()));
         });
         let (workspace, cx) = open_workspace(fs.clone(), cx).await;
         (fs, workspace, cx)
@@ -1645,7 +1645,7 @@ mod tests {
             assert_eq!(
                 picker.delegate.entries().last(),
                 Some(&Entry::Status(
-                    "GitHub authentication failed for github.com. Set GITHUB_TOKEN or run \
+                    "GitHub rejected the GitHub CLI's token for github.com. Run \
                      `gh auth login --hostname github.com`."
                         .into()
                 ))
@@ -1657,6 +1657,70 @@ mod tests {
         dispatch(TogglePullRequestFilter, cx);
         let keys = entry_keys(&picker, cx);
         assert_eq!(keys[keys.len() - 4..], pull_request_keys(&[4, 1, 3, 2]));
+    }
+
+    /// A remote whose host merely has "github" in its name: the picker says GitHub isn't
+    /// configured for it and nothing, least of all a token, is sent there.
+    #[gpui::test]
+    async fn test_pull_requests_of_a_host_that_only_looks_like_github(cx: &mut TestAppContext) {
+        use crate::github::{
+            FakeLookups, set_fake_lookups,
+            test_support::{fake_github, repository_context_reply},
+        };
+        use collections::HashMap;
+        use git::GitHostingProviderRegistry;
+
+        crate::init_test(cx);
+        cx.update(|cx| {
+            GitHostingProviderRegistry::default_global(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "a\n" }))
+            .await;
+        fs.set_head_and_index_for_repo(dot_git(), &[("a.txt", "a\n".into())]);
+        fs.set_remote_for_repo(dot_git(), "origin", "https://github.attacker.dev/x/y.git");
+        let (http, requests) = fake_github(repository_context_reply);
+        cx.update(|cx| {
+            cx.set_http_client(http);
+            set_fake_lookups(
+                cx,
+                FakeLookups {
+                    environment: HashMap::from_iter([(
+                        "GITHUB_TOKEN".to_string(),
+                        "secret".to_string(),
+                    )]),
+                    gh: Box::new(|_| None),
+                    ssh_hostnames: HashMap::default(),
+                },
+            );
+        });
+        let (workspace, cx) = open_workspace(fs, cx).await;
+
+        dispatch(StartReview, cx);
+        let picker = start_review_picker(&workspace, cx);
+        picker.read_with(cx, |picker, _| {
+            let entries = picker.delegate.entries();
+            assert!(entries.contains(&Entry::Header(Section::PullRequests)));
+            assert_eq!(
+                entries.last(),
+                Some(&Entry::Status(
+                    "GitHub isn't configured for github.attacker.dev. If it is a GitHub \
+                     Enterprise Server, add it to `git_hosting_providers` in your settings \
+                     (provider \"github\") or run `gh auth login --hostname \
+                     github.attacker.dev`."
+                        .into()
+                ))
+            );
+        });
+        // Not even when asked again, or for a pull request by number.
+        dispatch(TogglePullRequestFilter, cx);
+        dispatch(
+            OpenPullRequest {
+                reference: Some("1".into()),
+            },
+            cx,
+        );
+        assert_eq!(requests.lock().unwrap().len(), 0);
     }
 
     #[test]

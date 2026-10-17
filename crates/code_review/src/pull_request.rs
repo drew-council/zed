@@ -858,6 +858,7 @@ mod tests {
             name: name.into(),
             repo,
             is_ssh: true,
+            host_kind: crate::github::GitHubHost::Cloud,
         }
     }
 
@@ -1339,7 +1340,7 @@ mod tests {
             });
             cx.update(|cx| {
                 cx.set_http_client(http);
-                set_fake_token_source(cx, |_| Ok("token".into()));
+                set_fake_token_source(cx, |_| Some("token".into()));
             });
             let (workspace, cx) = open_workspace(fs.clone(), cx).await;
             dispatch(
@@ -1771,8 +1772,8 @@ mod tests {
                 assert_eq!(
                     pull_request.load_errors(),
                     [
-                        "GitHub authentication failed for github.com. Set GITHUB_TOKEN or run \
-                      `gh auth login --hostname github.com`."
+                        "GitHub rejected the GitHub CLI's token for github.com. Run \
+                         `gh auth login --hostname github.com`."
                     ]
                 );
                 assert!(pull_request.commentable().is_some());

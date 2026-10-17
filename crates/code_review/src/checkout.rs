@@ -422,7 +422,10 @@ fn askpass_delegate_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge::{Actor, ForgeRepo};
+    use crate::{
+        forge::{Actor, ForgeRepo},
+        github::GitHubHost,
+    };
     use futures::executor::block_on;
     use std::path::Path;
 
@@ -442,6 +445,7 @@ mod tests {
             name: name.into(),
             repo,
             is_ssh: false,
+            host_kind: GitHubHost::Cloud,
         }
     }
 

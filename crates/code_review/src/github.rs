@@ -15,7 +15,10 @@ use futures::{
     future::{BoxFuture, Either, Shared},
 };
 use git::{GitHostingProviderRegistry, Oid, RemoteUrl};
-use gpui::{App, AppContext as _, BackgroundExecutor, Entity, Global, SharedString, Task};
+use git_hosting_providers::GitHostingProviderSettings;
+use gpui::{
+    App, AppContext as _, AsyncApp, BackgroundExecutor, Entity, Global, SharedString, Task,
+};
 use http_client::{
     AsyncBody, HttpClient, HttpRequestExt as _, Method, Request, StatusCode,
     http::{HeaderMap, HeaderValue},
@@ -23,7 +26,9 @@ use http_client::{
 use project::{Project, git_store::Repository};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
+use settings::{GitHostingProviderKind, Settings as _};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
     io,
@@ -38,6 +43,7 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
+use util::command::Stdio;
 
 /// Every GraphQL operation, sent whole with an `operationName`.
 const QUERIES: &str = include_str!("github/queries.graphql");
@@ -54,6 +60,11 @@ const FILES_PER_PAGE: usize = 100;
 pub enum GitHubError {
     /// The repository has no GitHub remote.
     Unsupported,
+    /// The remote's host only looks like a GitHub Enterprise Server: neither the user's settings
+    /// nor `gh` know it, so no token is sent to it.
+    HostNotConfigured {
+        host: SharedString,
+    },
     /// A pull request reference names a repository this checkout doesn't review.
     OtherRepository {
         repo: SharedString,
@@ -94,11 +105,29 @@ pub enum GitHubError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthFailure {
     /// GitHub rejected the token (401).
-    Rejected,
-    /// Neither `GITHUB_TOKEN` nor `gh auth token` gave a token.
+    Rejected(TokenOrigin),
+    /// Neither the environment nor `gh auth token` gave a token.
     NoToken,
-    /// No `GITHUB_TOKEN`, and the GitHub CLI isn't installed.
+    /// No token in the environment, and the GitHub CLI isn't installed.
     NoTokenNoCli,
+}
+
+/// Where a token came from, to say which one GitHub rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenOrigin {
+    /// An environment variable of Zed or of the project.
+    Variable(&'static str),
+    /// `gh auth token --hostname <host>`.
+    GitHubCli,
+}
+
+/// The variable a token for `host` is read from first, as `gh` reads it.
+fn token_variable(host: &str) -> &'static str {
+    if is_cloud_host(host) {
+        "GITHUB_TOKEN"
+    } else {
+        "GH_ENTERPRISE_TOKEN"
+    }
 }
 
 impl GitHubError {
@@ -106,24 +135,36 @@ impl GitHubError {
     pub fn hint(&self) -> SharedString {
         match self {
             GitHubError::Unsupported => "This repository has no GitHub remote.".into(),
+            GitHubError::HostNotConfigured { host } => format!(
+                "GitHub isn't configured for {host}. If it is a GitHub Enterprise Server, add it \
+                 to `git_hosting_providers` in your settings (provider \"github\") or run \
+                 `gh auth login --hostname {host}`."
+            )
+            .into(),
             GitHubError::OtherRepository { repo } => {
                 format!("Open this pull request from a checkout of {repo}.").into()
             }
-            GitHubError::Auth { host, failure } => match failure {
-                AuthFailure::Rejected => format!(
-                    "GitHub authentication failed for {host}. Set GITHUB_TOKEN or run \
-                     `gh auth login --hostname {host}`."
-                ),
-                AuthFailure::NoToken => format!(
-                    "No GitHub token for {host}. Set GITHUB_TOKEN or run \
-                     `gh auth login --hostname {host}`."
-                ),
-                AuthFailure::NoTokenNoCli => format!(
-                    "No GitHub token for {host}. Set GITHUB_TOKEN, or install the GitHub CLI \
-                     and run `gh auth login --hostname {host}`."
-                ),
+            GitHubError::Auth { host, failure } => {
+                let variable = token_variable(host);
+                match failure {
+                    AuthFailure::Rejected(TokenOrigin::Variable(name)) => format!(
+                        "GitHub rejected the token in {name} for {host}. Update or unset {name}."
+                    ),
+                    AuthFailure::Rejected(TokenOrigin::GitHubCli) => format!(
+                        "GitHub rejected the GitHub CLI's token for {host}. Run \
+                         `gh auth login --hostname {host}`."
+                    ),
+                    AuthFailure::NoToken => format!(
+                        "No GitHub token for {host}. Set {variable} or run \
+                         `gh auth login --hostname {host}`."
+                    ),
+                    AuthFailure::NoTokenNoCli => format!(
+                        "No GitHub token for {host}. Set {variable}, or install the GitHub CLI \
+                         and run `gh auth login --hostname {host}`."
+                    ),
+                }
+                .into()
             }
-            .into(),
             GitHubError::RateLimited { reset } => {
                 rate_limit_hint(*reset, OffsetDateTime::now_utc().unix_timestamp()).into()
             }
@@ -169,7 +210,8 @@ fn transport(error: impl Into<anyhow::Error>) -> GitHubError {
 fn rate_limit_hint(reset: Option<i64>, now: i64) -> String {
     match reset {
         Some(reset) => {
-            let minutes = ((reset - now).max(0) + 59) / 60;
+            // The reset time comes from a header: never trust it not to overflow.
+            let minutes = reset.saturating_sub(now).max(0).saturating_add(59) / 60;
             let unit = if minutes == 1 { "minute" } else { "minutes" };
             format!("GitHub's API rate limit is exceeded. Try again in {minutes} {unit}.")
         }
@@ -230,15 +272,27 @@ fn rate_limit_reset(headers: &HeaderMap) -> Option<i64> {
         return Some(reset);
     }
     let retry_after: i64 = header(headers, "retry-after")?.parse().ok()?;
-    Some(OffsetDateTime::now_utc().unix_timestamp() + retry_after)
+    Some(
+        OffsetDateTime::now_utc()
+            .unix_timestamp()
+            .saturating_add(retry_after),
+    )
 }
 
-/// `X-GitHub-SSO: required; url=https://github.com/orgs/…/sso?authorization_request=…`
-fn sso_url(value: &str) -> Option<SharedString> {
-    value
+/// `X-GitHub-SSO: required; url=https://github.com/orgs/…/sso?authorization_request=…`. Only
+/// an https URL on the host's own web server is kept: the "Authorize" button opens it.
+fn sso_url(value: &str, host: &str) -> Option<SharedString> {
+    let url = value
         .split(';')
-        .find_map(|part| part.trim().strip_prefix("url="))
-        .map(|url| SharedString::from(url.to_string()))
+        .find_map(|part| part.trim().strip_prefix("url="))?;
+    let parsed = http_client::Url::parse(url).ok()?;
+    let url_host = match (parsed.host_str(), parsed.port()) {
+        (Some(url_host), Some(port)) => format!("{url_host}:{port}"),
+        (Some(url_host), None) => url_host.to_string(),
+        (None, _) => return None,
+    };
+    (parsed.scheme() == "https" && url_host.eq_ignore_ascii_case(host))
+        .then(|| SharedString::from(url.to_string()))
 }
 
 #[derive(Default, Deserialize)]
@@ -255,13 +309,14 @@ fn status_error(
     body: &[u8],
     what: &SharedString,
     host: &SharedString,
+    token_origin: TokenOrigin,
 ) -> GitHubError {
     let error_body: RestErrorBody = serde_json::from_slice(body).unwrap_or_default();
     let message = error_body.message.unwrap_or_default();
     match status.as_u16() {
         401 => GitHubError::Auth {
             host: host.clone(),
-            failure: AuthFailure::Rejected,
+            failure: AuthFailure::Rejected(token_origin),
         },
         403 | 429 => {
             if header(headers, "x-ratelimit-remaining") == Some("0")
@@ -272,7 +327,9 @@ fn status_error(
                     reset: rate_limit_reset(headers),
                 }
             } else if let Some(sso) = header(headers, "x-github-sso") {
-                GitHubError::Sso { url: sso_url(sso) }
+                GitHubError::Sso {
+                    url: sso_url(sso, host),
+                }
             } else {
                 GitHubError::Forbidden {
                     what: what.clone(),
@@ -321,6 +378,7 @@ fn graphql_error(
     errors: Vec<GraphQlErrorEntry>,
     headers: &HeaderMap,
     what: &SharedString,
+    host: &str,
 ) -> GitHubError {
     let has = |kind: &str| {
         errors
@@ -343,7 +401,9 @@ fn graphql_error(
     // Resources of an organization the token isn't authorized for come back FORBIDDEN, with an
     // `X-GitHub-SSO` header.
     if let Some(sso) = header(headers, "x-github-sso") {
-        return GitHubError::Sso { url: sso_url(sso) };
+        return GitHubError::Sso {
+            url: sso_url(sso, host),
+        };
     }
     if forbidden {
         return GitHubError::Forbidden {
@@ -383,18 +443,114 @@ impl Endpoints {
     }
 }
 
-/// The GitHub repository a remote URL points at, and whether the URL is an SSH one. GitHub
-/// Enterprise Server hosts are recognised through the git hosting provider registry, which
-/// registers the `origin` remote's host when it contains "github".
-fn github_repo_for_remote(
-    url: &str,
-    registry: Option<&GitHostingProviderRegistry>,
-) -> Option<(ForgeRepo, bool)> {
-    let remote_url = RemoteUrl::from_str(url).ok()?;
-    let host = remote_url.host_str()?.to_ascii_lowercase();
-    if !is_github_host(&host, registry) {
-        return None;
+/// Whether `host` is github.com or GitHub Enterprise Cloud with data residency (`*.ghe.com`):
+/// the hosts `GH_TOKEN` and `GITHUB_TOKEN` are for, as in `gh`.
+fn is_cloud_host(host: &str) -> bool {
+    host == "github.com" || host.ends_with(".ghe.com")
+}
+
+/// How a remote's host is known to be GitHub's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitHubHost {
+    /// github.com or `*.ghe.com`.
+    Cloud,
+    /// A GitHub Enterprise Server the user's settings name as a `github` provider.
+    Configured,
+    /// A host that only looks like GitHub's: Zed's hosting provider registry adds `origin`'s
+    /// host when its name contains "github", and a project's settings can add any host. It only
+    /// counts once `gh` is logged in to it, and no token is sent to it before that.
+    Unverified,
+}
+
+/// What tells the GitHub remotes apart from the others.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct GitHubHosts {
+    /// The API hosts (`host` or `host:port`, lowercase) of the `github` providers in the user's
+    /// settings. A project's settings don't count: the project could name any host.
+    configured: Vec<String>,
+    /// The hosts of the GitHub providers in Zed's hosting provider registry.
+    registered: Vec<String>,
+    /// SSH host aliases (from `~/.ssh/config`) and the host names `ssh -G` gave for them.
+    ssh_hostnames: BTreeMap<String, String>,
+}
+
+impl GitHubHosts {
+    fn new(cx: &App) -> Self {
+        let configured = GitHostingProviderSettings::get_global(cx)
+            .git_hosting_providers
+            .iter()
+            .filter(|provider| provider.provider == GitHostingProviderKind::Github)
+            .filter_map(|provider| url_host(&http_client::Url::parse(&provider.base_url).ok()?))
+            .filter(|host| !is_cloud_host(host))
+            .collect();
+        let registered = GitHostingProviderRegistry::try_global(cx)
+            .map(|registry| {
+                registry
+                    .list_hosting_providers()
+                    .iter()
+                    .filter(|provider| {
+                        matches!(provider.name().as_str(), "GitHub" | "GitHub Self-Hosted")
+                    })
+                    .filter_map(|provider| {
+                        provider
+                            .base_url()
+                            .host_str()
+                            .map(|host| host.to_ascii_lowercase())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            configured,
+            registered,
+            ssh_hostnames: BTreeMap::new(),
+        }
     }
+}
+
+/// `host`, or `host:port` for a port other than the scheme's, lowercase.
+fn url_host(url: &http_client::Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// The GitHub repository a remote URL points at, whether the URL is an SSH one, and how its host
+/// is known to be GitHub's.
+fn github_repo_for_remote(url: &str, hosts: &GitHubHosts) -> Option<(ForgeRepo, bool, GitHubHost)> {
+    let remote_url = RemoteUrl::from_str(url).ok()?;
+    let is_ssh = remote_url.scheme() == "ssh";
+    let mut hostname = remote_url.host_str()?.to_ascii_lowercase();
+    if is_ssh && let Some(resolved) = hosts.ssh_hostnames.get(&hostname) {
+        hostname = resolved.clone();
+    }
+    // GitHub's SSH service on port 443.
+    if hostname == "ssh.github.com" {
+        hostname = "github.com".into();
+    }
+    let (host, host_kind) = if is_cloud_host(&hostname) {
+        (hostname, GitHubHost::Cloud)
+    } else {
+        // An HTTPS remote's port is the web server's, which serves the API too; an SSH remote's
+        // port is the SSH server's.
+        let host = match remote_url.port() {
+            Some(port) if !is_ssh => format!("{hostname}:{port}"),
+            _ => hostname.clone(),
+        };
+        let configured = hosts.configured.iter().find(|configured| {
+            **configured == host
+                || (is_ssh && configured.split(':').next() == Some(hostname.as_str()))
+        });
+        if let Some(configured) = configured {
+            (configured.clone(), GitHubHost::Configured)
+        } else if hosts.registered.contains(&hostname) {
+            (host, GitHubHost::Unverified)
+        } else {
+            return None;
+        }
+    };
     let mut segments = remote_url
         .path_segments()?
         .filter(|segment| !segment.is_empty());
@@ -408,21 +564,7 @@ fn github_repo_for_remote(
         owner: owner.to_string().into(),
         name: name.to_string().into(),
     };
-    Some((repo, remote_url.scheme() == "ssh"))
-}
-
-fn is_github_host(host: &str, registry: Option<&GitHostingProviderRegistry>) -> bool {
-    host == "github.com"
-        || host.ends_with(".ghe.com")
-        || registry.is_some_and(|registry| {
-            registry.list_hosting_providers().iter().any(|provider| {
-                matches!(provider.name().as_str(), "GitHub" | "GitHub Self-Hosted")
-                    && provider
-                        .base_url()
-                        .host_str()
-                        .is_some_and(|provider_host| provider_host.eq_ignore_ascii_case(host))
-            })
-        })
+    Some((repo, is_ssh, host_kind))
 }
 
 /// A GitHub token. It never reaches the logs: `Debug` redacts it and requests are logged
@@ -430,13 +572,15 @@ fn is_github_host(host: &str, registry: Option<&GitHostingProviderRegistry>) -> 
 #[derive(Clone)]
 pub(crate) struct GitHubToken {
     value: Arc<str>,
+    origin: TokenOrigin,
     revoked: Arc<AtomicBool>,
 }
 
 impl GitHubToken {
-    fn new(value: &str) -> Self {
+    fn new(value: &str, origin: TokenOrigin) -> Self {
         Self {
             value: value.into(),
+            origin,
             revoked: Arc::default(),
         }
     }
@@ -456,34 +600,53 @@ impl fmt::Debug for GitHubToken {
     }
 }
 
+/// The variables `gh` reads a token for github.com and `*.ghe.com` from, in its order.
+const CLOUD_TOKEN_VARIABLES: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+/// The variables `gh` reads a token for any other host from.
+const ENTERPRISE_TOKEN_VARIABLES: [&str; 2] = ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+
+/// Where tokens and SSH host names come from: Zed's and the project's environment, `gh` and
+/// `ssh`, or a fake in tests, which never reads the real environment or runs anything.
 #[derive(Clone, Default)]
-enum TokenSource {
-    /// `GITHUB_TOKEN` in Zed's environment, then in the project's (direnv), then
-    /// `gh auth token --hostname <host>`.
+enum Lookups {
     #[default]
-    Environment,
+    System,
     #[cfg(test)]
-    Fake(Arc<dyn Fn(&str) -> Result<String, GitHubError> + Send + Sync>),
+    Fake(Arc<FakeLookups>),
 }
 
-/// Tokens by host, resolved once per session. A token GitHub rejected, or a failed lookup, is
-/// looked up again the next time.
+#[cfg(test)]
+pub(crate) struct FakeLookups {
+    /// Zed's environment.
+    pub(crate) environment: HashMap<String, String>,
+    /// The token of `gh`'s login to a host, if it is logged in to it.
+    pub(crate) gh: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    /// SSH host aliases and what `ssh -G` resolves them to.
+    pub(crate) ssh_hostnames: HashMap<String, String>,
+}
+
+/// Tokens by host and project, looked up once per session: a project's environment (direnv) may
+/// hold another token than the next project's. A token GitHub rejected, or a failed lookup, is
+/// looked up again the next time. SSH host names by alias, resolved once per session.
 #[derive(Default)]
-struct GitHubTokens {
-    source: TokenSource,
-    tokens: HashMap<SharedString, Shared<Task<Result<GitHubToken, GitHubError>>>>,
+struct GitHubLookups {
+    source: Lookups,
+    tokens: HashMap<(SharedString, Arc<Path>), Shared<Task<Result<GitHubToken, GitHubError>>>>,
+    ssh_hostnames: HashMap<String, Shared<Task<Option<String>>>>,
 }
 
-impl Global for GitHubTokens {}
+impl Global for GitHubLookups {}
 
 fn token_for_host(
     host: &SharedString,
+    host_kind: GitHubHost,
     project: &Entity<Project>,
     work_dir: &Arc<Path>,
     cx: &mut App,
 ) -> Shared<Task<Result<GitHubToken, GitHubError>>> {
-    let tokens = cx.default_global::<GitHubTokens>();
-    if let Some(token) = tokens.tokens.get(host) {
+    let key = (host.clone(), work_dir.clone());
+    let lookups = cx.default_global::<GitHubLookups>();
+    if let Some(token) = lookups.tokens.get(&key) {
         let usable = match token.peek() {
             None => true,
             Some(Ok(token)) => !token.is_revoked(),
@@ -493,10 +656,15 @@ fn token_for_host(
             return token.clone();
         }
     }
-    let task = match tokens.source.clone() {
-        TokenSource::Environment => {
-            let process_token = std::env::var("GITHUB_TOKEN").ok();
-            let environment = non_empty(process_token.as_deref()).is_none().then(|| {
+    let host = host.clone();
+    let task = match lookups.source.clone() {
+        Lookups::System => {
+            let has_process_token = host_kind != GitHubHost::Unverified
+                && token_variables(host_kind)
+                    .iter()
+                    .any(|name| non_empty(std::env::var(name).ok().as_deref()).is_some());
+            // `gh` may only be on the PATH of the login shell's environment.
+            let environment = (!has_process_token).then(|| {
                 project
                     .read(cx)
                     .environment()
@@ -506,29 +674,46 @@ fn token_for_host(
                     })
             });
             let executor = cx.background_executor().clone();
-            let host = host.clone();
             cx.background_spawn(async move {
                 let environment = match environment {
                     Some(environment) => environment.await,
                     None => None,
                 };
-                resolve_token(&host, process_token, environment, |environment| {
-                    gh_auth_token(host.clone(), environment, executor)
-                })
+                resolve_token(
+                    &host,
+                    host_kind,
+                    |name| std::env::var(name).ok(),
+                    environment.as_ref(),
+                    || gh_auth_token(host.clone(), environment.clone(), executor),
+                )
                 .await
             })
         }
         #[cfg(test)]
-        TokenSource::Fake(token) => {
-            let token = token(host.as_ref());
-            cx.background_spawn(async move { token.map(|token| GitHubToken::new(&token)) })
-        }
+        Lookups::Fake(fake) => cx.background_spawn(async move {
+            let gh = (fake.gh)(&host);
+            resolve_token(
+                &host,
+                host_kind,
+                |name| fake.environment.get(name).cloned(),
+                None,
+                || async move { gh.ok_or_else(|| GhFailure::Failed("not logged in".into())) },
+            )
+            .await
+        }),
     }
     .shared();
-    cx.default_global::<GitHubTokens>()
+    cx.default_global::<GitHubLookups>()
         .tokens
-        .insert(host.clone(), task.clone());
+        .insert(key, task.clone());
     task
+}
+
+fn token_variables(host_kind: GitHubHost) -> [&'static str; 2] {
+    match host_kind {
+        GitHubHost::Cloud => CLOUD_TOKEN_VARIABLES,
+        GitHubHost::Configured | GitHubHost::Unverified => ENTERPRISE_TOKEN_VARIABLES,
+    }
 }
 
 fn non_empty(token: Option<&str>) -> Option<&str> {
@@ -541,27 +726,49 @@ enum GhFailure {
     Failed(String),
 }
 
+/// The token for `host`, the way `gh` finds it: its variables in Zed's environment, then in the
+/// project's, then `gh`'s login to the host. A host that only looks like GitHub's gets nothing
+/// but the token of a `gh` login to it: without one it isn't known to be GitHub's.
 async fn resolve_token<F>(
     host: &SharedString,
-    process_token: Option<String>,
-    environment: Option<HashMap<String, String>>,
-    run_gh: impl FnOnce(Option<HashMap<String, String>>) -> F,
+    host_kind: GitHubHost,
+    process_environment: impl Fn(&str) -> Option<String>,
+    project_environment: Option<&HashMap<String, String>>,
+    run_gh: impl FnOnce() -> F,
 ) -> Result<GitHubToken, GitHubError>
 where
     F: Future<Output = Result<String, GhFailure>>,
 {
-    if let Some(token) = non_empty(process_token.as_deref()) {
-        return Ok(GitHubToken::new(token));
+    if host_kind == GitHubHost::Unverified {
+        let not_configured = || GitHubError::HostNotConfigured { host: host.clone() };
+        return match run_gh().await {
+            Ok(output) => non_empty(Some(&output))
+                .map(|token| GitHubToken::new(token, TokenOrigin::GitHubCli))
+                .ok_or_else(not_configured),
+            Err(GhFailure::Missing) => Err(not_configured()),
+            Err(GhFailure::Failed(message)) => {
+                log::info!("`gh auth token --hostname {host}` failed: {message}");
+                Err(not_configured())
+            }
+        };
     }
-    if let Some(token) = environment
-        .as_ref()
-        .and_then(|environment| non_empty(environment.get("GITHUB_TOKEN").map(String::as_str)))
-    {
-        return Ok(GitHubToken::new(token));
+    let variables = token_variables(host_kind);
+    for name in variables {
+        let value = process_environment(name);
+        if let Some(token) = non_empty(value.as_deref()) {
+            return Ok(GitHubToken::new(token, TokenOrigin::Variable(name)));
+        }
     }
-    let failure = match run_gh(environment).await {
+    if let Some(environment) = project_environment {
+        for name in variables {
+            if let Some(token) = non_empty(environment.get(name).map(String::as_str)) {
+                return Ok(GitHubToken::new(token, TokenOrigin::Variable(name)));
+            }
+        }
+    }
+    let failure = match run_gh().await {
         Ok(output) => match non_empty(Some(&output)) {
-            Some(token) => return Ok(GitHubToken::new(token)),
+            Some(token) => return Ok(GitHubToken::new(token, TokenOrigin::GitHubCli)),
             None => AuthFailure::NoToken,
         },
         Err(GhFailure::Missing) => AuthFailure::NoTokenNoCli,
@@ -586,9 +793,15 @@ async fn gh_auth_token(
     let mut command = util::command::new_command("gh");
     command
         .args(["auth", "token", "--hostname", host.as_ref()])
+        .stdin(Stdio::null())
         .kill_on_drop(true);
     if let Some(environment) = environment {
         command.envs(environment);
+    }
+    // `gh` would print these for any host. The environment's tokens were looked at already, and
+    // a host that only looks like GitHub's counts only when `gh` has a login for it.
+    for name in CLOUD_TOKEN_VARIABLES.iter().chain(&ENTERPRISE_TOKEN_VARIABLES) {
+        command.env_remove(name);
     }
     let output = pin!(command.output());
     let timeout = pin!(executor.timer(GH_TIMEOUT));
@@ -605,6 +818,100 @@ async fn gh_auth_token(
         Ok(output) => String::from_utf8(output.stdout)
             .map_err(|_| GhFailure::Failed("its output isn't UTF-8".into())),
     }
+}
+
+/// The host names of the SSH remotes' hosts that aren't GitHub's by name: a second GitHub account
+/// often gets an alias in `~/.ssh/config` (`github-work`, `github.com-personal`).
+fn ssh_hostnames(
+    remote_urls: &HashMap<String, String>,
+    cx: &mut App,
+) -> Task<BTreeMap<String, String>> {
+    let aliases = remote_urls
+        .values()
+        .filter_map(|url| RemoteUrl::from_str(url).ok())
+        .filter(|url| url.scheme() == "ssh")
+        .filter_map(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .filter(|host| !is_cloud_host(host) && host != "ssh.github.com" && is_host_name(host))
+        .collect::<BTreeSet<_>>();
+    let executor = cx.background_executor().clone();
+    let lookups = cx.default_global::<GitHubLookups>();
+    let tasks = aliases
+        .into_iter()
+        .map(|alias| {
+            let task = match &lookups.source {
+                Lookups::System => lookups
+                    .ssh_hostnames
+                    .entry(alias.clone())
+                    .or_insert_with(|| {
+                        let alias = alias.clone();
+                        let executor = executor.clone();
+                        executor
+                            .clone()
+                            .spawn(async move { ssh_hostname(&alias, executor).await })
+                            .shared()
+                    })
+                    .clone(),
+                #[cfg(test)]
+                Lookups::Fake(fake) => Task::ready(fake.ssh_hostnames.get(&alias).cloned()).shared(),
+            };
+            (alias, task)
+        })
+        .collect::<Vec<_>>();
+    cx.background_spawn(async move {
+        let mut hostnames = BTreeMap::new();
+        for (alias, task) in tasks {
+            if let Some(hostname) = task.await
+                && hostname != alias
+            {
+                hostnames.insert(alias, hostname);
+            }
+        }
+        hostnames
+    })
+}
+
+/// Whether `host` is a plain host name, which can't reach `ssh` as an option.
+fn is_host_name(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && host
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+}
+
+/// The host name `ssh -G` gives for `alias` (`~/.ssh/config`'s `Hostname`). It reads the
+/// configuration only and connects nowhere.
+async fn ssh_hostname(alias: &str, executor: BackgroundExecutor) -> Option<String> {
+    let mut command = util::command::new_command("ssh");
+    command
+        .args(["-G", alias])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = pin!(command.output());
+    let timeout = pin!(executor.timer(GH_TIMEOUT));
+    let output = match futures::future::select(output, timeout).await {
+        Either::Left((Ok(output), _)) if output.status.success() => output,
+        Either::Left((Ok(output), _)) => {
+            log::info!(
+                "`ssh -G {alias}` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return None;
+        }
+        Either::Left((Err(error), _)) => {
+            log::info!("`ssh -G {alias}` failed: {error}");
+            return None;
+        }
+        Either::Right(_) => {
+            log::info!("`ssh -G {alias}` timed out");
+            return None;
+        }
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("hostname "))
+        .map(|hostname| hostname.trim().to_ascii_lowercase())
+        .filter(|hostname| is_host_name(hostname))
 }
 
 #[derive(Deserialize)]
@@ -1173,6 +1480,7 @@ impl GitHubClient {
             &bytes,
             what,
             &self.host,
+            self.token.origin,
         ))
     }
 
@@ -1199,7 +1507,7 @@ impl GitHubClient {
             .await?;
         let response: GraphQlResponse = parse_json(&bytes, operation)?;
         if !response.errors.is_empty() {
-            return Err(graphql_error(response.errors, &headers, what));
+            return Err(graphql_error(response.errors, &headers, what, &self.host));
         }
         let data = response
             .data
@@ -1557,6 +1865,7 @@ pub(crate) struct GitHubRemote {
     pub(crate) name: String,
     pub(crate) repo: ForgeRepo,
     pub(crate) is_ssh: bool,
+    pub(crate) host_kind: GitHubHost,
 }
 
 /// The GitHub remotes, preferred first: the current branch's upstream remote, `origin`,
@@ -1564,16 +1873,17 @@ pub(crate) struct GitHubRemote {
 fn github_remotes(
     urls: &HashMap<String, String>,
     branch_remote: Option<&str>,
-    registry: Option<&GitHostingProviderRegistry>,
+    hosts: &GitHubHosts,
 ) -> Vec<GitHubRemote> {
     let mut remotes = urls
         .iter()
         .filter_map(|(name, url)| {
-            let (repo, is_ssh) = github_repo_for_remote(url, registry)?;
+            let (repo, is_ssh, host_kind) = github_repo_for_remote(url, hosts)?;
             Some(GitHubRemote {
                 name: name.clone(),
                 repo,
                 is_ssh,
+                host_kind,
             })
         })
         .collect::<Vec<_>>();
@@ -1609,29 +1919,48 @@ fn choose_remote<'a>(
     Ok((preferred, true))
 }
 
-/// The checkout's GitHub remotes, preferred first (see [`github_remotes`]).
-pub(crate) fn remotes(
+/// The checkout's remote URLs, and what tells GitHub's apart.
+async fn remote_urls_and_hosts(
     repository: &Entity<Repository>,
-    cx: &mut App,
-) -> Task<anyhow::Result<Vec<GitHubRemote>>> {
-    let branch_remote = repository
+    cx: &mut AsyncApp,
+) -> Result<(HashMap<String, String>, GitHubHosts), GitHubError> {
+    let remote_urls = repository.update(cx, |repository, _| repository.remote_urls());
+    let remote_urls = remote_urls
+        .await
+        .map_err(|_| transport(anyhow!("the repository was closed")))?
+        .map_err(|error| transport(error.context("listing the repository's remotes")))?;
+    let (hosts, ssh_hostnames) =
+        cx.update(|cx| (GitHubHosts::new(cx), ssh_hostnames(&remote_urls, cx)));
+    let hosts = GitHubHosts {
+        ssh_hostnames: ssh_hostnames.await,
+        ..hosts
+    };
+    Ok((remote_urls, hosts))
+}
+
+fn branch_remote(repository: &Entity<Repository>, cx: &App) -> Option<String> {
+    repository
         .read(cx)
         .branch
         .as_ref()
         .and_then(|branch| branch.upstream.as_ref())
         .and_then(|upstream| upstream.remote_name())
-        .map(str::to_string);
-    let remote_urls = repository.update(cx, |repository, _| repository.remote_urls());
-    let registry = GitHostingProviderRegistry::try_global(cx);
-    cx.spawn(async move |_| {
-        let remote_urls = remote_urls
-            .await
-            .map_err(|_| anyhow!("the repository was closed"))?
-            .map_err(|error| error.context("listing the repository's remotes"))?;
+        .map(str::to_string)
+}
+
+/// The checkout's GitHub remotes, preferred first (see [`github_remotes`]).
+pub(crate) fn remotes(
+    repository: &Entity<Repository>,
+    cx: &mut App,
+) -> Task<anyhow::Result<Vec<GitHubRemote>>> {
+    let branch_remote = branch_remote(repository, cx);
+    let repository = repository.clone();
+    cx.spawn(async move |cx| {
+        let (remote_urls, hosts) = remote_urls_and_hosts(&repository, cx).await?;
         Ok(github_remotes(
             &remote_urls,
             branch_remote.as_deref(),
-            registry.as_deref(),
+            &hosts,
         ))
     })
 }
@@ -1640,8 +1969,8 @@ pub(crate) fn remotes(
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ForgeKey {
     work_dir: Arc<Path>,
-    origin_url: Option<String>,
-    upstream_url: Option<String>,
+    remote_urls: BTreeMap<String, String>,
+    hosts: GitHubHosts,
     branch_remote: Option<String>,
     reference: Option<ForgeRepoRef>,
 }
@@ -1657,92 +1986,102 @@ pub(crate) fn resolve(
     project: &Entity<Project>,
     cx: &mut App,
 ) -> Task<anyhow::Result<Arc<dyn Forge>>> {
-    let snapshot = repository.read(cx).snapshot();
-    let branch_remote = snapshot
-        .branch
-        .as_ref()
-        .and_then(|branch| branch.upstream.as_ref())
-        .and_then(|upstream| upstream.remote_name())
-        .map(str::to_string);
-    let key = ForgeKey {
-        work_dir: snapshot.work_directory_abs_path,
-        origin_url: snapshot.remote_origin_url,
-        upstream_url: snapshot.remote_upstream_url,
-        branch_remote: branch_remote.clone(),
-        reference: reference.clone(),
-    };
-    let cached = cx
-        .default_global::<GitHubForges>()
-        .0
-        .get(&key)
-        .filter(|forge| match forge.peek() {
-            None => true,
-            Some(Ok(forge)) => !forge.client.token.is_revoked(),
-            Some(Err(_)) => false,
-        })
-        .cloned();
-    let forge = match cached {
-        Some(forge) => forge,
-        None => {
-            let forge = resolve_uncached(
-                repository,
-                reference,
-                branch_remote,
-                project,
-                key.work_dir.clone(),
-                cx,
-            )
-            .shared();
-            cx.default_global::<GitHubForges>()
+    let branch_remote = branch_remote(repository, cx);
+    let work_dir = repository.read(cx).work_directory_abs_path.clone();
+    let repository = repository.clone();
+    let project = project.clone();
+    cx.spawn(async move |cx| {
+        let (remote_urls, hosts) = remote_urls_and_hosts(&repository, cx).await?;
+        let key = ForgeKey {
+            work_dir: work_dir.clone(),
+            remote_urls: remote_urls
+                .iter()
+                .map(|(name, url)| (name.clone(), url.clone()))
+                .collect(),
+            hosts: hosts.clone(),
+            branch_remote: branch_remote.clone(),
+            reference: reference.clone(),
+        };
+        let forge = cx.update(|cx| {
+            let cached = cx
+                .default_global::<GitHubForges>()
                 .0
-                .insert(key, forge.clone());
-            forge
-        }
-    };
-    cx.spawn(async move |_| {
+                .get(&key)
+                .filter(|forge| match forge.peek() {
+                    None => true,
+                    Some(Ok(forge)) => !forge.client.token.is_revoked(),
+                    Some(Err(_)) => false,
+                })
+                .cloned();
+            match cached {
+                Some(forge) => forge,
+                None => {
+                    let remotes = github_remotes(&remote_urls, branch_remote.as_deref(), &hosts);
+                    let forge =
+                        resolve_uncached(&remotes, reference, &project, &work_dir, cx).shared();
+                    cx.default_global::<GitHubForges>()
+                        .0
+                        .insert(key, forge.clone());
+                    forge
+                }
+            }
+        });
         let forge: Arc<dyn Forge> = forge.await?;
         Ok(forge)
     })
 }
 
 fn resolve_uncached(
-    repository: &Entity<Repository>,
+    remotes: &[GitHubRemote],
     reference: Option<ForgeRepoRef>,
-    branch_remote: Option<String>,
     project: &Entity<Project>,
-    work_dir: Arc<Path>,
+    work_dir: &Arc<Path>,
     cx: &mut App,
 ) -> Task<Result<Arc<GitHubForge>, GitHubError>> {
-    let remote_urls = repository.update(cx, |repository, _| repository.remote_urls());
-    let registry = GitHostingProviderRegistry::try_global(cx);
+    let (remote, follow_parent) = match choose_remote(remotes, reference.as_ref()) {
+        Ok((remote, follow_parent)) => (remote.clone(), follow_parent),
+        Err(error) => return Task::ready(Err(error)),
+    };
+    let token = token_for_host(
+        &remote.repo.host,
+        remote.host_kind,
+        project,
+        work_dir,
+        cx,
+    );
     let http = cx.http_client();
-    let project = project.clone();
-    cx.spawn(async move |cx| {
-        let remote_urls = remote_urls
-            .await
-            .map_err(|_| transport(anyhow!("the repository was closed")))?
-            .map_err(|error| transport(error.context("listing the repository's remotes")))?;
-        let remotes = github_remotes(&remote_urls, branch_remote.as_deref(), registry.as_deref());
-        let (remote, follow_parent) = choose_remote(&remotes, reference.as_ref())?;
-        let token = cx
-            .update(|cx| token_for_host(&remote.repo.host, &project, &work_dir, cx))
-            .await?;
+    cx.spawn(async move |_| {
+        let token = token.await?;
         let client = Arc::new(GitHubClient::new(http, remote.repo.host.clone(), token));
         let context = client
-            .repository_context(remote, reference.as_ref(), follow_parent)
+            .repository_context(&remote, reference.as_ref(), follow_parent)
             .await?;
         Ok(Arc::new(GitHubForge { client, context }))
     })
 }
 
+/// Tests get tokens from `gh`, which `gh` says it has for a host, and no environment.
 #[cfg(test)]
 pub(crate) fn set_fake_token_source(
     cx: &mut App,
-    token: impl Fn(&str) -> Result<String, GitHubError> + Send + Sync + 'static,
+    gh: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
 ) {
-    let tokens = cx.default_global::<GitHubTokens>();
-    tokens.source = TokenSource::Fake(Arc::new(token));
-    tokens.tokens.clear();
+    set_fake_lookups(
+        cx,
+        FakeLookups {
+            environment: HashMap::default(),
+            gh: Box::new(gh),
+            ssh_hostnames: HashMap::default(),
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn set_fake_lookups(cx: &mut App, lookups: FakeLookups) {
+    let state = cx.default_global::<GitHubLookups>();
+    state.source = Lookups::Fake(Arc::new(lookups));
+    state.tokens.clear();
+    state.ssh_hostnames.clear();
 }
 
 #[cfg(test)]
@@ -1858,7 +2197,11 @@ pub(crate) mod test_support {
     /// PR A's review threads, parsed.
     pub(crate) fn pr1_threads() -> Vec<RemoteThread> {
         let (http, _) = fake_github(|_| Reply::json(PR1_THREADS));
-        let client = GitHubClient::new(http, "github.com".into(), GitHubToken::new(TOKEN));
+        let client = GitHubClient::new(
+            http,
+            "github.com".into(),
+            GitHubToken::new(TOKEN, TokenOrigin::GitHubCli),
+        );
         let repo = ForgeRepo {
             host: "github.com".into(),
             owner: "drew-council".into(),
@@ -1904,10 +2247,11 @@ mod tests {
     use crate::forge::{error_message, github_error, resolve_forge};
     use anyhow::Context as _;
     use futures::{AsyncWriteExt as _, executor::block_on};
-    use gpui::TestAppContext;
-    use http_client::{FakeHttpClient, Response, Url};
+    use gpui::{BorrowAppContext as _, TestAppContext};
+    use http_client::{FakeHttpClient, Response};
     use project::FakeFs;
     use serde_json::Value;
+    use settings::SettingsStore;
     use std::{
         cell::Cell,
         sync::{Mutex, atomic::AtomicUsize},
@@ -1923,7 +2267,11 @@ mod tests {
     }
 
     fn client(http: Arc<dyn HttpClient>) -> GitHubClient {
-        GitHubClient::new(http, "github.com".into(), GitHubToken::new(TOKEN))
+        GitHubClient::new(
+            http,
+            "github.com".into(),
+            GitHubToken::new(TOKEN, TokenOrigin::GitHubCli),
+        )
     }
 
     fn fixture(text: &str) -> Value {
@@ -1958,19 +2306,18 @@ mod tests {
 
     #[test]
     fn test_github_repo_for_remote() {
-        let registry = GitHostingProviderRegistry::new();
-        registry
-            .register_hosting_provider(Arc::new(git_hosting_providers::Github::public_instance()));
-        registry
-            .register_hosting_provider(Arc::new(git_hosting_providers::Gitlab::public_instance()));
-        registry.register_hosting_provider(Arc::new(git_hosting_providers::Github::new(
-            "GitHub Self-Hosted",
-            Url::parse("https://github.example.com").unwrap(),
-        )));
-        let parse = |url: &str, registry: Option<&GitHostingProviderRegistry>| {
-            github_repo_for_remote(url, registry).map(|(repo, is_ssh)| {
+        let hosts = GitHubHosts {
+            configured: vec!["ghe.corp:8443".into(), "code.corp".into()],
+            registered: vec!["github.com".into(), "github.example.com".into()],
+            ssh_hostnames: BTreeMap::from_iter([
+                ("github-work".to_string(), "github.com".to_string()),
+                ("ghe-alias".to_string(), "code.corp".to_string()),
+            ]),
+        };
+        let parse = |url: &str, hosts: &GitHubHosts| {
+            github_repo_for_remote(url, hosts).map(|(repo, is_ssh, host_kind)| {
                 format!(
-                    "{} {repo} {}",
+                    "{} {repo} {} {host_kind:?}",
                     repo.host,
                     if is_ssh { "ssh" } else { "https" }
                 )
@@ -1979,41 +2326,84 @@ mod tests {
         let cases = [
             (
                 "git@github.com:drew-council/zed.git",
-                Some("github.com drew-council/zed ssh"),
+                Some("github.com drew-council/zed ssh Cloud"),
             ),
             (
                 "ssh://git@github.com/drew-council/zed.git",
-                Some("github.com drew-council/zed ssh"),
+                Some("github.com drew-council/zed ssh Cloud"),
             ),
             (
                 "https://github.com/zed-industries/zed",
-                Some("github.com zed-industries/zed https"),
+                Some("github.com zed-industries/zed https Cloud"),
             ),
             (
                 "https://x-access-token@github.com/zed-industries/zed.git/",
-                Some("github.com zed-industries/zed https"),
-            ),
-            (
-                "git@github.example.com:team/app.git",
-                Some("github.example.com team/app ssh"),
+                Some("github.com zed-industries/zed https Cloud"),
             ),
             (
                 "https://octo.ghe.com/team/app.git",
-                Some("octo.ghe.com team/app https"),
+                Some("octo.ghe.com team/app https Cloud"),
+            ),
+            // GitHub's SSH service on port 443, and an alias of `~/.ssh/config`.
+            (
+                "ssh://git@ssh.github.com:443/team/app.git",
+                Some("github.com team/app ssh Cloud"),
+            ),
+            (
+                "git@github-work:team/app.git",
+                Some("github.com team/app ssh Cloud"),
+            ),
+            // Enterprise Server: the user's settings name it, with its port for HTTPS; SSH
+            // remotes (also through an alias) use the configured web server.
+            (
+                "https://ghe.corp:8443/team/app.git",
+                Some("ghe.corp:8443 team/app https Configured"),
+            ),
+            (
+                "git@ghe.corp:team/app.git",
+                Some("ghe.corp:8443 team/app ssh Configured"),
+            ),
+            (
+                "ssh://git@code.corp:2222/team/app.git",
+                Some("code.corp team/app ssh Configured"),
+            ),
+            (
+                "git@ghe-alias:team/app.git",
+                Some("code.corp team/app ssh Configured"),
+            ),
+            ("https://ghe.corp/team/app.git", None),
+            // Only Zed's registry says it is GitHub's (its name has "github" in it).
+            (
+                "git@github.example.com:team/app.git",
+                Some("github.example.com team/app ssh Unverified"),
+            ),
+            (
+                "https://github.example.com:4443/team/app.git",
+                Some("github.example.com:4443 team/app https Unverified"),
             ),
             ("https://gitlab.com/team/app.git", None),
             ("https://github.com/only-an-owner", None),
             ("/srv/git/app.git", None),
         ];
         for (url, expected) in cases {
-            assert_eq!(parse(url, Some(&registry)).as_deref(), expected, "{url}");
+            assert_eq!(parse(url, &hosts).as_deref(), expected, "{url}");
         }
-        // Enterprise Server hosts are only known through the registry.
-        assert_eq!(parse("git@github.example.com:team/app.git", None), None);
+        let nothing_known = GitHubHosts::default();
+        assert_eq!(parse("git@github.example.com:team/app.git", &nothing_known), None);
+        assert_eq!(parse("git@github-work:team/app.git", &nothing_known), None);
         assert_eq!(
-            parse("https://octo.ghe.com/team/app.git", None).as_deref(),
-            Some("octo.ghe.com team/app https")
+            parse("https://octo.ghe.com/team/app.git", &nothing_known).as_deref(),
+            Some("octo.ghe.com team/app https Cloud")
         );
+    }
+
+    #[test]
+    fn test_ssh_host_names() {
+        assert!(is_host_name("github.com-personal"));
+        assert!(is_host_name("github_work"));
+        for hostile in ["", "-oProxyCommand=x", "a b", "a;b", "[::1]", "a/b"] {
+            assert!(!is_host_name(hostile), "{hostile:?}");
+        }
     }
 
     #[test]
@@ -2029,7 +2419,7 @@ mod tests {
             .map(|(name, url)| (name.to_string(), url.to_string())),
         );
         let names = |branch_remote: Option<&str>| {
-            github_remotes(&urls, branch_remote, None)
+            github_remotes(&urls, branch_remote, &GitHubHosts::default())
                 .into_iter()
                 .map(|remote| remote.name)
                 .collect::<Vec<_>>()
@@ -2040,7 +2430,7 @@ mod tests {
             ["colleague", "origin", "upstream", "archive"]
         );
 
-        let remotes = github_remotes(&urls, None, None);
+        let remotes = github_remotes(&urls, None, &GitHubHosts::default());
         assert!(remotes[0].repo.is_same_repo(&ForgeRepo {
             host: "GitHub.com".into(),
             owner: "Drew-Council".into(),
@@ -2074,52 +2464,106 @@ mod tests {
 
     #[test]
     fn test_token_precedence() {
-        let host = SharedString::from("github.com");
-        let directory = |token: &str| {
-            Some(HashMap::from_iter([(
-                "GITHUB_TOKEN".to_string(),
-                token.to_string(),
-            )]))
+        let github = SharedString::from("github.com");
+        let variables = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<HashMap<_, _>>()
         };
         let gh_ran = Cell::new(false);
-        let gh = |output: &'static str| {
+        let gh = |output: Option<&'static str>| {
             let gh_ran = &gh_ran;
-            move |_| {
+            move || {
                 gh_ran.set(true);
-                async move { Ok::<_, GhFailure>(output.to_string()) }
+                async move {
+                    output
+                        .map(str::to_string)
+                        .ok_or_else(|| GhFailure::Failed("not logged in".into()))
+                }
             }
         };
+        let resolve = |host: &SharedString,
+                       host_kind: GitHubHost,
+                       process: &HashMap<String, String>,
+                       project: Option<&HashMap<String, String>>,
+                       gh_output: Option<&'static str>| {
+            gh_ran.set(false);
+            block_on(resolve_token(
+                host,
+                host_kind,
+                |name| process.get(name).cloned(),
+                project,
+                gh(gh_output),
+            ))
+            .map(|token| (token.value.to_string(), token.origin))
+        };
+        let everything = variables(&[
+            ("GH_TOKEN", "gh-variable"),
+            ("GITHUB_TOKEN", "github-variable"),
+            ("GH_ENTERPRISE_TOKEN", "enterprise-variable"),
+        ]);
+        let project = variables(&[("GITHUB_TOKEN", "project"), ("GH_ENTERPRISE_TOKEN", "x")]);
 
-        let token = block_on(resolve_token(
-            &host,
-            Some("process".into()),
-            directory("directory"),
-            gh("gh"),
-        ))
-        .unwrap();
-        assert_eq!(&*token.value, "process");
+        // github.com: `GH_TOKEN`, then `GITHUB_TOKEN`, Zed's before the project's, then gh.
+        assert_eq!(
+            resolve(&github, GitHubHost::Cloud, &everything, Some(&project), Some("gh")).unwrap(),
+            ("gh-variable".into(), TokenOrigin::Variable("GH_TOKEN"))
+        );
         assert!(!gh_ran.get());
+        let github_only = variables(&[("GH_TOKEN", " \n"), ("GITHUB_TOKEN", "github-variable")]);
+        assert_eq!(
+            resolve(&github, GitHubHost::Cloud, &github_only, Some(&project), Some("gh"))
+                .unwrap(),
+            ("github-variable".into(), TokenOrigin::Variable("GITHUB_TOKEN"))
+        );
+        assert_eq!(
+            resolve(&github, GitHubHost::Cloud, &HashMap::default(), Some(&project), Some("gh"))
+                .unwrap(),
+            ("project".into(), TokenOrigin::Variable("GITHUB_TOKEN"))
+        );
+        assert!(!gh_ran.get());
+        assert_eq!(
+            resolve(&github, GitHubHost::Cloud, &HashMap::default(), None, Some("gh\n")).unwrap(),
+            ("gh".into(), TokenOrigin::GitHubCli)
+        );
 
-        let token = block_on(resolve_token(
-            &host,
-            Some(" \n".into()),
-            directory("directory"),
-            gh("gh"),
-        ))
-        .unwrap();
-        assert_eq!(&*token.value, "directory");
-        assert!(!gh_ran.get());
+        // An Enterprise Server the user configured: never `GITHUB_TOKEN`.
+        let enterprise = SharedString::from("ghe.corp");
+        let cloud_only = variables(&[("GITHUB_TOKEN", "github-variable")]);
+        assert_eq!(
+            resolve(&enterprise, GitHubHost::Configured, &cloud_only, None, Some("gh")).unwrap(),
+            ("gh".into(), TokenOrigin::GitHubCli)
+        );
+        assert_eq!(
+            resolve(&enterprise, GitHubHost::Configured, &everything, None, Some("gh")).unwrap(),
+            (
+                "enterprise-variable".into(),
+                TokenOrigin::Variable("GH_ENTERPRISE_TOKEN")
+            )
+        );
+
+        // A host that only looks like GitHub's: only a `gh` login to it makes it one, and only
+        // that login's token goes to it.
+        let lookalike = SharedString::from("github.attacker.dev");
+        assert_eq!(
+            resolve(&lookalike, GitHubHost::Unverified, &everything, Some(&project), Some("gh"))
+                .unwrap(),
+            ("gh".into(), TokenOrigin::GitHubCli)
+        );
+        assert!(matches!(
+            resolve(&lookalike, GitHubHost::Unverified, &everything, Some(&project), None),
+            Err(GitHubError::HostNotConfigured { host }) if host == "github.attacker.dev"
+        ));
 
         // `gh` runs in the project's environment.
         let environment = HashMap::from_iter([("PATH".to_string(), "/nix/bin".to_string())]);
         let token = block_on(resolve_token(
-            &host,
-            None,
-            Some(environment),
-            |environment| {
-                assert_eq!(environment.unwrap()["PATH"], "/nix/bin");
-                async { Ok::<_, GhFailure>("gh-token\n".to_string()) }
-            },
+            &github,
+            GitHubHost::Cloud,
+            |_| None,
+            Some(&environment),
+            || async { Ok::<_, GhFailure>("gh-token\n".to_string()) },
         ))
         .unwrap();
         assert_eq!(&*token.value, "gh-token");
@@ -2131,22 +2575,36 @@ mod tests {
             }
             other => panic!("expected an auth error, got {other:?}"),
         };
-        let error = block_on(resolve_token(&host, None, None, |_| async {
-            Err::<String, _>(GhFailure::Failed(
-                "no oauth token found for github.com".into(),
-            ))
-        }));
+        let error = block_on(resolve_token(
+            &github,
+            GitHubHost::Cloud,
+            |_| None,
+            None,
+            || async {
+                Err::<String, _>(GhFailure::Failed(
+                    "no oauth token found for github.com".into(),
+                ))
+            },
+        ));
         assert_eq!(failure(error), AuthFailure::NoToken);
-        let error = block_on(resolve_token(&host, None, None, |_| async {
-            Err::<String, _>(GhFailure::Missing)
-        }));
+        let error = block_on(resolve_token(
+            &github,
+            GitHubHost::Cloud,
+            |_| None,
+            None,
+            || async { Err::<String, _>(GhFailure::Missing) },
+        ));
         assert_eq!(failure(error), AuthFailure::NoTokenNoCli);
-        let error = block_on(resolve_token(&host, None, None, |_| async {
-            Ok::<_, GhFailure>("\n".to_string())
-        }));
+        let error = block_on(resolve_token(
+            &github,
+            GitHubHost::Cloud,
+            |_| None,
+            None,
+            || async { Ok::<_, GhFailure>("\n".to_string()) },
+        ));
         assert_eq!(failure(error), AuthFailure::NoToken);
 
-        let hint = |failure| {
+        let hint = |host: &SharedString, failure| {
             GitHubError::Auth {
                 host: host.clone(),
                 failure,
@@ -2154,20 +2612,44 @@ mod tests {
             .hint()
         };
         assert_eq!(
-            hint(AuthFailure::NoToken),
+            hint(&github, AuthFailure::NoToken),
             "No GitHub token for github.com. Set GITHUB_TOKEN or run \
              `gh auth login --hostname github.com`."
         );
         assert_eq!(
-            hint(AuthFailure::NoTokenNoCli),
+            hint(&github, AuthFailure::NoTokenNoCli),
             "No GitHub token for github.com. Set GITHUB_TOKEN, or install the GitHub CLI and \
              run `gh auth login --hostname github.com`."
+        );
+        assert_eq!(
+            hint(&enterprise, AuthFailure::NoToken),
+            "No GitHub token for ghe.corp. Set GH_ENTERPRISE_TOKEN or run \
+             `gh auth login --hostname ghe.corp`."
+        );
+        assert_eq!(
+            hint(
+                &github,
+                AuthFailure::Rejected(TokenOrigin::Variable("GITHUB_TOKEN"))
+            ),
+            "GitHub rejected the token in GITHUB_TOKEN for github.com. Update or unset \
+             GITHUB_TOKEN."
+        );
+        assert_eq!(
+            hint(&github, AuthFailure::Rejected(TokenOrigin::GitHubCli)),
+            "GitHub rejected the GitHub CLI's token for github.com. Run \
+             `gh auth login --hostname github.com`."
+        );
+        assert_eq!(
+            GitHubError::HostNotConfigured { host: lookalike }.hint(),
+            "GitHub isn't configured for github.attacker.dev. If it is a GitHub Enterprise \
+             Server, add it to `git_hosting_providers` in your settings (provider \"github\") \
+             or run `gh auth login --hostname github.attacker.dev`."
         );
     }
 
     #[test]
     fn test_token_stays_out_of_debug_output() {
-        let token = GitHubToken::new(TOKEN);
+        let token = GitHubToken::new(TOKEN, TokenOrigin::GitHubCli);
         assert!(!format!("{token:?}").contains(TOKEN));
 
         let (http, _) = fake_github(|_| Reply::status(401, r#"{"message":"Bad credentials"}"#));
@@ -2894,7 +3376,7 @@ mod tests {
         let error = block_on(client.changed_files(&sandbox(), 4)).unwrap_err();
         assert_eq!(
             error.hint(),
-            "GitHub authentication failed for github.com. Set GITHUB_TOKEN or run \
+            "GitHub rejected the GitHub CLI's token for github.com. Run \
              `gh auth login --hostname github.com`."
         );
         assert!(client.token.is_revoked());
@@ -2917,6 +3399,12 @@ mod tests {
             rate_limit_hint(Some(1760000090), 1760000000),
             "GitHub's API rate limit is exceeded. Try again in 2 minutes."
         );
+        // Headers can say anything.
+        rate_limit_hint(Some(i64::MAX), i64::MIN);
+        rate_limit_hint(Some(i64::MIN), i64::MAX);
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("9223372036854775807"));
+        assert_eq!(rate_limit_reset(&headers), Some(i64::MAX));
 
         let error = error_for(
             Reply::status(
@@ -2932,6 +3420,18 @@ mod tests {
             error.hint(),
             "Authorize your GitHub token for this organization's single sign-on: \
              https://github.com/orgs/acme/sso?authorization_request=A1"
+        );
+        // The "Authorize" button only opens GitHub's own pages.
+        for url in [
+            "http://github.com/orgs/acme/sso",
+            "https://github.attacker.dev/orgs/acme/sso",
+            "javascript:alert(1)",
+        ] {
+            assert_eq!(sso_url(&format!("required; url={url}"), "github.com"), None);
+        }
+        assert_eq!(
+            sso_url("required; url=https://ghe.corp:8443/orgs/a/sso", "ghe.corp:8443").as_deref(),
+            Some("https://ghe.corp:8443/orgs/a/sso")
         );
 
         let error = error_for(Reply::status(
@@ -2994,6 +3494,7 @@ mod tests {
                 body.as_bytes(),
                 &"drew-council/code-review-sandbox#2".into(),
                 &"github.com".into(),
+                TokenOrigin::GitHubCli,
             )
             .hint()
             .to_string()
@@ -3094,7 +3595,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_tokens_are_shared_per_host(cx: &mut TestAppContext) {
+    async fn test_tokens_are_shared_per_host_and_project(cx: &mut TestAppContext) {
         let (project, _) = project_with_remotes(&[], cx).await;
         let lookups = Arc::new(AtomicUsize::new(0));
         let fail = Arc::new(AtomicBool::new(false));
@@ -3102,50 +3603,206 @@ mod tests {
             set_fake_token_source(cx, {
                 let lookups = lookups.clone();
                 let fail = fail.clone();
-                move |host| {
+                move |_| {
                     let lookup = lookups.fetch_add(1, Ordering::SeqCst) + 1;
-                    if fail.load(Ordering::SeqCst) {
-                        Err(GitHubError::Auth {
-                            host: host.to_string().into(),
-                            failure: AuthFailure::NoToken,
-                        })
-                    } else {
-                        Ok(format!("token-{lookup}"))
-                    }
+                    (!fail.load(Ordering::SeqCst)).then(|| format!("token-{lookup}"))
                 }
             })
         });
         let work_dir: Arc<Path> = Path::new(path!("/project")).into();
-        let token = |host: &str, cx: &mut TestAppContext| {
+        let token = |host: &str, work_dir: &Arc<Path>, cx: &mut TestAppContext| {
             let host = SharedString::from(host.to_string());
-            cx.update(|cx| token_for_host(&host, &project, &work_dir, cx))
+            cx.update(|cx| token_for_host(&host, GitHubHost::Cloud, &project, work_dir, cx))
         };
 
         // Two callers at once share one lookup.
-        let (first, second) = (token("github.com", cx), token("github.com", cx));
+        let (first, second) = (
+            token("github.com", &work_dir, cx),
+            token("github.com", &work_dir, cx),
+        );
         let (first, second) = (first.await.unwrap(), second.await.unwrap());
         assert_eq!(&*first.value, "token-1");
         assert!(Arc::ptr_eq(&first.value, &second.value));
-        assert_eq!(&*token("github.com", cx).await.unwrap().value, "token-1");
+        assert_eq!(
+            &*token("github.com", &work_dir, cx).await.unwrap().value,
+            "token-1"
+        );
         assert_eq!(lookups.load(Ordering::SeqCst), 1);
 
         assert_eq!(
-            &*token("github.example.com", cx).await.unwrap().value,
+            &*token("octo.ghe.com", &work_dir, cx).await.unwrap().value,
             "token-2"
+        );
+        // Another project's environment may have another token.
+        let other_project: Arc<Path> = Path::new(path!("/other")).into();
+        assert_eq!(
+            &*token("github.com", &other_project, cx).await.unwrap().value,
+            "token-3"
         );
 
         // A token GitHub rejected is looked up again.
         first.revoke();
-        let third = token("github.com", cx).await.unwrap();
-        assert_eq!(&*third.value, "token-3");
+        let fourth = token("github.com", &work_dir, cx).await.unwrap();
+        assert_eq!(&*fourth.value, "token-4");
 
         // So is a failed lookup, once the problem is fixed.
         fail.store(true, Ordering::SeqCst);
-        third.revoke();
-        assert!(token("github.com", cx).await.is_err());
+        fourth.revoke();
+        assert!(token("github.com", &work_dir, cx).await.is_err());
         fail.store(false, Ordering::SeqCst);
-        assert_eq!(&*token("github.com", cx).await.unwrap().value, "token-5");
-        assert_eq!(lookups.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            &*token("github.com", &work_dir, cx).await.unwrap().value,
+            "token-6"
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 6);
+    }
+
+    /// A remote whose host only looks like GitHub's (Zed registers `origin`'s host as "GitHub
+    /// Self-Hosted" when its name contains "github") gets no request at all, whatever tokens
+    /// the environment has, until the user configures it or logs `gh` in to it.
+    #[gpui::test]
+    async fn test_no_request_to_a_host_that_only_looks_like_github(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let registry = GitHostingProviderRegistry::default_global(cx);
+            registry.register_hosting_provider(Arc::new(
+                git_hosting_providers::Github::public_instance(),
+            ));
+        });
+        let (project, repository) =
+            project_with_remotes(&[("origin", "https://github.attacker.dev/x/y")], cx).await;
+        let registered = cx.update(|cx| GitHubHosts::new(cx).registered);
+        assert!(
+            registered.contains(&"github.attacker.dev".to_string()),
+            "{registered:?}"
+        );
+        let (http, requests) = fake_github(repository_context_reply);
+        let gh_hosts = Arc::new(Mutex::new(vec!["github.com".to_string()]));
+        cx.update(|cx| {
+            cx.set_http_client(http);
+            set_fake_lookups(
+                cx,
+                FakeLookups {
+                    environment: HashMap::from_iter(
+                        [
+                            ("GITHUB_TOKEN", "cloud-secret"),
+                            ("GH_TOKEN", "cloud-secret"),
+                            ("GH_ENTERPRISE_TOKEN", "enterprise-secret"),
+                            ("GITHUB_ENTERPRISE_TOKEN", "enterprise-secret"),
+                        ]
+                        .map(|(name, value)| (name.to_string(), value.to_string())),
+                    ),
+                    gh: Box::new({
+                        let gh_hosts = gh_hosts.clone();
+                        move |host| {
+                            gh_hosts
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .any(|known| known == host)
+                                .then(|| "gh-secret".to_string())
+                        }
+                    }),
+                    ssh_hostnames: HashMap::default(),
+                },
+            );
+        });
+
+        let Err(error) = cx
+            .update(|cx| resolve_forge(&repository, None, &project, cx))
+            .await
+        else {
+            panic!("expected an error");
+        };
+        assert!(matches!(
+            github_error(&error),
+            Some(GitHubError::HostNotConfigured { host }) if host == "github.attacker.dev"
+        ));
+        assert!(
+            error_message(&error).starts_with("GitHub isn't configured for github.attacker.dev."),
+            "{error:#}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 0);
+
+        // The user configures it in their settings: then the environment's enterprise token
+        // goes there, never the github.com one.
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.git_hosting_providers = Some(
+                        vec![settings::GitHostingProviderConfig {
+                            provider: GitHostingProviderKind::Github,
+                            base_url: "https://github.attacker.dev".into(),
+                            name: "Corp".into(),
+                        }]
+                        .into(),
+                    );
+                });
+            });
+        });
+        let forge = cx
+            .update(|cx| resolve_forge(&repository, None, &project, cx))
+            .await;
+        assert!(forge.is_err(), "the fake GitHub doesn't know x/y");
+        let authorizations = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                (
+                    request.uri.clone(),
+                    request.headers["authorization"]
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authorizations,
+            [(
+                "https://github.attacker.dev/api/graphql".to_string(),
+                "Bearer enterprise-secret".to_string()
+            )]
+        );
+    }
+
+    /// A host Zed only guesses is GitHub's counts once `gh` is logged in to it, with that
+    /// login's token.
+    #[gpui::test]
+    async fn test_host_known_to_gh(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            GitHostingProviderRegistry::default_global(cx);
+        });
+        let (project, repository) = project_with_remotes(
+            &[("origin", "git@github.corp.example:drew-council/zed.git")],
+            cx,
+        )
+        .await;
+        let (http, requests) = fake_github(repository_context_reply);
+        cx.update(|cx| {
+            cx.set_http_client(http);
+            set_fake_lookups(
+                cx,
+                FakeLookups {
+                    environment: HashMap::from_iter([(
+                        "GH_ENTERPRISE_TOKEN".to_string(),
+                        "enterprise-secret".to_string(),
+                    )]),
+                    gh: Box::new(|host| {
+                        (host == "github.corp.example").then(|| "gh-login".to_string())
+                    }),
+                    ssh_hostnames: HashMap::default(),
+                },
+            );
+        });
+        let forge = cx
+            .update(|cx| resolve_forge(&repository, None, &project, cx))
+            .await
+            .unwrap();
+        assert_eq!(forge.context().canonical.host, "github.corp.example");
+        let request = requests.lock().unwrap().remove(0);
+        assert_eq!(request.uri, "https://github.corp.example/api/graphql");
+        assert_eq!(request.headers["authorization"], "Bearer gh-login");
     }
 
     #[gpui::test]
@@ -3165,7 +3822,7 @@ mod tests {
         });
         cx.update(|cx| {
             cx.set_http_client(http);
-            set_fake_token_source(cx, |_| Ok(TOKEN.into()));
+            set_fake_token_source(cx, |_| Some(TOKEN.into()));
         });
         let resolve = |reference: Option<(&str, &str)>, cx: &mut TestAppContext| {
             let reference = reference.map(|(owner, name)| ForgeRepoRef {
@@ -3250,6 +3907,51 @@ mod tests {
         );
     }
 
+    /// `git remote set-url` on any remote resolves the forge again.
+    #[gpui::test]
+    async fn test_forge_follows_remote_urls(cx: &mut TestAppContext) {
+        crate::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "file.txt": "text\n" }))
+            .await;
+        let dot_git = Path::new(path!("/project/.git"));
+        fs.set_remote_for_repo(dot_git, "origin", "https://github.com/zed-industries/zed");
+        fs.set_remote_for_repo(dot_git, "alice", "https://github.com/drew-council/zed");
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        cx.run_until_parked();
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+        let (http, requests) = fake_github(repository_context_reply);
+        cx.update(|cx| {
+            cx.set_http_client(http);
+            set_fake_token_source(cx, |_| Some(TOKEN.into()));
+        });
+        let alice = ForgeRepoRef {
+            host: None,
+            owner: "drew-council".into(),
+            name: "zed".into(),
+        };
+        let resolve = |cx: &mut TestAppContext| {
+            cx.update(|cx| resolve_forge(&repository, Some(alice.clone()), &project, cx))
+        };
+
+        let forge = resolve(cx).await.unwrap();
+        assert_eq!(forge.context().canonical.to_string(), "drew-council/zed");
+        assert!(Arc::ptr_eq(&forge, &resolve(cx).await.unwrap()));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        // No remote points at drew-council/zed any more: the preferred remote's repository
+        // isn't it.
+        fs.set_remote_for_repo(dot_git, "alice", "https://github.com/someone/zed");
+        let Err(error) = resolve(cx).await else {
+            panic!("expected an error");
+        };
+        assert!(matches!(
+            github_error(&error),
+            Some(GitHubError::OtherRepository { .. })
+        ));
+    }
+
     #[gpui::test]
     async fn test_resolve_forge_after_rejected_token(cx: &mut TestAppContext) {
         let (project, repository) =
@@ -3270,7 +3972,7 @@ mod tests {
             cx.set_http_client(http);
             set_fake_token_source(cx, {
                 let lookups = lookups.clone();
-                move |_| Ok(format!("token-{}", lookups.fetch_add(1, Ordering::SeqCst)))
+                move |_| Some(format!("token-{}", lookups.fetch_add(1, Ordering::SeqCst)))
             });
         });
         let resolve = |cx: &mut TestAppContext| {
@@ -3287,7 +3989,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error_message(&error),
-            "GitHub authentication failed for github.com. Set GITHUB_TOKEN or run \
+            "GitHub rejected the GitHub CLI's token for github.com. Run \
              `gh auth login --hostname github.com`."
         );
 
@@ -3312,7 +4014,7 @@ mod tests {
         let (http, requests) = fake_github(|_| Reply::status(500, "{}"));
         cx.update(|cx| {
             cx.set_http_client(http);
-            set_fake_token_source(cx, |_| Ok(TOKEN.into()));
+            set_fake_token_source(cx, |_| Some(TOKEN.into()));
         });
         let Err(error) = cx
             .update(|cx| resolve_forge(&repository, None, &project, cx))
