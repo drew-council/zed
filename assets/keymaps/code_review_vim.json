@@ -94,10 +94,27 @@
     },
   },
   {
-    "context": "ReviewPanel",
+    // `not_editing`: `;` typed into a filter prompt must not start `; l`.
+    "context": "ReviewPanel && not_editing",
     "bindings": {
       "; e": "code_review::TogglePanel",
       "; l": "code_review::FocusDiff",
+      // vim's `space f`, `space w …` would otherwise keep `space` pending.
+      "space": "code_review::ToggleSelectedDirectory",
+      "j": "vim::MenuSelectNext",
+      "k": "vim::MenuSelectPrevious",
+      "down": "vim::MenuSelectNext",
+      "up": "vim::MenuSelectPrevious",
+      "0": ["vim::Number", 0],
+      "1": ["vim::Number", 1],
+      "2": ["vim::Number", 2],
+      "3": ["vim::Number", 3],
+      "4": ["vim::Number", 4],
+      "5": ["vim::Number", 5],
+      "6": ["vim::Number", 6],
+      "7": ["vim::Number", 7],
+      "8": ["vim::Number", 8],
+      "9": ["vim::Number", 9],
     },
   },
 ]

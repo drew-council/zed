@@ -58,6 +58,13 @@ actions!(
         ToggleSingleFileMode,
         /// Opens the file at the cursor line in a regular editor.
         OpenFileAtCursor,
+        /// In the review panel: expands the selected directory, enters an expanded one, or shows
+        /// the selected file in the diff.
+        ExpandSelectedEntry,
+        /// In the review panel: collapses the selected directory or selects the parent directory.
+        CollapseSelectedEntry,
+        /// In the review panel: expands or collapses the selected directory.
+        ToggleSelectedDirectory,
     ]
 );
 
@@ -168,7 +175,8 @@ pub(crate) mod test_support {
     use util::path;
     use workspace::MultiWorkspace;
 
-    /// `init_test` plus vim mode and the keymaps in the order `zed` loads them. Vim attaches to
+    /// `init_test` plus vim mode and the keymaps in the order `zed` loads them (minus the base
+    /// keymap overlay). Vim attaches to
     /// editors when they are created, so this must run before the review opens.
     pub(crate) fn init_vim_test(cx: &mut TestAppContext, diff_view_style: DiffViewStyle) {
         init_test(cx);
@@ -180,17 +188,17 @@ pub(crate) mod test_support {
                 });
             });
             vim::init(cx);
-            for (asset, source) in [
-                ("keymaps/default-linux.json", KeybindSource::Default),
-                ("keymaps/vim.json", KeybindSource::Vim),
-            ] {
+            let load_asset = |asset: &str, source: KeybindSource, cx: &mut App| {
                 let mut key_bindings =
                     KeymapFile::load_asset_allow_partial_failure(asset, cx).unwrap();
                 for key_binding in &mut key_bindings {
                     key_binding.set_meta(source.meta());
                 }
                 cx.bind_keys(key_bindings);
-            }
+            };
+            load_asset("keymaps/default-linux.json", KeybindSource::Default, cx);
+            cx.bind_keys(parse_keymap(KEYMAP, KeybindSource::Default, cx).unwrap());
+            load_asset("keymaps/vim.json", KeybindSource::Vim, cx);
             cx.bind_keys(parse_keymap(VIM_KEYMAP, KeybindSource::Vim, cx).unwrap());
         });
     }
@@ -260,17 +268,15 @@ pub(crate) mod test_support {
         row_text(editor, row, cx)
     }
 
-    /// The worktree path of the file under the cursor.
+    /// The repository path of the file under the cursor.
     pub(crate) fn path_at_cursor(
         review: &Entity<ReviewView>,
         cx: &mut VisualTestContext,
     ) -> Option<String> {
         review.read_with(cx, |review, cx| {
-            review
-                .diff()
-                .read(cx)
-                .path_at_cursor(cx)
-                .map(|path_key| path_key.path.as_unix_str().to_string())
+            let diff = review.diff().read(cx);
+            let path_key = diff.path_at_cursor(cx)?;
+            Some(diff.repo_path_for(&path_key)?.as_unix_str().to_string())
         })
     }
 
@@ -435,6 +441,66 @@ pub(crate) mod test_support {
         let review = workspace.update(cx, |workspace, cx| {
             workspace.active_item_as::<ReviewView>(cx).unwrap()
         });
+        cx.focus(&review);
+        cx.run_until_parked();
+        (fs, workspace, review, cx)
+    }
+
+    /// The HEAD contents of [`open_tree_fixture`]'s repository.
+    pub(crate) fn tree_fixture_head() -> Vec<(&'static str, String)> {
+        let lib: String = (1..=30).map(line).collect();
+        vec![
+            (".gitattributes", TREE_FIXTURE_ATTRIBUTES.into()),
+            ("Cargo.lock", "lock 1\nlock 2\n".into()),
+            ("docs/old.md", "old\n".into()),
+            ("src/lib.rs", lib),
+            ("src/mod_b.rs", "b 1\nb 2\n".into()),
+            ("z.txt", "one\ntwo\nthree\n".into()),
+        ]
+    }
+
+    pub(crate) const TREE_FIXTURE_ATTRIBUTES: &str =
+        "Cargo.lock linguist-generated\nvendor/** linguist-vendored\n";
+
+    /// A repository with nested directories, a generated and a vendored file (per its
+    /// `.gitattributes`) and a file with two hunks (`src/lib.rs`). Review order:
+    /// `docs/old.md` (deleted), `src/a/b/c.rs` (added), `src/lib.rs`, `src/mod_b.rs`,
+    /// `vendor/x.js` (added, vendored), `Cargo.lock` (generated), `z.txt`.
+    pub(crate) async fn open_tree_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Workspace>,
+        Entity<ReviewView>,
+        &mut VisualTestContext,
+    ) {
+        let lib = (1..=30)
+            .map(line)
+            .collect::<String>()
+            .replace(&line(2), "LINE 2\n")
+            .replace(&line(25), "LINE 25\n");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                ".gitattributes": TREE_FIXTURE_ATTRIBUTES,
+                "Cargo.lock": "lock 1\nlock 2\nlock 3\n",
+                "src": {
+                    "a": { "b": { "c.rs": "fn c() {}\n" } },
+                    "lib.rs": lib,
+                    "mod_b.rs": "b 1\nB 2\n",
+                },
+                "vendor": { "x.js": "x();\n" },
+                "z.txt": "one\nTWO\nthree\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(dot_git(), &tree_fixture_head());
+        let (workspace, cx) = open_workspace(fs.clone(), cx).await;
+        cx.update(|window, cx| window.dispatch_action(ReviewUncommitted.boxed_clone(), cx));
+        cx.run_until_parked();
+        let review = active_review(&workspace, cx);
         cx.focus(&review);
         cx.run_until_parked();
         (fs, workspace, review, cx)

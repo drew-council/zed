@@ -6,4 +6,20 @@
       "tab": "picker::MultiSelectNext",
     },
   },
+  {
+    // The review panel's file tree. Enter, Escape and the arrow keys come from the global
+    // `menu::*` bindings.
+    "context": "ReviewPanel && not_editing",
+    "bindings": {
+      "j": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "h": "code_review::CollapseSelectedEntry",
+      "left": "code_review::CollapseSelectedEntry",
+      "l": "code_review::ExpandSelectedEntry",
+      "right": "code_review::ExpandSelectedEntry",
+      "space": "code_review::ToggleSelectedDirectory",
+      "g g": "menu::SelectFirst",
+      "shift-g": "menu::SelectLast",
+    },
+  },
 ]

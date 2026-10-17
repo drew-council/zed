@@ -3,7 +3,7 @@ use crate::{
     PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel, ReviewUncommitted,
     ScrollLeft, ScrollRight, ChangeBase, ToggleHeader, ToggleSingleFileMode,
     commits::{TOP_BLOCK_COMMIT_LIMIT, first_parent_chain, resolve_commit_spec, validate_ref},
-    diff::ReviewDiff,
+    diff::{ReviewDiff, ReviewDiffEvent, ReviewFile},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
     target::{ReviewTarget, parse_commit_spec},
@@ -346,6 +346,9 @@ impl ReviewView {
 
         let subscriptions = vec![
             cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| cx.emit(event.clone())),
+            cx.subscribe(&diff, |_, _, _: &ReviewDiffEvent, cx| cx.notify()),
+            // The review panel shows the diff's loading state.
+            cx.observe(&diff, |_, _, cx| cx.notify()),
             // A branch review is titled after the checked-out branch.
             cx.subscribe(&repo, |this, repo, event: &RepositoryEvent, cx| {
                 if let (RepositoryEvent::HeadChanged, ReviewTarget::Branch { base }) =
@@ -399,6 +402,17 @@ impl ReviewView {
                 .commits_title()
                 .unwrap_or_else(|| range.head.display_short().into()),
         }
+    }
+
+    /// The files the review panel lists, in review order.
+    pub(crate) fn panel_files(&self, cx: &App) -> Vec<ReviewFile> {
+        self.diff.read(cx).files(cx)
+    }
+
+    /// Moves the diff to the first row of the file (showing only that file in single-file mode).
+    pub(crate) fn reveal_file(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_path(path_key, window, cx));
     }
 
     /// Opens Zed's branch picker to change the base of a branch review. A branch that another

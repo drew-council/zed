@@ -107,8 +107,25 @@ struct BufferSubscriptions {
     path_key: PathKey,
     display_buffer: Entity<Buffer>,
     diff: Entity<BufferDiff>,
+    /// The file's status when the source listed it; headers and the panel prefer the status
+    /// against the review base once the buffer is known.
+    status: FileStatus,
     has_hunks: bool,
     _diff_subscription: Subscription,
+}
+
+/// A changed file of the review, as the review panel lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewFile {
+    pub path_key: PathKey,
+    pub repo_path: RepoPath,
+    pub status: FileStatus,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ReviewDiffEvent {
+    /// Files came or went, or gained or lost their hunks.
+    FilesChanged,
 }
 
 /// The diff of a review: a read-only multibuffer with one excerpt group per changed file, over
@@ -306,6 +323,7 @@ impl ReviewDiff {
         &mut self,
         repo_path: RepoPath,
         path_key: PathKey,
+        status: FileStatus,
         display_buffer: Entity<Buffer>,
         diff: Entity<BufferDiff>,
         window: &mut Window,
@@ -334,6 +352,7 @@ impl ReviewDiff {
                 path_key,
                 display_buffer,
                 diff,
+                status,
                 has_hunks: false,
                 _diff_subscription: diff_subscription,
             },
@@ -357,7 +376,11 @@ impl ReviewDiff {
             )
             .map(|hunk| hunk.buffer_range.to_point(&snapshot))
             .collect::<Vec<_>>();
+        let had_hunks = entry.has_hunks;
         entry.has_hunks = !excerpt_ranges.is_empty();
+        if had_hunks != entry.has_hunks {
+            cx.emit(ReviewDiffEvent::FilesChanged);
+        }
         let path_key = entry.path_key.clone();
         let display_buffer = entry.display_buffer.clone();
         let diff = entry.diff.clone();
@@ -419,6 +442,36 @@ impl ReviewDiff {
 
     pub(crate) fn single_file(&self) -> Option<&PathKey> {
         self.single_file.as_ref()
+    }
+
+    /// Every changed file with hunks, in review order, with its status against the review base.
+    pub(crate) fn files(&self, cx: &App) -> Vec<ReviewFile> {
+        let mut files = self
+            .buffer_subscriptions
+            .iter()
+            .filter(|(_, entry)| entry.has_hunks)
+            .map(|(repo_path, entry)| ReviewFile {
+                path_key: entry.path_key.clone(),
+                repo_path: repo_path.clone(),
+                status: self
+                    .source
+                    .status_for_buffer_id(entry.display_buffer.read(cx).remote_id(), cx)
+                    .unwrap_or(entry.status),
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path_key.cmp(&right.path_key));
+        files
+    }
+
+    /// Whether the file list is still being computed or loaded.
+    pub(crate) fn is_loading(&self, cx: &App) -> bool {
+        !self.refresh_task.is_ready() || self.is_source_loading(cx)
+    }
+
+    /// What the review shows when it has no changes (or why it has none).
+    pub(crate) fn empty_label(&self, cx: &App) -> SharedString {
+        self.source_error(cx)
+            .unwrap_or_else(|| self.empty_label.clone())
     }
 
     /// The file under the cursor of the focused side.
@@ -539,6 +592,7 @@ impl ReviewDiff {
                 entries.insert(path_key, diff_buffer);
             }
 
+            let file_count = this.buffer_subscriptions.len();
             let repo_path_by_display_id = this
                 .buffer_subscriptions
                 .iter()
@@ -559,6 +613,9 @@ impl ReviewDiff {
             });
             this.buffer_subscriptions
                 .retain(|repo_path, _| live_repo_paths.contains(repo_path));
+            if this.buffer_subscriptions.len() != file_count {
+                cx.emit(ReviewDiffEvent::FilesChanged);
+            }
             // The loads below show every file again.
             if this
                 .single_file
@@ -574,13 +631,15 @@ impl ReviewDiff {
         // Ordered, so excerpts don't shift under the reader as later files arrive.
         let mut loads = stream::iter(entries.into_iter().map(|(path_key, entry)| {
             let DiffBuffer {
-                repo_path, load, ..
+                repo_path,
+                file_status,
+                load,
             } = entry;
-            load.map(move |loaded| (path_key, repo_path, loaded))
+            load.map(move |loaded| (path_key, repo_path, file_status, loaded))
         }))
         .buffered(MAX_CONCURRENT_BUFFER_LOADS);
 
-        while let Some((path_key, repo_path, loaded)) = loads.next().await {
+        while let Some((path_key, repo_path, file_status, loaded)) = loads.next().await {
             // Buffered loads can already be complete when we poll them, in which
             // case this loop never awaits and starves the foreground thread.
             yield_now().await;
@@ -590,6 +649,7 @@ impl ReviewDiff {
                         this.register_buffer(
                             repo_path,
                             path_key,
+                            file_status,
                             loaded.display_buffer,
                             loaded.diff,
                             window,
@@ -702,6 +762,7 @@ impl ReviewDiff {
 }
 
 impl EventEmitter<EditorEvent> for ReviewDiff {}
+impl EventEmitter<ReviewDiffEvent> for ReviewDiff {}
 
 impl Focusable for ReviewDiff {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -716,10 +777,8 @@ impl Focusable for ReviewDiff {
 impl Render for ReviewDiff {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
-        let is_loading = !self.refresh_task.is_ready() || self.is_source_loading(cx);
-        let empty_label = self
-            .source_error(cx)
-            .unwrap_or_else(|| self.empty_label.clone());
+        let is_loading = self.is_loading(cx);
+        let empty_label = self.empty_label(cx);
 
         div()
             .track_focus(&self.focus_handle)
