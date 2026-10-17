@@ -1,4 +1,4 @@
-use crate::{ReviewUncommitted, diff::ReviewDiff, target::ReviewTarget};
+use crate::{ReviewUncommitted, diff::ReviewDiff, line_cursor::LineCursor, target::ReviewTarget};
 use editor::{Editor, EditorEvent, SplittableEditor};
 use gpui::{
     AnyEntity, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, WeakEntity,
@@ -27,6 +27,7 @@ pub(crate) fn register(workspace: &mut Workspace) {
 pub struct ReviewView {
     target: ReviewTarget,
     diff: Entity<ReviewDiff>,
+    _line_cursor: Entity<LineCursor>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     _diff_subscription: Subscription,
@@ -88,9 +89,11 @@ impl ReviewView {
         let diff_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
+        let line_cursor = cx.new(|cx| LineCursor::new(diff.read(cx).editor().clone(), cx));
         Self {
             target,
             diff,
+            _line_cursor: line_cursor,
             project,
             workspace: workspace.downgrade(),
             _diff_subscription: diff_subscription,

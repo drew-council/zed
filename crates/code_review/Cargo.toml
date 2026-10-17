@@ -42,5 +42,6 @@ settings = { workspace = true, features = ["test-support"] }
 theme.workspace = true
 theme_settings.workspace = true
 unindent.workspace = true
+vim.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 zlog.workspace = true

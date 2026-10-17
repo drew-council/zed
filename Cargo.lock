@@ -3262,6 +3262,7 @@ dependencies = [
  "ui",
  "unindent",
  "util",
+ "vim",
  "workspace",
  "zlog",
 ]

@@ -1,0 +1,540 @@
+use buffer_diff::DiffHunkStatusKind;
+use editor::{
+    Anchor, Bias, DisplayPoint, Editor, EditorEvent, MultiBufferSnapshot, RowHighlightOptions,
+    SplittableEditor,
+    display_map::{DisplayRow, DisplaySnapshot},
+};
+use gpui::{Entity, EntityId, Hsla, Subscription};
+use language::Point;
+use multi_buffer::MultiBufferRow;
+use std::ops::RangeInclusive;
+use ui::prelude::*;
+
+struct CursorRowContext;
+struct CursorRowAdded;
+struct CursorRowDeleted;
+
+/// The review tab's line cursor: Zed's caret and selections are hidden, and the rows of the
+/// newest selection get a full-width highlight instead, mirrored on the other side of a split
+/// diff. Vim keeps driving the (invisible) selections.
+pub(crate) struct LineCursor {
+    editor: Entity<SplittableEditor>,
+    lhs_editor_id: Option<EntityId>,
+    focused_lhs: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl LineCursor {
+    pub(crate) fn new(editor: Entity<SplittableEditor>, cx: &mut Context<Self>) -> Self {
+        let subscriptions = vec![
+            cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| match event {
+                EditorEvent::SelectionsChanged { .. }
+                | EditorEvent::BufferRangesUpdated { .. }
+                | EditorEvent::BuffersRemoved { .. }
+                | EditorEvent::BuffersEdited { .. }
+                | EditorEvent::BufferFoldToggled { .. }
+                | EditorEvent::BufferEdited => this.refresh(cx),
+                _ => {}
+            }),
+            cx.observe(&editor, |this, _, cx| this.sync_split_state(cx)),
+        ];
+        let rhs_editor = editor.read(cx).rhs_editor().clone();
+        configure(&rhs_editor, cx);
+        let mut this = Self {
+            editor,
+            lhs_editor_id: None,
+            focused_lhs: false,
+            _subscriptions: subscriptions,
+        };
+        this.sync_split_state(cx);
+        this.refresh(cx);
+        this
+    }
+
+    /// The left side is recreated on every split (including automatic ones when the pane gets
+    /// wide enough), and the highlight moves with focus between the sides.
+    fn sync_split_state(&mut self, cx: &mut Context<Self>) {
+        let splittable = self.editor.read(cx);
+        let lhs_editor = splittable.lhs_editor().cloned();
+        let lhs_editor_id = lhs_editor.as_ref().map(|editor| editor.entity_id());
+        let focused_lhs = lhs_editor
+            .as_ref()
+            .is_some_and(|editor| splittable.focused_editor() == editor);
+
+        let mut changed = false;
+        if lhs_editor_id != self.lhs_editor_id {
+            self.lhs_editor_id = lhs_editor_id;
+            if let Some(lhs_editor) = &lhs_editor {
+                configure(lhs_editor, cx);
+            }
+            changed = true;
+        }
+        if focused_lhs != self.focused_lhs {
+            self.focused_lhs = focused_lhs;
+            changed = true;
+        }
+        if changed {
+            self.refresh(cx);
+        }
+    }
+
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        let splittable = self.editor.read(cx);
+        let focused = splittable.focused_editor().clone();
+        let companion = if splittable.is_split() {
+            if &focused == splittable.rhs_editor() {
+                splittable.lhs_editor().cloned()
+            } else {
+                Some(splittable.rhs_editor().clone())
+            }
+        } else {
+            None
+        };
+
+        let display_rows = focused.update(cx, |editor, cx| {
+            // A rename editor turns local selections back on.
+            editor.show_local_selections = false;
+            let snapshot = editor.display_snapshot(cx);
+            let rows = selected_rows(editor, &snapshot);
+            paint_rows(editor, snapshot.buffer_snapshot(), rows.clone(), cx);
+            let buffer = snapshot.buffer_snapshot();
+            let end_row = *rows.end();
+            let start = snapshot.point_to_display_point(Point::new(*rows.start(), 0), Bias::Left);
+            let end = snapshot.point_to_display_point(
+                Point::new(end_row, buffer.line_len(MultiBufferRow(end_row))),
+                Bias::Left,
+            );
+            start.row()..=end.row()
+        });
+
+        // The sides of a split diff have aligned display rows (spacers balance them), so the
+        // companion's rows are the real rows within the focused side's display rows. A row
+        // facing a spacer has nothing to mirror.
+        if let Some(companion) = companion {
+            companion.update(cx, |editor, cx| {
+                editor.show_local_selections = false;
+                let snapshot = editor.display_snapshot(cx);
+                match companion_rows(&snapshot, display_rows) {
+                    Some(rows) => paint_rows(editor, snapshot.buffer_snapshot(), rows, cx),
+                    None => {
+                        clear_rows(editor);
+                        cx.notify();
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn configure(editor: &Entity<Editor>, cx: &mut App) {
+    editor.update(cx, |editor, cx| {
+        editor.show_local_selections = false;
+        editor.set_forbid_horizontal_autoscroll(true);
+        cx.notify();
+    });
+}
+
+/// The multibuffer rows spanned by the newest selection (whole lines in line-wise visual mode).
+fn selected_rows(editor: &Editor, snapshot: &DisplaySnapshot) -> RangeInclusive<u32> {
+    let selection = editor.selections.newest_adjusted(snapshot);
+    let start = selection.start.row;
+    let mut end = selection.end.row;
+    if end > start && selection.end.column == 0 {
+        end -= 1;
+    }
+    start..=end
+}
+
+fn companion_rows(
+    snapshot: &DisplaySnapshot,
+    display_rows: RangeInclusive<DisplayRow>,
+) -> Option<RangeInclusive<u32>> {
+    let max_row = snapshot.max_point().row();
+    let mut real_rows = (display_rows.start().0..=display_rows.end().0)
+        .map(DisplayRow)
+        .filter(|row| *row <= max_row && !snapshot.is_block_line(*row));
+    let first = real_rows.next()?;
+    let last = real_rows.last().unwrap_or(first);
+    let start = snapshot.display_point_to_point(DisplayPoint::new(first, 0), Bias::Left);
+    let end = snapshot.display_point_to_point(DisplayPoint::new(last, 0), Bias::Left);
+    Some(start.row..=end.row)
+}
+
+fn clear_rows(editor: &mut Editor) {
+    editor.clear_row_highlights::<CursorRowContext>();
+    editor.clear_row_highlights::<CursorRowAdded>();
+    editor.clear_row_highlights::<CursorRowDeleted>();
+}
+
+/// Row highlights replace the diff background of their rows, so added and deleted rows get
+/// their own cursor colors that keep the diff color visible underneath.
+fn paint_rows(
+    editor: &mut Editor,
+    buffer: &MultiBufferSnapshot,
+    rows: RangeInclusive<u32>,
+    cx: &mut Context<Editor>,
+) {
+    clear_rows(editor);
+    let max_row = buffer.max_row().0;
+    let start_row = (*rows.start()).min(max_row);
+    let end_row = (*rows.end()).min(max_row);
+
+    let mut run: Option<(u32, Option<DiffHunkStatusKind>)> = None;
+    let mut last_row = start_row;
+    for (row, row_info) in (start_row..=end_row).zip(buffer.row_infos(MultiBufferRow(start_row))) {
+        let kind = row_info.diff_status.map(|status| status.kind);
+        match run {
+            Some((_, run_kind)) if run_kind == kind => {}
+            Some((run_start, run_kind)) => {
+                highlight_run(editor, buffer, run_start..=row - 1, run_kind, cx);
+                run = Some((row, kind));
+            }
+            None => run = Some((row, kind)),
+        }
+        last_row = row;
+    }
+    if let Some((run_start, run_kind)) = run {
+        highlight_run(editor, buffer, run_start..=last_row, run_kind, cx);
+    }
+    cx.notify();
+}
+
+fn highlight_run(
+    editor: &mut Editor,
+    buffer: &MultiBufferSnapshot,
+    rows: RangeInclusive<u32>,
+    kind: Option<DiffHunkStatusKind>,
+    cx: &mut Context<Editor>,
+) {
+    let start = buffer.anchor_before(Point::new(*rows.start(), 0));
+    let end_row = *rows.end();
+    let end_line_len = buffer.line_len(MultiBufferRow(end_row));
+    // A highlight ending at column 0 excludes that row, so an empty last row needs to reach
+    // into the next row (or the end of the buffer).
+    let end = if end_line_len > 0 {
+        buffer.anchor_before(Point::new(end_row, end_line_len))
+    } else if end_row < buffer.max_row().0 {
+        buffer.anchor_before(Point::new(end_row + 1, 0))
+    } else {
+        Anchor::Max
+    };
+    let options = RowHighlightOptions {
+        autoscroll: false,
+        include_gutter: true,
+    };
+    match kind {
+        Some(DiffHunkStatusKind::Added) => {
+            editor.highlight_rows::<CursorRowAdded>(start..end, added_row_color, options, cx)
+        }
+        Some(DiffHunkStatusKind::Deleted) => {
+            editor.highlight_rows::<CursorRowDeleted>(start..end, deleted_row_color, options, cx)
+        }
+        Some(DiffHunkStatusKind::Modified) | None => {
+            editor.highlight_rows::<CursorRowContext>(start..end, context_row_color, options, cx)
+        }
+    }
+}
+
+fn cursor_overlay(cx: &App) -> Hsla {
+    cx.theme().players().local().selection
+}
+
+fn context_row_color(cx: &App) -> Hsla {
+    cx.theme()
+        .colors()
+        .editor_background
+        .blend(cursor_overlay(cx))
+}
+
+fn added_row_color(cx: &App) -> Hsla {
+    let colors = cx.theme().colors();
+    colors
+        .editor_background
+        .blend(colors.editor_diff_hunk_added_background)
+        .blend(cursor_overlay(cx))
+}
+
+fn deleted_row_color(cx: &App) -> Hsla {
+    let colors = cx.theme().colors();
+    colors
+        .editor_background
+        .blend(colors.editor_diff_hunk_deleted_background)
+        .blend(cursor_overlay(cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ReviewView, test_support::open_review_fixture};
+    use editor::{SelectionEffects, ToPoint as _, ToggleSplitDiff};
+    use gpui::{Focusable as _, TestAppContext, VisualTestContext};
+    use settings::DiffViewStyle;
+    use std::ops::Range;
+
+    fn init(cx: &mut TestAppContext, diff_view_style: DiffViewStyle) {
+        crate::test_support::init_vim_test(cx, diff_view_style);
+    }
+
+    fn splittable(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<SplittableEditor> {
+        review.read_with(cx, |review, cx| review.diff().read(cx).editor().clone())
+    }
+
+    fn rhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
+        splittable(review, cx).read_with(cx, |editor, _| editor.rhs_editor().clone())
+    }
+
+    fn lhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
+        splittable(review, cx).read_with(cx, |editor, _| editor.lhs_editor().unwrap().clone())
+    }
+
+    /// The highlighted cursor rows of `editor`, with the kind of row they were painted as.
+    fn cursor_rows(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Vec<(u32, &'static str)> {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let mut rows = Vec::new();
+            let highlights: [(&'static str, Vec<Range<Anchor>>); 3] = [
+                (
+                    "context",
+                    editor
+                        .highlighted_rows::<CursorRowContext>(cx)
+                        .map(|(range, _)| range)
+                        .collect(),
+                ),
+                (
+                    "added",
+                    editor
+                        .highlighted_rows::<CursorRowAdded>(cx)
+                        .map(|(range, _)| range)
+                        .collect(),
+                ),
+                (
+                    "deleted",
+                    editor
+                        .highlighted_rows::<CursorRowDeleted>(cx)
+                        .map(|(range, _)| range)
+                        .collect(),
+                ),
+            ];
+            for (kind, ranges) in highlights {
+                for range in ranges {
+                    let start = range.start.to_point(&snapshot).row;
+                    let end = range.end.to_point(&snapshot);
+                    let end_row = if !range.end.is_max() && end.column == 0 && end.row > start {
+                        end.row - 1
+                    } else {
+                        end.row
+                    };
+                    rows.extend((start..=end_row).map(|row| (row, kind)));
+                }
+            }
+            rows.sort();
+            rows
+        })
+    }
+
+    fn cursor_point(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Point {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).head()
+        })
+    }
+
+    fn row_text(editor: &Entity<Editor>, row: u32, cx: &mut VisualTestContext) -> String {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+            snapshot.text_for_range(Point::new(row, 0)..end).collect()
+        })
+    }
+
+    fn move_to_row_with_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestContext) -> u32 {
+        let row = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            (0..=snapshot.max_row().0)
+                .find(|row| {
+                    let end = Point::new(*row, snapshot.line_len(MultiBufferRow(*row)));
+                    snapshot
+                        .text_for_range(Point::new(*row, 0)..end)
+                        .collect::<String>()
+                        == text
+                })
+                .unwrap()
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)])
+            });
+        });
+        cx.run_until_parked();
+        row
+    }
+
+    #[gpui::test]
+    async fn test_line_cursor_highlights_row_without_caret(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let editor = rhs_editor(&review, cx);
+
+        editor.read_with(cx, |editor, _| assert!(!editor.show_local_selections));
+        assert_eq!(cursor_point(&editor, cx), Point::new(0, 0));
+        assert_eq!(cursor_rows(&editor, cx), [(0, "context")]);
+
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor_rows(&editor, cx), [(1, "deleted")]);
+        assert_eq!(row_text(&editor, 1, cx), "line 2");
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor_rows(&editor, cx), [(2, "added")]);
+        assert_eq!(row_text(&editor, 2, cx), "LINE 2");
+        cx.simulate_keystrokes("k k");
+        assert_eq!(cursor_rows(&editor, cx), [(0, "context")]);
+    }
+
+    #[gpui::test]
+    async fn test_character_motions_do_nothing(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let editor = rhs_editor(&review, cx);
+
+        let row = move_to_row_with_text(&editor, "line 4", cx);
+        for keystrokes in [
+            "w", "b", "e", "shift-w", "$", "^", "space", "backspace", "(", ")", "%", "f", "t",
+            "; ,", "h", "l", "left", "right", "end",
+        ] {
+            cx.simulate_keystrokes(keystrokes);
+            assert_eq!(
+                cursor_point(&editor, cx),
+                Point::new(row, 0),
+                "after {keystrokes:?}"
+            );
+            assert_eq!(cursor_rows(&editor, cx), [(row, "context")]);
+        }
+
+        // Editing keys are stopped by the read-only diff (they may still move the cursor).
+        let text = editor.read_with(cx, |editor, cx| editor.text(cx));
+        for keystrokes in [
+            "x", "shift-x", "p", "shift-p", "u", "d d", "shift-d", "shift-j", "~", "> >", "< <",
+        ] {
+            cx.simulate_keystrokes(keystrokes);
+            editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), text));
+        }
+        move_to_row_with_text(&editor, "line 4", cx);
+
+        // Counts (including a 0 digit) and `0` still work.
+        cx.simulate_keystrokes("1 0 j");
+        assert_eq!(cursor_point(&editor, cx).row, row + 10);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(row, 3)..Point::new(row, 3)])
+            });
+        });
+        cx.simulate_keystrokes("0");
+        assert_eq!(cursor_point(&editor, cx), Point::new(row, 0));
+    }
+
+    #[gpui::test]
+    async fn test_insert_keys_are_noops(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let editor = rhs_editor(&review, cx);
+        let text = editor.read_with(cx, |editor, cx| editor.text(cx));
+
+        for keystrokes in [
+            "i", "a", "shift-i", "shift-a", "o", "shift-o", "s", "shift-s", "c c", "shift-c",
+            "r x", "shift-r", "g i", "insert",
+        ] {
+            let row = cursor_point(&editor, cx).row;
+            cx.simulate_keystrokes(keystrokes);
+            // Still in normal mode: `j` moves the cursor instead of typing.
+            cx.simulate_keystrokes("j");
+            assert_eq!(cursor_point(&editor, cx).row, row + 1, "after {keystrokes:?}");
+        }
+        editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), text));
+    }
+
+    #[gpui::test]
+    async fn test_visual_mode_is_line_wise(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let editor = rhs_editor(&review, cx);
+
+        for start_visual in ["v", "shift-v", "ctrl-v"] {
+            cx.simulate_keystrokes(start_visual);
+            cx.simulate_keystrokes("j j");
+            editor.read_with(cx, |editor, _| assert!(editor.selections.line_mode()));
+            assert_eq!(
+                cursor_rows(&editor, cx),
+                [(0, "context"), (1, "deleted"), (2, "added")],
+                "after {start_visual:?}"
+            );
+
+            cx.simulate_keystrokes("escape");
+            assert_eq!(cursor_rows(&editor, cx), [(2, "added")]);
+            cx.simulate_keystrokes("k k");
+        }
+
+        cx.simulate_keystrokes("v j v");
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert!(!editor.selections.line_mode());
+            assert!(editor.selections.newest::<Point>(&snapshot).is_empty());
+        });
+        assert_eq!(cursor_rows(&editor, cx), [(1, "deleted")]);
+    }
+
+    #[gpui::test]
+    async fn test_split_mirrors_cursor_row(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Split);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let splittable = splittable(&review, cx);
+        assert!(splittable.read_with(cx, |editor, _| editor.is_split()));
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+        lhs.read_with(cx, |editor, _| assert!(!editor.show_local_selections));
+
+        // A modified row faces its old version.
+        let rhs_row = move_to_row_with_text(&rhs, "LINE 2", cx);
+        assert_eq!(cursor_rows(&rhs, cx), [(rhs_row, "added")]);
+        let lhs_rows = cursor_rows(&lhs, cx);
+        assert_eq!(lhs_rows.len(), 1);
+        assert_eq!(row_text(&lhs, lhs_rows[0].0, cx), "line 2");
+        assert_eq!(lhs_rows[0].1, "deleted");
+
+        // A pure addition faces a spacer.
+        let rhs_row = move_to_row_with_text(&rhs, "four", cx);
+        assert_eq!(cursor_rows(&rhs, cx), [(rhs_row, "added")]);
+        assert_eq!(cursor_rows(&lhs, cx), []);
+
+        // Moving to the left side moves the highlight with it.
+        move_to_row_with_text(&rhs, "two", cx);
+        cx.simulate_keystrokes("ctrl-w h");
+        assert!(splittable.read_with(cx, |editor, _| editor.focused_editor() == &lhs));
+        let lhs_rows = cursor_rows(&lhs, cx);
+        assert_eq!(lhs_rows.len(), 1);
+        assert_eq!(row_text(&lhs, lhs_rows[0].0, cx), "two");
+        cx.simulate_keystrokes("k");
+        let lhs_rows = cursor_rows(&lhs, cx);
+        assert_eq!(row_text(&lhs, lhs_rows[0].0, cx), "one");
+        assert_eq!(lhs_rows[0].1, "deleted");
+        let rhs_rows = cursor_rows(&rhs, cx);
+        assert_eq!(rhs_rows.len(), 1);
+        assert_eq!(row_text(&rhs, rhs_rows[0].0, cx), "ONE");
+
+        // The left side is recreated when the diff is split again.
+        cx.simulate_keystrokes("ctrl-w l");
+        let rhs_row = move_to_row_with_text(&rhs, "three", cx);
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let focus_handle = rhs.focus_handle(cx);
+                focus_handle.dispatch_action(&ToggleSplitDiff, window, cx);
+            });
+            cx.run_until_parked();
+        }
+        let new_lhs = lhs_editor(&review, cx);
+        assert_ne!(new_lhs, lhs);
+        new_lhs.read_with(cx, |editor, _| assert!(!editor.show_local_selections));
+        assert_eq!(cursor_rows(&rhs, cx), [(rhs_row, "context")]);
+        let lhs_rows = cursor_rows(&new_lhs, cx);
+        assert_eq!(lhs_rows.len(), 1);
+        assert_eq!(row_text(&new_lhs, lhs_rows[0].0, cx), "three");
+    }
+}
