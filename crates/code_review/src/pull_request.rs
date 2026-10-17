@@ -2369,6 +2369,11 @@ pub(crate) mod tests {
                 .unwrap();
             };
             set_head(C1);
+            fs.insert_file(
+                path!("/project/.git/HEAD"),
+                b"ref: refs/heads/main\n".to_vec(),
+            )
+            .await;
             cx.run_until_parked();
             let mut app_state = cx.update(|_, cx| workspace::AppState::test(cx));
             Arc::get_mut(&mut app_state).unwrap().fs = fs.clone();

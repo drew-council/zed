@@ -355,8 +355,13 @@ async fn repository_root(fs: &dyn Fs, path: &Path) -> Result<PathBuf> {
     }
     let directory = fs.canonicalize(path).await?;
     for ancestor in directory.ancestors() {
-        // A linked worktree's `.git` is a file.
-        if fs.metadata(&ancestor.join(".git")).await?.is_some() {
+        let dot_git = ancestor.join(".git");
+        let Some(metadata) = fs.metadata(&dot_git).await? else {
+            continue;
+        };
+        // A linked worktree's `.git` is a file. A `.git` directory without a HEAD isn't a
+        // repository for git either (an empty `/tmp/.git` happens).
+        if !metadata.is_dir || fs.metadata(&dot_git.join("HEAD")).await?.is_some() {
             return Ok(ancestor.to_path_buf());
         }
     }
@@ -592,7 +597,7 @@ pub(crate) mod tests {
         let fs = app_state.fs.as_fake();
         fs.insert_tree(
             path!("/project"),
-            json!({ ".git": {}, "src": { "a.rs": "one\nTWO\n" } }),
+            json!({ ".git": { "HEAD": "ref: refs/heads/main\n" }, "src": { "a.rs": "one\nTWO\n" } }),
         )
         .await;
         fs.set_head_and_index_for_repo(dot_git(), &[("src/a.rs", "one\ntwo\n".into())]);
@@ -775,9 +780,10 @@ pub(crate) mod tests {
             path!("/root"),
             json!({
                 "project": {
-                    ".git": {},
+                    ".git": { "HEAD": "ref: refs/heads/main\n" },
                     "src": { "a.rs": "" },
-                    "nested": { ".git": {}, "deep": {} },
+                    "nested": { ".git": { "HEAD": "ref: refs/heads/main\n" }, "deep": {} },
+                    "not_a_repository": { ".git": {}, "x": {} },
                 },
                 "linked": { ".git": "gitdir: /root/project/.git/worktrees/linked", "x": {} },
                 "plain": { "x": {} },
@@ -804,6 +810,10 @@ pub(crate) mod tests {
         assert_eq!(
             root(path!("/root/project/nested/deep")).await,
             Ok(PathBuf::from(path!("/root/project/nested")))
+        );
+        assert_eq!(
+            root(path!("/root/project/not_a_repository/x")).await,
+            Ok(PathBuf::from(path!("/root/project")))
         );
         assert_eq!(
             root(path!("/root/linked/x")).await,
@@ -833,11 +843,12 @@ pub(crate) mod tests {
     async fn test_find_review_workspace(cx: &mut TestAppContext) {
         let app_state = app_with_repository(cx).await;
         let fs = app_state.fs.as_fake();
-        fs.insert_tree(path!("/other"), json!({ ".git": {}, "b.rs": "" }))
+        let dot_git = || json!({ "HEAD": "ref: refs/heads/main\n" });
+        fs.insert_tree(path!("/other"), json!({ ".git": dot_git(), "b.rs": "" }))
             .await;
         fs.insert_tree(
             path!("/outer"),
-            json!({ ".git": {}, "inner": { ".git": {}, "c.rs": "" } }),
+            json!({ ".git": dot_git(), "inner": { ".git": dot_git(), "c.rs": "" } }),
         )
         .await;
         let find = |root: &str, cx: &mut TestAppContext| {
