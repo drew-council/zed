@@ -1,4 +1,4 @@
-use crate::{ReviewView, ToggleFileReviewed, ToggleHunkReviewed};
+use crate::{AddFileComment, ReviewView, ToggleFileReviewed, ToggleHunkReviewed};
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use editor::{Anchor, DiffHunkRenderer, Editor, MultiBufferSnapshot, RowHighlightOptions};
 use gpui::{Entity, Focusable as _, Hsla, MouseButton, WeakEntity};
@@ -11,8 +11,8 @@ use util::ResultExt as _;
 struct ReviewedHunkAdded;
 struct ReviewedHunkDeleted;
 
-/// The reviewed checkbox in a file header (also on folded headers, so reviewed files can be
-/// unmarked from there).
+/// A file header's controls (also on folded headers, so reviewed files can be unmarked from
+/// there): a button to comment on the file and the reviewed checkbox.
 pub(crate) fn render_file_checkbox(
     view: &Entity<ReviewView>,
     buffer_id: BufferId,
@@ -21,9 +21,35 @@ pub(crate) fn render_file_checkbox(
     let review = view.read(cx);
     let repo_path = review.diff().read(cx).repo_path_for_buffer(buffer_id, cx)?;
     let reviewed = review.session().read(cx).is_file_reviewed(&repo_path);
-    let checkbox = Checkbox::new(("review-file", buffer_id.to_proto()), reviewed.into())
+    let id = buffer_id.to_proto();
+    let comment_button = Button::new(("review-file-comment", id), "Comment")
+        .label_size(LabelSize::Small)
+        .start_icon(
+            Icon::new(IconName::Chat)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .tooltip(Tooltip::for_action_title(
+            "Comment on File",
+            &AddFileComment,
+        ))
+        .on_click({
+            let comments = review.comments().downgrade();
+            let repo_path = repo_path.clone();
+            move |_, window, cx| {
+                cx.stop_propagation();
+                comments
+                    .update(cx, |comments, cx| {
+                        comments.add_file_comment_for(repo_path.clone(), window, cx)
+                    })
+                    .log_err();
+            }
+        });
+    let checkbox = Checkbox::new(("review-file", id), reviewed.into())
         .fill()
         .elevation(ElevationIndex::Surface)
+        .label("Reviewed")
+        .label_size(LabelSize::Small)
         .tooltip(Tooltip::for_action_title(
             if reviewed {
                 "Mark as Not Reviewed"
@@ -34,15 +60,23 @@ pub(crate) fn render_file_checkbox(
         ))
         .on_click({
             let view = view.downgrade();
+            let repo_path = repo_path.clone();
             move |_, _, cx| {
                 view.update(cx, |view, cx| view.toggle_file(&repo_path, cx))
                     .log_err();
                 cx.stop_propagation();
             }
         });
+    let path = repo_path.as_unix_str().to_string();
     Some(
         h_flex()
             .id("review-file-checkbox")
+            .gap_2()
+            .child(
+                div()
+                    .debug_selector(move || format!("review-file-comment-{path}"))
+                    .child(comment_button),
+            )
             .child(checkbox)
             // Keeps the header's own click handling (folding, opening the file) out of it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

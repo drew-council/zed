@@ -1183,6 +1183,18 @@ impl CommentBlocks {
         self.add_file_comment_on(path, editor, window, cx);
     }
 
+    /// A file header's comment button: comments on that file, wherever the cursor is.
+    pub(crate) fn add_file_comment_for(
+        &mut self,
+        path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.focused_diff_editor(cx);
+        collapse_selection(&editor, window, cx);
+        self.add_file_comment_on(path, editor, window, cx);
+    }
+
     fn add_file_comment_on(
         &mut self,
         path: RepoPath,
@@ -5054,5 +5066,54 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         assert!(comments(&review, cx).is_empty());
         assert!(open_editor(&review, cx).is_none());
         assert_back_in_diff(&rhs, cx);
+    }
+
+    async fn check_file_comment_button(diff_view_style: DiffViewStyle, cx: &mut TestAppContext) {
+        init(cx, diff_view_style);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+
+        // Wherever the cursor is.
+        move_to_row_with_text(&rhs, "new 1", cx);
+        click_drawn("review-file-comment-a.rs", cx);
+        let editor = open_editor(&review, cx).expect("a comment editor opens");
+        assert_eq!(vim_mode(&editor, cx).as_deref(), Some("insert"));
+        cx.simulate_input("whole file");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(
+            comments(&review, cx),
+            [(
+                CommentTarget::File {
+                    path: RepoPath::new("a.rs").unwrap()
+                },
+                "whole file".to_string(),
+                None
+            )]
+        );
+
+        // A reviewed file's folded header has the button too; the file unfolds for the comment.
+        move_to_row_with_text(&rhs, "line 1", cx);
+        cx.simulate_keystrokes("r");
+        cx.run_until_parked();
+        assert!(is_folded(&review, "a.rs", cx));
+        rhs.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(gpui::point(0., 0.), window, cx)
+        });
+        click_drawn("review-file-comment-a.rs", cx);
+        assert!(!is_folded(&review, "a.rs", cx));
+        cx.simulate_input("again");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!(bodies(&review, cx), ["whole file", "again"]);
+    }
+
+    #[gpui::test]
+    async fn test_file_comment_button(cx: &mut TestAppContext) {
+        check_file_comment_button(DiffViewStyle::Unified, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_file_comment_button_in_split_view(cx: &mut TestAppContext) {
+        check_file_comment_button(DiffViewStyle::Split, cx).await;
     }
 }
