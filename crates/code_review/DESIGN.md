@@ -15,15 +15,18 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: milestone 3 (review targets) done.** The long-lived fork branch `code-review`
+**Status: milestone 4 (panel, reviewed marks, filters) done.** The long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
 (changeable in place), and one commit or a contiguous range (live when it ends at HEAD, a read-only
 historic snapshot otherwise), opened from the `code_review::StartReview` picker or the direct actions
 `ReviewUncommitted` / `ReviewBranch { base }` / `ReviewCommits { commits }`. Each tab has a
-tuicr-style line cursor and file navigation (§2.5 minus comments/reviewed marks/export) and a fixed top
-block (branch base, or the commit messages). The review panel in the left dock only shows the active
-review's title so far. Next: milestone 4 (§6).
+tuicr-style line cursor and file navigation, a fixed top block (branch base, or the commit messages),
+per-file and per-hunk reviewed marks persisted in Zed's DB (reviewed files fold to their header,
+reviewed hunks are dimmed, marks clear when the diff content changes), and per-tab filters (include /
+exclude regexes, hide reviewed, generated/vendored files from `.gitattributes` hidden by default). The
+review panel shows the active review's file tree with progress, filters, path search and a context
+menu. Next: milestone 5 (comments, §6).
 
 What exists:
 
@@ -34,13 +37,17 @@ What exists:
 | `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
 | `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base }, Commits(CommitRange)}`, `is_same_review`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI) |
 | `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `validate_ref`) |
-| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode |
+| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
+| `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks of one review, shared by its tabs through the `ReviewSessions` global, loaded from/saved to the DB), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
+| `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (`code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`), queued writes |
+| `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
+| `crates/code_review/src/reviewed.rs` | Header checkbox, `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
 | `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, or the commit messages (collapsible); commit tab titles |
 | `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select); `CommitSelection` |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll |
-| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`, GPUI tests |
-| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab and shows its title; `FocusPanel` / `TogglePanel` / `ToggleFocus` |
-| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: only `tab` → `picker::MultiSelectNext` in the Start Review picker; the rest is in the command palette) |
+| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the single-file bar, the panel's read API (`panel_files`, `summary`); GPUI tests |
+| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu, empty states; workspace-level filter/copy actions; GPUI tests |
+| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` in the Start Review picker and the review panel's keys; the review tab's keys are vim-only) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
 | `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks |
@@ -53,8 +60,9 @@ Upstream glue so far (all append-style, §3.10): root `Cargo.toml` (member + wor
 `crates/zed/src/zed.rs` (`ReviewPanel::load` in `initialize_panels`; `code_review::key_bindings`
 after the base keymap and `code_review::vim_key_bindings` right after `vim.json` in
 `load_default_keymap`; `"code_review"` in `test_action_namespaces`). Core patches #1 and #2 are
-applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10). M3 added no
-upstream glue.
+applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10). M3 and M4 added
+no upstream glue (M4: new deps `db`, `file_icons`, `fs`, `ignore`, `regex`, `smallvec`, all already in
+`zed`'s graph; dev-deps `db` and `buffer_diff` with `test-support`).
 
 **Implementation decisions (milestone 1)** — implementation details, not user questions:
 
@@ -198,6 +206,90 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   The fake `diff_tree` ignores refs and lists files by comparing merge-base blobs with HEAD's
   contents, so tests can't check which base/head reach git — the live check covers that.
 
+**Implementation decisions (milestone 4)** — the M4 plan's D1–D11 unless noted:
+
+- **Persistence** (D1): own domain `CodeReviewDb` (`db::static_connection!(CodeReviewDb, [])`, no
+  `WorkspaceDb` dependency: state is keyed by review, not workspace). Schema in §3.8. Every query goes
+  through `ThreadSafeConnection::write`'s queue at call time (its future borrows the connection, so
+  results come back through a oneshot), so toggles land in order and loads see earlier writes. No
+  pruning yet. **M5 appends** a migration (never edit the first) for drafts, e.g.
+  `code_review_comments(review_key TEXT NOT NULL REFERENCES code_review_sessions(review_key) ON DELETE
+  CASCADE ON UPDATE CASCADE, comment_id INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(review_key,
+  comment_id)) STRICT` (`ON UPDATE CASCADE` lets a re-key move a review's rows). Tests set
+  `db::AppDatabase::test_new()` in `init_test`.
+- **`ReviewKey`** (D4, `ReviewTarget::review_key(&RepositorySnapshot)`): `uncommitted:{work_dir}`,
+  `branch:{base}:{branch}:{common_dir}` ("HEAD" when detached), `commits:{base}..{head}:{common_dir}`
+  (empty base for a root commit); M7 adds `pr:{host}/{owner}/{name}#{n}`. Change Base and a branch
+  switch change a branch review's key: the tab switches to that key's session (marks stay with their
+  key; switching back restores them).
+- **Sessions** (D5): `ReviewSession::for_key` shares one entity per key through the `ReviewSessions`
+  global (weak entries), so split tabs share marks; filters, the hidden set and single-file mode are per
+  tab and not persisted. Marks can't change until the stored ones have loaded.
+- **Hashes/invalidation** (D3): FNV-1a 64; hunk key `hunk-content-v1:{hash}` (span-qualified
+  `hunk-span-v1:…:{old_start}:{old_count}:{new_start}:{new_count}` when a file repeats a hunk); file
+  hash over the hunk hashes. Digests are taken in `sync_excerpts` only while the buffer has no unsaved
+  edits. Deviation: only files that still have hunks are reconciled, so a file whose changes vanish
+  (e.g. committed) keeps its mark and stays reviewed if it comes back unchanged.
+- **Folding** (D7): fold when a file becomes reviewed or its excerpts reappear; unfold when unreviewed
+  or invalidated; single-file mode shows its file unfolded and leaving re-folds. A session load or
+  switch syncs every shown file (also unfolding unreviewed ones). Folding the RHS folds the LHS.
+- **`r`** (D6): marks and moves to the next file (no wrap; the last file keeps the cursor on its folded
+  header), or unmarks and lands on the file's first row; with hide-reviewed on, the file disappears and
+  the cursor moves to the next shown file, wrapping. Panel `r` and the header checkbox toggle without
+  moving. **`R`** toggles the hunk at the cursor (both views; split RHS rows of a pure deletion can't,
+  use the LHS); a context row or a folded file shows a toast.
+- **Dimmed hunks** (D2): row highlights (`include_gutter: false`) in faint versions of the diff colors
+  (diff background at 40% opacity over the editor background), painted per row kind so deleted/added
+  stay distinguishable; the gutter bars keep the kind. Repainted on mark/digest/excerpt/fold changes
+  and LHS re-creation, always followed by `LineCursor::refresh` (newest highlight wins). The hunk
+  control (`ReviewHunkRenderer`, replaces `HiddenUnstagedDiffHunkRenderer`) reads "Mark Reviewed" or
+  "✓ Reviewed" with the `R` binding.
+- **`]c`/`[c`** (D8) → `code_review::NextHunk`/`PreviousHunk`: Zed's wrap-around, centered `GoToHunk`
+  minus hunks of folded buffers (checked on the focused side); `[c` inside a hunk goes to its start.
+- **Folded headers vs vim**: a cursor on a folded header resolves (`newest()`, "wrapping blocks") to
+  the whole folded file, so vim entered Visual whenever the diff regained focus there (`r` then did
+  nothing). `ReviewView` dispatches `vim::SwitchToNormalMode` on `EditorEvent::Focused` when the
+  cursor is a single anchor but resolves non-empty. `has_visual_selection` compares anchors (+ line
+  mode). Vim's status still shows "N lines, M characters" there (cosmetic).
+- **Filters** (D11): include then exclude, case-insensitive regexes over the repo path; prompts
+  prefilled, empty clears, invalid keeps the prompt with the error. Hidden files lose their excerpts
+  (`ReviewDiff::set_hidden`; computed from the source's file list before buffers load, so filtered files
+  don't flash) and leave the panel, `]f`, `]u` and `]c`. "Clear Filters" clears include, exclude and
+  hide-reviewed (not the generated/vendored defaults). Diff placeholder when everything is hidden: "All
+  files reviewed" / "All N changed files are hidden" + a hint.
+- **`.gitattributes`** (D9): tuicr's rules; read through the project `Fs` on every file-list refresh.
+  Deviation: always from the working tree (also for historic snapshots). Generated/vendored files may
+  show until the attributes load (milliseconds). Toggles `ToggleShowGenerated`/`ToggleShowVendored`.
+- **Panel** (D10): tree order = review order (directories first, single-child chains compacted);
+  directories default open, collapse state per tab; status letters `U`/`A`/`D`/`M` (deleted struck
+  through); ✓ column; "(generated)"/"(vendored)" suffix when shown. Header: title, "reviewed/total"
+  (files passing patterns and attribute defaults, ignoring hide-reviewed), a status line ("include … ·
+  N filtered out · N generated hidden · N vendored hidden · N reviewed hidden · single file") and a
+  ⋯ menu. Keys: `j k h l Enter Space r i e I E / n N gg G` (+ arrows, Escape = focus the diff); `j`/`k`
+  only move the selection except in single-file mode; `l` on a file shows it and keeps focus, Enter
+  focuses the diff; a click selects and shows; the selection follows the diff cursor while the panel
+  isn't focused (a file in a collapsed directory selects the directory). Path search: case-insensitive
+  substring, next match after the selection, expands parents, `n`/`N` wrap. `space` is also bound in
+  the vim keymap: vim's `space f`/`space w …` (context `!Editor && !Terminal`, loaded later) would keep
+  it pending. Filter/search/toggle/copy actions are workspace actions (palette works anywhere; they
+  act on the active review tab, else the panel's).
+- **Context menu** (right-click a row or the panel, or ⋯): Mark as (Not) Reviewed, Open File, Copy
+  Relative Path (file rows), Hide Reviewed / Show Generated / Show Vendored toggles, Include/Exclude
+  Filter…, Search Paths…, Clear Filters, Copy Branch Name (`CopyBranchName`; disabled/toast when HEAD
+  is detached). M7 adds "Copy Pull Request URL" next to it.
+- **Single-file indicator**: a bar under the top block ("Single file · i of N  path   Show All Files
+  ;f") plus "single file" in the panel's status line.
+- Tests: `test_support::path_at_cursor` returns repo paths; `init_vim_test` also binds
+  `code_review.json`; `open_tree_fixture` (nested dirs, `.gitattributes`, two-hunk file). 46 tests,
+  stable under `ITERATIONS=10`.
+- **M4 live check** (harness, scratch repo with nested dirs, `.gitattributes`, multi-hunk files, a
+  feature branch with commits): panel tree/letters/progress/status, `r` fold+advance, `R` dimming in
+  split and unified, `]c`/`[c`/`]u` skipping folded files, panel keys, include/exclude/invalid regex,
+  ⋯ menu toggles, Copy Branch Name / Copy Relative Path (clipboard), single-file bar, split toggles
+  keeping folds and dimming, marks restored after a restart (uncommitted, branch, commit snapshot),
+  a reviewed file's mark clearing after a shell edit while an unchanged hunk keeps its mark. Found and
+  fixed there: the folded-header Visual-mode bug above.
+
 **Known issues / notes for the next slices:**
 
 - Saving: for an active item whose `capability` isn't editable, the workspace doesn't register
@@ -216,13 +308,19 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
 - Upstream quirks seen live: vim relative line numbers apply to the focused side only and count across
   file sections; on the LHS the current line shows 0 instead of its number; after toggling soft wrap in
   split view the LHS is mis-laid-out until the next frame.
-- `]c` (`GoToHunk`) unfolds ranges — will fight M4's reviewed-file folding.
+- M4 cosmetics: the line cursor's colors blend the full diff color, also on dimmed rows; the file row
+  tooltip can overlap the panel's context menu; regex errors show the regex crate's multi-line message;
+  `e` on a folded header opens the file at its last row. M5 should prune `code_review_sessions` by
+  `last_opened_at`.
+- M5: comment blocks in folded/hidden files aren't shown (hidden files have no excerpts; re-host on
+  `BufferRangesUpdated`); the panel's comment list goes below the tree (same `uniform_list` so
+  `j`/`k` walk both); add header controls only through `ReviewAddon` in `diff.rs`; `R`/`r` stay bound.
 - Single-file mode removes excerpts and the LHS is recreated on split toggles: M5 must re-host comment
   blocks for both (`LineCursor::sync_split_state` shows how to catch LHS re-creation). The
   `ToggleSoftWrap` capture will also catch the action inside M5 comment editors — scope it then.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - Not run: `zed`'s own tests (incl. `test_action_namespaces`), clippy. `cargo test -p code_review`:
-  27 tests, stable under `ITERATIONS=10`.
+  46 tests (M4), stable under `ITERATIONS=10`.
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
   snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
   `]f`/`]c`/line cursor/`e` in branch, live and snapshot reviews.
@@ -524,7 +622,7 @@ covers it), tuicr's `tuicr review` CLI protocol.
 
 ## 3. Architecture
 
-### 3.1 Crate layout (proposed; files up to `picker.rs` exist as of M3)
+### 3.1 Crate layout (proposed; as of M4 `session.rs`, `persistence.rs`, `gitattributes.rs` and `reviewed.rs` exist too; `comments/`, `github/`, `checkout.rs`, `submit.rs`, `export.rs`, `cli.rs` don't yet)
 
 ```
 crates/code_review/
@@ -533,7 +631,8 @@ crates/code_review/
   LICENSE-GPL -> ../../LICENSE-GPL   # required by script/check-licenses
   src/code_review.rs    # init(cx): actions, observe_new::<Workspace>, item/panel registration
   src/target.rs         # ReviewTarget (Pr/Branch/Uncommitted/Commits), parsing (CLI + picker)
-  src/session.rs        # ReviewSession entity: target, file list, diffs, comments, reviewed state
+  src/session.rs        # ReviewKey, ReviewSession (reviewed marks, shared per key), digests (M4)
+  src/reviewed.rs       # header checkbox, hunk control, dimmed reviewed hunks (M4)
   src/diff.rs           # building the multibuffer: DiffSource (DiffBufferList / CommitDiffList)
   src/commits.rs        # commit ranges: live (open_diff_since) or historic snapshot buffers; git helpers
   src/view.rs           # ReviewView: workspace Item wrapping a SplittableEditor (+ top block)
@@ -671,6 +770,11 @@ crates/code_review/
 - Fold reviewed files: `rhs_editor.fold_buffer(buffer_id)` (`editor/src/fold.rs:618-676`; mirrors to
   LHS in split). Per-hunk controls if wanted: `DiffHunkRenderer` (`editor/src/git.rs:25-41`;
   precedent `agent_ui/src/agent_diff.rs:742-938`).
+- As built (M4): range folds are a no-op in split view (`display_map.rs:722`), so reviewed *hunks* are
+  dimmed with row highlights instead of collapsed; stock `GoToHunk` walks through folded buffers, so
+  `]c`/`[c` use our wrapper; a cursor inside a folded buffer resolves to the whole buffer (vim fix in
+  §0 M4 decisions). Folded buffer ids survive excerpt removal (`block_map.rs:1247`), and our fold
+  sync re-applies the state when excerpts reappear.
 
 ### 3.8 Workspace integration
 
@@ -684,6 +788,13 @@ crates/code_review/
   `vim.json` `ProjectPanel && not_editing` (`:1013-1061`, `menu::*` + `vim::MenuSelectNext`).
 - Persistence: own DB domain `db::static_connection!(…, [WorkspaceDb])` (migrations self-register,
   `db/src/db.rs:29-52, 247-280`) or `KeyValueStore` for small state.
+- As built (M4): `CodeReviewDb` (`persistence.rs`, no dependencies), migration 0:
+  `code_review_sessions(review_key TEXT PRIMARY KEY, created_at, last_opened_at)`,
+  `code_review_reviewed_files(review_key FK, path TEXT /*repo-relative unix*/, content_hash INTEGER
+  /*NULL = adopt on next reconcile*/, PRIMARY KEY(review_key, path))`,
+  `code_review_reviewed_hunks(review_key FK, path, hunk_key, PRIMARY KEY(review_key, path,
+  hunk_key))`, all `STRICT`, FKs `ON DELETE CASCADE ON UPDATE CASCADE`. Writes `INSERT OR IGNORE` the
+  session row first. M5 appends its drafts table as migration 1.
 - Pickers: `picker::PickerDelegate` with multi-select (`picker/src/picker.rs:259-292`).
 - Notifications/toasts: `workspace/src/notifications.rs`.
 - Tests: `zed.rs::test_action_namespaces` (:5866-6005) must list `"code_review"`.
