@@ -1,6 +1,6 @@
 use buffer_diff::DiffHunkStatusKind;
 use editor::{
-    Anchor, Bias, DisplayPoint, Editor, EditorEvent, MultiBufferSnapshot, RowHighlightOptions,
+    Bias, DisplayPoint, Editor, EditorEvent, MultiBufferSnapshot, RowHighlightOptions,
     SplittableEditor,
     display_map::{DisplayRow, DisplaySnapshot},
 };
@@ -242,19 +242,16 @@ fn highlight_run(
 ) {
     let start = buffer.anchor_before(Point::new(*rows.start(), 0));
     let end_row = *rows.end();
-    let end_line_len = buffer.line_len(MultiBufferRow(end_row));
-    // A highlight ending at column 0 excludes that row, so an empty last row needs to reach
-    // into the next row (or the end of the buffer).
-    let end = if end_line_len > 0 {
-        buffer.anchor_before(Point::new(end_row, end_line_len))
-    } else if end_row < buffer.max_row().0 {
-        buffer.anchor_before(Point::new(end_row + 1, 0))
-    } else {
-        Anchor::Max
-    };
+    let end = buffer.anchor_before(Point::new(
+        end_row,
+        buffer.line_len(MultiBufferRow(end_row)),
+    ));
+    // An empty last row ends at column 0, which would exclude it; reaching into the next row
+    // instead would also paint the spacers and blocks before that row.
     let options = RowHighlightOptions {
         autoscroll: false,
         include_gutter: true,
+        include_end_row: true,
     };
     match kind {
         Some(DiffHunkStatusKind::Added) => {
@@ -306,7 +303,7 @@ pub(crate) fn cursor_rows(
     editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let mut rows = Vec::new();
-        let highlights: [(&'static str, Vec<std::ops::Range<Anchor>>); 3] = [
+        let highlights: [(&'static str, Vec<std::ops::Range<editor::Anchor>>); 3] = [
             (
                 "context",
                 editor
@@ -332,12 +329,7 @@ pub(crate) fn cursor_rows(
         for (kind, ranges) in highlights {
             for range in ranges {
                 let start = range.start.to_point(&snapshot).row;
-                let end = range.end.to_point(&snapshot);
-                let end_row = if !range.end.is_max() && end.column == 0 && end.row > start {
-                    end.row - 1
-                } else {
-                    end.row
-                };
+                let end_row = range.end.to_point(&snapshot).row;
                 rows.extend((start..=end_row).map(|row| (row, kind)));
             }
         }
@@ -363,6 +355,85 @@ mod tests {
 
     fn scroll_x(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> f64 {
         editor.update(cx, |editor, cx| editor.scroll_position(cx).x)
+    }
+
+    /// The display rows the cursor highlight paints, and the display row of the cursor's line
+    /// on that side.
+    fn painted_rows(
+        editor: &Entity<Editor>,
+        row: u32,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<DisplayRow>, DisplayRow) {
+        use std::any::TypeId;
+        let cursor_types = [
+            TypeId::of::<CursorRowContext>(),
+            TypeId::of::<CursorRowAdded>(),
+            TypeId::of::<CursorRowDeleted>(),
+        ];
+        editor.update_in(cx, |editor, window, cx| {
+            let painted = editor
+                .highlighted_display_rows(window, cx)
+                .into_iter()
+                .filter(|(_, highlight)| {
+                    highlight
+                        .type_id
+                        .is_some_and(|type_id| cursor_types.contains(&type_id))
+                })
+                .map(|(display_row, _)| display_row)
+                .collect();
+            let snapshot = editor.display_snapshot(cx);
+            let cursor_row = snapshot
+                .point_to_display_point(Point::new(row, 0), Bias::Left)
+                .row();
+            (painted, cursor_row)
+        })
+    }
+
+    #[gpui::test]
+    async fn test_empty_row_above_spacers_highlights_only_itself(cx: &mut TestAppContext) {
+        use crate::test_support::{dot_git, open_workspace};
+        use project::FakeFs;
+        use util::path;
+
+        init(cx, DiffViewStyle::Split);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            serde_json::json!({
+                ".git": {},
+                "a.txt": "one\n\nnew 1\nnew 2\ntwo\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(dot_git(), &[("a.txt", "one\n\ntwo\n".into())]);
+        let (workspace, cx) = open_workspace(fs, cx).await;
+        crate::test_support::dispatch(crate::ReviewUncommitted, cx);
+        let review = crate::test_support::active_review(&workspace, cx);
+        cx.focus(&review);
+        cx.run_until_parked();
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+
+        // On the right side the empty row is followed by the added rows; on the left side by
+        // the spacers facing them, which the highlight must not cover.
+        let rhs_row = move_to_row_with_text(&rhs, "", cx);
+        let (painted, cursor_row) = painted_rows(&rhs, rhs_row, cx);
+        assert_eq!(painted, [cursor_row]);
+        let lhs_rows = cursor_rows(&lhs, cx);
+        assert_eq!(lhs_rows.len(), 1);
+        let (painted, cursor_row) = painted_rows(&lhs, lhs_rows[0].0, cx);
+        assert_eq!(painted, [cursor_row]);
+
+        cx.simulate_keystrokes("ctrl-w h");
+        let lhs_row = move_to_row_with_text(&lhs, "", cx);
+        let (painted, cursor_row) = painted_rows(&lhs, lhs_row, cx);
+        assert_eq!(painted, [cursor_row]);
+
+        // A line-wise selection from the empty row on covers the spacers it spans.
+        cx.simulate_keystrokes("shift-v j");
+        let (painted, cursor_row) = painted_rows(&lhs, lhs_row, cx);
+        assert_eq!(painted.first(), Some(&cursor_row));
+        assert!(painted.len() > 2, "{painted:?}");
     }
 
     #[gpui::test]

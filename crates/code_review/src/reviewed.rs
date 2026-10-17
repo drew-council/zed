@@ -185,6 +185,7 @@ fn highlight_run(
     let options = RowHighlightOptions {
         autoscroll: false,
         include_gutter: false,
+        ..RowHighlightOptions::default()
     };
     if is_deleted {
         editor.highlight_rows::<ReviewedHunkDeleted>(
