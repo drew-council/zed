@@ -158,6 +158,10 @@ struct LineAnchor {
     /// current again. Its anchor on the line numbers moves away from that place when the lines
     /// are put back right before it.
     deleted_from: Option<Range<language::Anchor>>,
+    /// Kept open, so that a file that leaves the review and comes back (a stash and its pop in
+    /// an uncommitted review) is shown with this buffer again, whose edits the range followed
+    /// meanwhile, rather than with a new one, where only the line numbers would be left.
+    _buffer: Entity<Buffer>,
 }
 
 struct HostedBlock {
@@ -764,12 +768,12 @@ impl CommentBlocks {
                 let CommentTarget::Lines { path, side, lines } = &comment.target else {
                     continue;
                 };
-                let Some(buffer) = side_buffer(diff, path, *side, cx) else {
+                let Some(buffer_entity) = side_buffer(diff, path, *side, cx) else {
                     continue;
                 };
                 let buffer = snapshots
-                    .entry(buffer.entity_id())
-                    .or_insert_with(|| buffer.read(cx).snapshot());
+                    .entry(buffer_entity.entity_id())
+                    .or_insert_with(|| buffer_entity.read(cx).snapshot());
                 // As it will be once this update's checks are applied.
                 let mut is_outdated = comment.is_outdated();
                 let mut deleted_from = None;
@@ -829,6 +833,7 @@ impl CommentBlocks {
                             lines: lines.clone(),
                             text: comment.line_text.clone().unwrap_or_default(),
                             deleted_from: deleted_from.filter(|_| is_outdated),
+                            _buffer: buffer_entity.clone(),
                         },
                     );
                 }
@@ -956,6 +961,7 @@ impl CommentBlocks {
                     lines,
                     text,
                     deleted_from: None,
+                    _buffer: buffer,
                 };
                 self.add_comment(new_comment, Some(anchor), editor, window, cx);
             }
@@ -3524,6 +3530,69 @@ mod tests {
             line_state(&review, single, cx),
             (lines("a.rs", 1..=1), false)
         );
+    }
+
+    /// A stash and its pop in an uncommitted review: the file leaves the review and comes back.
+    #[gpui::test]
+    async fn test_comments_survive_a_stash_and_pop(cx: &mut TestAppContext) {
+        use crate::test_support::{dot_git, line, open_workspace};
+        use project::FakeFs;
+
+        init(cx, DiffViewStyle::Unified);
+        let head: String = (1..=20).map(line).collect();
+        let working = head
+            .replace(&line(10), "line 10\nadded A\nadded B\n")
+            .replace(&line(15), "line FIFTEEN\n");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            serde_json::json!({ ".git": {}, "x.rs": working.clone() }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(dot_git(), &[("x.rs", head.clone())]);
+        let (workspace, cx) = open_workspace(fs.clone(), cx).await;
+        crate::test_support::dispatch(crate::ReviewUncommitted, cx);
+        let review = crate::test_support::active_review(&workspace, cx);
+        cx.focus(&review);
+        cx.run_until_parked();
+        let rhs = rhs_editor(&review, cx);
+        for (row_text, body) in [("added A", "added"), ("line FIFTEEN", "fifteen")] {
+            move_to_row_with_text(&rhs, row_text, cx);
+            cx.simulate_keystrokes("c");
+            cx.simulate_input(body);
+            cx.simulate_keystrokes("ctrl-enter");
+        }
+        let [added, fifteen] = comment_ids(&review, cx)[..] else {
+            panic!("two comments expected");
+        };
+        assert_eq!(
+            line_state(&review, added, cx),
+            (lines("x.rs", 11..=11), false)
+        );
+        assert_eq!(
+            line_state(&review, fifteen, cx),
+            (lines("x.rs", 17..=17), false)
+        );
+
+        // The stash: the file has no changes left and leaves the review.
+        fs.insert_file(path!("/project/x.rs"), head.into_bytes())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(hosted_rows(&review, cx).len(), 0);
+
+        // The pop: it comes back, with its comments on their lines and current.
+        fs.insert_file(path!("/project/x.rs"), working.into_bytes())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(
+            line_state(&review, added, cx),
+            (lines("x.rs", 11..=11), false)
+        );
+        assert_eq!(
+            line_state(&review, fifteen, cx),
+            (lines("x.rs", 17..=17), false)
+        );
+        assert_eq!(hosted_rows(&review, cx).len(), 2);
     }
 
     /// Two projects on one repository (its root and a subfolder, in two windows) review the
