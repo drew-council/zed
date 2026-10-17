@@ -7,7 +7,11 @@ use editor::{
 use gpui::{Entity, Focusable as _, MouseButton, WeakEntity};
 use language::Point;
 use multi_buffer::{MultiBufferRow, RowInfo};
-use std::{cell::RefCell, ops::RangeInclusive, rc::Rc};
+use std::{
+    cell::RefCell,
+    ops::{Range, RangeInclusive},
+    rc::Rc,
+};
 use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::ResultExt as _;
 
@@ -33,7 +37,7 @@ struct SelectionRows {
 /// Draws a "+" in the gutter of one side of the diff: on the row under the pointer, and on the
 /// cursor's row and the selection's last row while the side has the cursor. A click comments on
 /// the row (or on the selection it is in); a drag from it selects rows, which its release
-/// comments on.
+/// comments on. Clicks on a row's line number select the row (see [`select_from_line_number`]).
 pub(super) fn install(editor: &Entity<Editor>, blocks: WeakEntity<CommentBlocks>, cx: &mut App) {
     let weak_editor = editor.downgrade();
     let drag_rows = DragRows::default();
@@ -45,11 +49,109 @@ pub(super) fn install(editor: &Entity<Editor>, blocks: WeakEntity<CommentBlocks>
                 let button = blocks
                     .upgrade()?
                     .read(cx)
-                    .gutter_button(&editor, gutter_row, cx)?;
-                Some(render_button(button, &blocks, &editor, &drag_rows, cx))
+                    .gutter_button(&editor, gutter_row, cx)
+                    .map(|button| render_button(button, &blocks, &editor, &drag_rows, cx));
+                Some(render_row(gutter_row.row, button, &editor, &drag_rows))
             })),
             cx,
         );
+    });
+}
+
+/// How far the area over a row's line number reaches from the start of the line-number column
+/// (where the "+" is): past the line numbers of any length. Its click handler only takes clicks
+/// on the line numbers, and lets the others through.
+const LINE_NUMBER_AREA_WIDTH: Rems = Rems(6.);
+
+/// What the review draws over a row's line number: the "+" when the row has one, in an area
+/// that takes the clicks on the line number.
+fn render_row(
+    row: DisplayRow,
+    button: Option<AnyElement>,
+    editor: &Entity<Editor>,
+    drag_rows: &DragRows,
+) -> AnyElement {
+    let editor = editor.downgrade();
+    let drag_rows = drag_rows.clone();
+    h_flex()
+        .h_full()
+        .w(LINE_NUMBER_AREA_WIDTH)
+        .items_center()
+        .debug_selector(move || format!("review-line-number-{}", row.0))
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            if window.default_prevented() {
+                return;
+            }
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
+            let on_line_number = editor
+                .update(cx, |editor, cx| line_number_column(editor, window, cx))
+                .is_some_and(|column| column.contains(&event.position.x));
+            if !on_line_number {
+                return;
+            }
+            // In a multibuffer, the editor opens the file at a clicked line number.
+            window.prevent_default();
+            cx.stop_propagation();
+            select_from_line_number(&editor, row, event.modifiers.shift, &drag_rows, window, cx);
+        })
+        .children(button)
+        .into_any_element()
+}
+
+/// Where a side's line numbers are drawn (window x coordinates, as last laid out): right-aligned
+/// at the end of the gutter, before its right padding, as wide as the widest line number.
+pub(super) fn line_number_column(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Option<Range<Pixels>> {
+    let origin = editor.last_bounds()?.origin.x;
+    let style = editor.style(cx).clone();
+    let font_id = window.text_system().resolve_font(&style.text.font());
+    let font_size = style.text.font_size.to_pixels(window.rem_size());
+    let snapshot = editor.snapshot(window, cx);
+    let gutter = snapshot.gutter_dimensions(font_id, font_size, &style, window, cx);
+    let end = origin + gutter.width - gutter.right_padding;
+    let start = end - snapshot.max_line_number_width(&style, window);
+    Some(start..end)
+}
+
+/// A click on a line number moves the line cursor to its row (shift-click extends the selection
+/// to it), and dragging from it selects rows, as on GitHub. `e`, a header's Open File and the
+/// review's context menu still open the file.
+fn select_from_line_number(
+    editor: &Entity<Editor>,
+    row: DisplayRow,
+    extend: bool,
+    drag_rows: &DragRows,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.focus(&editor.focus_handle(cx), cx);
+    if extend {
+        let rows = editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let selected = selected_rows(editor, &snapshot);
+            let anchor_row = if editor.selections.newest_anchor().reversed {
+                *selected.end()
+            } else {
+                *selected.start()
+            };
+            let anchor_row = snapshot
+                .point_to_display_point(Point::new(anchor_row, 0), Bias::Left)
+                .row();
+            anchor_row.min(row)..=anchor_row.max(row)
+        });
+        select_display_rows(editor, rows, window, cx);
+        return;
+    }
+    select_display_rows(editor, row..=row, window, cx);
+    *drag_rows.borrow_mut() = Some(row..=row);
+    // The rows follow the drag (`follow_drag`); its end only leaves them selected.
+    editor.update(cx, |editor, cx| {
+        editor.start_gutter_row_drag(row, Box::new(|_, _, _| {}), cx)
     });
 }
 

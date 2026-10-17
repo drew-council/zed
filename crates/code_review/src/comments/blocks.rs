@@ -4839,6 +4839,82 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         (bounds, row)
     }
 
+    /// A click on a line number moves the line cursor there instead of opening the file (a
+    /// multibuffer's own behaviour); a drag from it selects rows, a shift-click extends the
+    /// selection to it. Neither comments.
+    #[gpui::test]
+    async fn test_line_number_clicks_select_rows(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Split);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+        let none = gpui::Modifiers::none();
+        let item_count = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count())
+        };
+        let items = item_count(cx);
+        let line_number = |editor: &Entity<Editor>, row: u32, cx: &mut VisualTestContext| {
+            draw(cx);
+            let column = editor
+                .update_in(cx, |editor, window, cx| {
+                    gutter::line_number_column(editor, window, cx)
+                })
+                .unwrap();
+            gpui::point(
+                column.end - gpui::px(2.),
+                crate::test_support::row_center(editor, row, cx).y,
+            )
+        };
+        let selection = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                crate::line_cursor::selected_rows(editor, &snapshot)
+            })
+        };
+
+        let line_3 = move_to_row_with_text(&rhs, "line 3", cx);
+        let position = line_number(&rhs, line_3 + 1, cx);
+        cx.simulate_click(position, none);
+        cx.run_until_parked();
+        assert_eq!(cursor_line(&rhs, cx), "line 4");
+        assert_eq!(vim_mode(&rhs, cx).as_deref(), Some("normal"));
+        assert_eq!(item_count(cx), items);
+
+        // The left side's line numbers too.
+        let row = move_to_row_with_text(&lhs, "line 1", cx);
+        let position = line_number(&lhs, row + 2, cx);
+        cx.simulate_click(position, none);
+        cx.run_until_parked();
+        assert!(is_focused(&lhs, cx));
+        assert_eq!(cursor_line(&lhs, cx), "line 3");
+        assert_eq!(item_count(cx), items);
+
+        // A drag over line numbers selects the rows.
+        let from = line_number(&rhs, line_3 - 1, cx);
+        let to = line_number(&rhs, line_3 + 1, cx);
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, none);
+        cx.simulate_mouse_move(to, Some(gpui::MouseButton::Left), none);
+        draw(cx);
+        cx.run_until_parked();
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(selection(&rhs, cx), line_3 - 1..=line_3 + 1);
+        assert_eq!(vim_mode(&rhs, cx).as_deref(), Some("visual"));
+        assert!(comment_ids(&review, cx).is_empty());
+
+        // Shift-click extends the selection.
+        move_to_row_with_text(&rhs, "LINE 2", cx);
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let position = line_number(&rhs, line_3 + 1, cx);
+        cx.simulate_click(position, shift);
+        cx.run_until_parked();
+        assert_eq!(selection(&rhs, cx), line_3 - 1..=line_3 + 1);
+        assert_eq!(item_count(cx), items);
+    }
+
     /// GitHub's "+": on the hovered row and the cursor row; a click comments on its row (the old
     /// line on a removed row of a unified diff), and clicking a row's text moves the cursor
     /// there.
