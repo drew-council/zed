@@ -1093,6 +1093,8 @@ struct CommentNode {
     url: String,
     state: Option<String>,
     commit: Option<CommitNode>,
+    #[serde(default)]
+    original_commit: Option<CommitNode>,
     author: Option<ActorNode>,
 }
 
@@ -1229,6 +1231,10 @@ fn parse_thread(node: ThreadNode) -> Option<RemoteThread> {
         .commit
         .as_ref()
         .and_then(|commit| parse_full_oid(&commit.oid).ok());
+    let original_commit = first
+        .original_commit
+        .as_ref()
+        .and_then(|commit| parse_full_oid(&commit.oid).ok());
     let anchor = thread_anchor(&node);
     let mut pending_replies = 0;
     let comments = node
@@ -1255,6 +1261,7 @@ fn parse_thread(node: ThreadNode) -> Option<RemoteThread> {
         path: node.path,
         anchor,
         anchor_commit,
+        original_commit,
         is_resolved: node.is_resolved,
         is_outdated: node.is_outdated,
         comments,
@@ -1372,8 +1379,9 @@ fn parse_patch(patch: &str) -> Vec<Hunk> {
             Some(b'\\') => continue,
             _ => HunkRowKind::Context,
         };
+        // Counted saturating: a malformed patch may have more rows than its header says.
         match hunk.rows.last_mut() {
-            Some(rows) if rows.kind == kind => rows.len += 1,
+            Some(rows) if rows.kind == kind => rows.len = rows.len.saturating_add(1),
             _ => hunk.rows.push(HunkRows {
                 kind,
                 old_start: *old_line,
@@ -1382,10 +1390,10 @@ fn parse_patch(patch: &str) -> Vec<Hunk> {
             }),
         }
         if kind != HunkRowKind::Added {
-            *old_line += 1;
+            *old_line = old_line.saturating_add(1);
         }
         if kind != HunkRowKind::Deleted {
-            *new_line += 1;
+            *new_line = new_line.saturating_add(1);
         }
     }
     hunks.extend(current.map(|(hunk, _, _)| hunk));
@@ -2925,6 +2933,22 @@ mod tests {
                 Some(head)
             ]
         );
+        // Every thread but the bot's was made before the push that outdated one of them.
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.original_commit)
+                .collect::<Vec<_>>(),
+            [
+                Some(outdated_commit),
+                Some(outdated_commit),
+                Some(outdated_commit),
+                Some(outdated_commit),
+                Some(outdated_commit),
+                Some(outdated_commit),
+                Some(head)
+            ]
+        );
         let first = &threads[0];
         assert_eq!(first.id, "PRRT_kwDOVM9_N86tcJxI");
         assert_eq!(first.total_comments, 2);
@@ -3231,6 +3255,20 @@ mod tests {
         });
         assert_eq!(file.status, ChangedFileStatus::Renamed);
         assert_eq!(file.hunks, None);
+
+        // A patch with more rows than its header says, near the largest line number, doesn't
+        // overflow (a hostile or broken server).
+        let file = changed_file(FileEntry {
+            filename: "x.rs".into(),
+            previous_filename: None,
+            status: "modified".into(),
+            patch: Some("@@ -1,1 +4294967294,1 @@\n+a\n+b\n+c\n-d\n e\n".into()),
+        });
+        let lines = CommentableLines::new([file], false);
+        assert!(lines.allows("x.rs", DiffSide::Right, 4294967294));
+        assert!(!lines.allows("x.rs", DiffSide::Right, 7));
+        // The deletion comes after the additions in this patch.
+        assert!(!lines.allows_range("x.rs", (DiffSide::Left, 1), (DiffSide::Right, 4294967294)));
     }
 
     fn files_fixture(text: &str) -> CommentableLines {

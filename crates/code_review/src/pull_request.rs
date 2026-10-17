@@ -15,6 +15,7 @@ use crate::{
     view::ReviewView,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
+use buffer_diff::{BufferDiff, BufferDiffEvent, BufferDiffSnapshot};
 use collections::{HashMap, HashSet};
 use git::{
     Oid,
@@ -22,8 +23,9 @@ use git::{
 };
 use gpui::{
     App, AppContext as _, AsyncWindowContext, BackgroundExecutor, Context, Entity, EntityId,
-    EventEmitter, Global, PromptLevel, SharedString, Task, WeakEntity, Window,
+    EventEmitter, Global, PromptLevel, SharedString, Subscription, Task, WeakEntity, Window,
 };
+use language::{Buffer, BufferSnapshot, Point};
 use project::{
     Project,
     git_store::Repository,
@@ -33,6 +35,7 @@ use project::{
 use settings::Settings as _;
 use std::{
     cell::RefCell,
+    ops::RangeInclusive,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -46,10 +49,9 @@ use workspace::{OpenMode, Workspace};
 pub struct PullRequestState {
     forge: Arc<dyn Forge>,
     details: PullRequestDetails,
-    /// The checkout the forge was resolved from, to resolve it again after GitHub rejected its
-    /// token.
-    repository: WeakEntity<Repository>,
-    project: WeakEntity<Project>,
+    /// The checkouts reviewing the pull request (the latest last), to resolve the forge again
+    /// from one that is still open after GitHub rejected its token.
+    checkouts: Vec<(WeakEntity<Repository>, WeakEntity<Project>)>,
     threads: Vec<Arc<RemoteThread>>,
     summaries: Vec<RemoteReviewSummary>,
     /// GitHub's diff hunks: comments are only accepted inside them.
@@ -119,8 +121,7 @@ impl PullRequestState {
             pull_request.update(cx, |pull_request, cx| {
                 pull_request.forge = forge;
                 pull_request.details = details;
-                pull_request.repository = repository.downgrade();
-                pull_request.project = project.downgrade();
+                pull_request.add_checkout(repository, project);
                 pull_request.forge_is_stale = false;
                 pull_request.load(false, cx);
             });
@@ -130,8 +131,7 @@ impl PullRequestState {
             let mut pull_request = Self {
                 forge,
                 details,
-                repository: repository.downgrade(),
-                project: project.downgrade(),
+                checkouts: vec![(repository.downgrade(), project.downgrade())],
                 threads: Vec::new(),
                 summaries: Vec::new(),
                 commentable: None,
@@ -152,6 +152,16 @@ impl PullRequestState {
 
     pub fn details(&self) -> &PullRequestDetails {
         &self.details
+    }
+
+    /// Records a checkout that reviews the pull request (a tab's), which the forge can be
+    /// resolved from again.
+    pub(crate) fn add_checkout(&mut self, repository: &Entity<Repository>, project: &Entity<Project>) {
+        self.checkouts.retain(|(known, _)| {
+            known.upgrade().is_some() && known.entity_id() != repository.entity_id()
+        });
+        self.checkouts
+            .push((repository.downgrade(), project.downgrade()));
     }
 
     pub fn forge(&self) -> &Arc<dyn Forge> {
@@ -236,21 +246,63 @@ impl PullRequestState {
         self.load(true, cx);
     }
 
-    /// Whether GitHub would take a comment on `target`: only on lines inside its diff hunks, and
-    /// on files of the pull request.
-    pub(crate) fn check_comment(&self, target: &CommentTarget) -> Result<(), SharedString> {
+    /// Whether GitHub would take a comment on `target`, made in a checkout at `local_head` whose
+    /// files differ from that commit as `local` says: only on files of the pull request, and on
+    /// lines inside GitHub's diff hunks, which are numbered in the pull request's head commit.
+    /// So line comments need that commit checked out, and lines the checkout didn't change.
+    pub(crate) fn check_comment(
+        &self,
+        target: &CommentTarget,
+        local_head: Option<Oid>,
+        local: &LocalChanges,
+        cx: &App,
+    ) -> Result<(), SharedString> {
         if *target == CommentTarget::Review {
             return Ok(());
         }
-        match &self.commentable {
-            Some(commentable) => check_comment_target(commentable, target),
-            None if self.is_loading => Err("Loading the pull request's diff from GitHub…".into()),
-            None => Err(
+        let Some(commentable) = &self.commentable else {
+            return Err(if self.is_loading {
+                "Loading the pull request's diff from GitHub…".into()
+            } else {
                 "The pull request's diff couldn't be loaded from GitHub: reload the pull request \
-                 to comment on its lines"
-                    .into(),
-            ),
+                 to comment on its files and lines"
+                    .into()
+            });
+        };
+        let CommentTarget::Lines { path, side, lines } = target else {
+            return check_comment_target(commentable, target);
+        };
+        if local_head != Some(self.details.head_oid) {
+            return Err(format!(
+                "Check out the pull request's head {} to comment on its lines: GitHub numbers \
+                 them in that commit",
+                self.details.head_oid.display_short()
+            )
+            .into());
         }
+        let lines = match side {
+            Side::Old => lines.clone(),
+            Side::New => match local.working_to_head(path, lines.clone(), cx) {
+                LineMapping::Lines(lines) => lines,
+                LineMapping::Changed => {
+                    return Err(
+                        "These lines have local changes, which the pull request doesn't have"
+                            .into(),
+                    );
+                }
+                LineMapping::Unknown => {
+                    return Err("Comparing the file with HEAD… Try again in a moment.".into());
+                }
+            },
+        };
+        check_comment_target(
+            commentable,
+            &CommentTarget::Lines {
+                path: path.clone(),
+                side: *side,
+                lines,
+            },
+        )
     }
 
     fn load(&mut self, with_details: bool, cx: &mut Context<Self>) {
@@ -299,8 +351,9 @@ impl PullRequestState {
     }
 
     fn resolve_forge(&self, cx: &mut App) -> Option<Task<Result<Arc<dyn Forge>>>> {
-        let repository = self.repository.upgrade()?;
-        let project = self.project.upgrade()?;
+        let (repository, project) = self.checkouts.iter().rev().find_map(|(repository, project)| {
+            Some((repository.upgrade()?, project.upgrade()?))
+        })?;
         let canonical = &self.forge.context().canonical;
         let reference = ForgeRepoRef {
             host: Some(canonical.host.clone()),
@@ -361,6 +414,236 @@ impl PullRequestState {
         cx.emit(PullRequestEvent::Loaded);
         cx.notify();
     }
+}
+
+/// How a review tab's working tree differs from its HEAD commit, file by file. GitHub numbers a
+/// pull request's lines in its head commit, while the review shows the working tree with its
+/// uncommitted and unsaved changes: this translates between the two.
+pub(crate) struct LocalChanges {
+    project: WeakEntity<Project>,
+    files: HashMap<RepoPath, LocalFile>,
+}
+
+struct LocalFile {
+    buffer: Entity<Buffer>,
+    state: LocalFileState,
+}
+
+enum LocalFileState {
+    Loading { _task: Task<()> },
+    /// The file's diff against HEAD, recalculated as the buffer changes.
+    Loaded {
+        diff: Entity<BufferDiff>,
+        _subscription: Subscription,
+    },
+    /// The file couldn't be compared: its lines count as HEAD's.
+    Failed,
+}
+
+/// Lines of one numbering (HEAD's or the working tree's) in the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LineMapping {
+    Lines(RangeInclusive<u32>),
+    /// Some of the lines changed in the working tree (or the file isn't in HEAD).
+    Changed,
+    /// The file hasn't been compared with HEAD yet.
+    Unknown,
+}
+
+/// A file was compared with HEAD, or its comparison changed.
+pub(crate) struct LocalChangesEvent;
+
+impl EventEmitter<LocalChangesEvent> for LocalChanges {}
+
+impl LocalChanges {
+    pub(crate) fn new(project: &Entity<Project>) -> Self {
+        Self {
+            project: project.downgrade(),
+            files: HashMap::default(),
+        }
+    }
+
+    /// Compares the review's files (with the buffers showing them) with HEAD, each buffer once,
+    /// and forgets the files the review no longer has.
+    pub(crate) fn sync(&mut self, files: Vec<(RepoPath, Entity<Buffer>)>, cx: &mut Context<Self>) {
+        let paths = files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<HashSet<_>>();
+        self.files.retain(|path, _| paths.contains(path));
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        for (path, buffer) in files {
+            if self
+                .files
+                .get(&path)
+                .is_some_and(|file| file.buffer == buffer)
+            {
+                continue;
+            }
+            let open = project.update(cx, |project, cx| {
+                project.open_uncommitted_diff(buffer.clone(), cx)
+            });
+            let task = cx.spawn({
+                let path = path.clone();
+                async move |this, cx| {
+                    let diff = open.await;
+                    this.update(cx, |this, cx| this.compared(path, diff, cx))
+                        .log_err();
+                }
+            });
+            self.files.insert(
+                path,
+                LocalFile {
+                    buffer,
+                    state: LocalFileState::Loading { _task: task },
+                },
+            );
+        }
+    }
+
+    fn compared(&mut self, path: RepoPath, diff: Result<Entity<BufferDiff>>, cx: &mut Context<Self>) {
+        let Some(file) = self.files.get_mut(&path) else {
+            return;
+        };
+        file.state = match diff {
+            Ok(diff) => {
+                let subscription = cx.subscribe(&diff, |_, _, _: &BufferDiffEvent, cx| {
+                    cx.emit(LocalChangesEvent)
+                });
+                LocalFileState::Loaded {
+                    diff,
+                    _subscription: subscription,
+                }
+            }
+            Err(error) => {
+                log::error!("comparing {} with HEAD: {error:#}", path.as_unix_str());
+                LocalFileState::Failed
+            }
+        };
+        cx.emit(LocalChangesEvent);
+    }
+
+    /// Where HEAD's `lines` (1-based) of the file are in the working tree.
+    pub(crate) fn head_to_working(
+        &self,
+        path: &RepoPath,
+        lines: RangeInclusive<u32>,
+        cx: &App,
+    ) -> LineMapping {
+        self.map(path, lines, true, cx)
+    }
+
+    /// Where the working tree's `lines` (1-based) of the file are in HEAD.
+    pub(crate) fn working_to_head(
+        &self,
+        path: &RepoPath,
+        lines: RangeInclusive<u32>,
+        cx: &App,
+    ) -> LineMapping {
+        self.map(path, lines, false, cx)
+    }
+
+    fn map(
+        &self,
+        path: &RepoPath,
+        lines: RangeInclusive<u32>,
+        from_head: bool,
+        cx: &App,
+    ) -> LineMapping {
+        let Some(file) = self.files.get(path) else {
+            return LineMapping::Unknown;
+        };
+        match &file.state {
+            LocalFileState::Loading { .. } => LineMapping::Unknown,
+            LocalFileState::Failed => LineMapping::Lines(lines),
+            LocalFileState::Loaded { diff, .. } => {
+                let diff = diff.read(cx).snapshot(cx);
+                let buffer = file.buffer.read(cx).snapshot();
+                if from_head {
+                    head_lines_in_working_tree(&diff, &buffer, lines)
+                } else {
+                    working_lines_in_head(&diff, &buffer, lines)
+                }
+            }
+        }
+    }
+}
+
+/// Where HEAD's `lines` (the diff's base text, 1-based) are in the buffer, unless the buffer
+/// changed any of them.
+fn head_lines_in_working_tree(
+    diff: &BufferDiffSnapshot,
+    buffer: &BufferSnapshot,
+    lines: RangeInclusive<u32>,
+) -> LineMapping {
+    if !diff.base_text_exists() {
+        return LineMapping::Changed;
+    }
+    let base = diff.base_text();
+    let max_row = base.max_point().row;
+    for line in lines.clone() {
+        let Some(row) = line.checked_sub(1).filter(|row| *row <= max_row) else {
+            return LineMapping::Changed;
+        };
+        let start = base.point_to_offset(Point::new(row, 0));
+        let end = if row < max_row {
+            base.point_to_offset(Point::new(row + 1, 0))
+        } else {
+            base.len()
+        };
+        // Lines inserted right before or after the row leave it as it is.
+        if diff
+            .hunks_intersecting_base_text_range(start..end, buffer)
+            .any(|hunk| hunk.diff_base_byte_range.start < end && hunk.diff_base_byte_range.end > start)
+        {
+            return LineMapping::Changed;
+        }
+    }
+    let line_in_buffer = |line: u32| {
+        diff.base_text_point_to_buffer_point(Point::new(line - 1, 0), buffer)
+            .row
+            + 1
+    };
+    LineMapping::Lines(line_in_buffer(*lines.start())..=line_in_buffer(*lines.end()))
+}
+
+/// Where the buffer's `lines` (1-based) are in HEAD (the diff's base text), unless the buffer
+/// changed any of them.
+fn working_lines_in_head(
+    diff: &BufferDiffSnapshot,
+    buffer: &BufferSnapshot,
+    lines: RangeInclusive<u32>,
+) -> LineMapping {
+    if !diff.base_text_exists() {
+        return LineMapping::Changed;
+    }
+    let max_row = buffer.max_point().row;
+    for line in lines.clone() {
+        let Some(row) = line.checked_sub(1).filter(|row| *row <= max_row) else {
+            return LineMapping::Changed;
+        };
+        let start = Point::new(row, 0);
+        let end = if row < max_row {
+            Point::new(row + 1, 0)
+        } else {
+            buffer.max_point()
+        };
+        let range = buffer.anchor_before(start)..buffer.anchor_after(end);
+        if diff
+            .hunks_intersecting_range(range, buffer)
+            .any(|hunk| hunk.range.start < end && hunk.range.end > start)
+        {
+            return LineMapping::Changed;
+        }
+    }
+    let line_in_head = |line: u32| {
+        diff.buffer_point_to_base_text_point(Point::new(line - 1, 0), buffer)
+            .row
+            + 1
+    };
+    LineMapping::Lines(line_in_head(*lines.start())..=line_in_head(*lines.end()))
 }
 
 struct Loaded {
@@ -944,7 +1227,7 @@ async fn repository_at(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::forge::{Actor, ForgeRepo, PullRequestStatus};
 
@@ -1261,6 +1544,20 @@ mod tests {
             location("PRRT_kwDOVM9_N86tcJ3I", false).as_deref(),
             Some("File comment")
         );
+
+        // An outdated thread's original line is in the commit it was made on, which pushes
+        // since didn't change (they moved its current commit along).
+        let mut outdated = threads
+            .iter()
+            .find(|thread| thread.id.as_ref() == "PRRT_kwDOVM9_N86tcJxR")
+            .unwrap()
+            .clone();
+        outdated.anchor_commit = Some("2222222222222222222222222222222222222222".parse().unwrap());
+        outdated.original_commit = Some("1111111111111111111111111111111111111111".parse().unwrap());
+        assert_eq!(
+            thread_location(&outdated, true).as_deref(),
+            Some("Originally line 223 at 1111111")
+        );
     }
 
     #[test]
@@ -1316,7 +1613,7 @@ mod tests {
         );
     }
 
-    mod review {
+    pub(crate) mod review {
         use super::*;
         use crate::{
             CopyBranchName, CopyPullRequestUrl, OpenPullRequest, ReloadPullRequest,
@@ -1326,7 +1623,7 @@ mod tests {
                 set_fake_token_source,
                 test_support::{
                     PR1_BASE_OID, PR1_DETAILS, PR1_FILES, PR1_HEAD_OID, PR1_SUMMARIES, PR1_THREADS,
-                    Reply, SentRequests, fake_github, repository_context_reply,
+                    Reply, SentRequest, SentRequests, fake_github, repository_context_reply,
                 },
             },
             test_support::{
@@ -1340,9 +1637,10 @@ mod tests {
         use editor::{Bias, Editor};
         use gpui::{Focusable as _, TestAppContext, VisualContext as _, VisualTestContext};
         use language::Point;
-        use project::FakeFs;
+        use project::{FakeFs, Project};
         use serde_json::json;
         use settings::DiffViewStyle;
+        use std::path::Path;
         use std::sync::atomic::{AtomicBool, Ordering};
         use util::path;
 
@@ -1367,11 +1665,21 @@ mod tests {
             lines.join("\n") + "\n"
         }
 
-        /// A checkout of PR A at its head, with files shaped so that its threads' lines exist:
-        /// `src/engine.rs` changes lines 59, 100 and 134 and deletes old line 193,
-        /// `src/filters.rs` is added (71 lines), `src/util/strings.rs` changes line 48 and
-        /// `docs/guide.md` line 30. The fake GitHub has PR A's threads, summaries and files.
-        /// `fail_threads` makes the threads answer 401.
+        /// What [`open_review`] varies.
+        #[derive(Default)]
+        pub(crate) struct Fixture {
+            pub(crate) split: bool,
+            /// The threads answer 401 while set.
+            pub(crate) fail_threads: Arc<AtomicBool>,
+            /// The working tree differs from HEAD: two lines are inserted at the top of
+            /// `src/engine.rs`, and `src/filters.rs` line 22 is edited.
+            pub(crate) local_edits: bool,
+            /// Thread nodes (GraphQL) after PR A's.
+            pub(crate) extra_threads: Vec<serde_json::Value>,
+            /// Answers requests before the fake GitHub's own answers.
+            pub(crate) respond: Option<Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync>>,
+        }
+
         async fn open_pull_request_review(
             diff_view_style: DiffViewStyle,
             fail_threads: Arc<AtomicBool>,
@@ -1383,7 +1691,43 @@ mod tests {
             SentRequests,
             &mut VisualTestContext,
         ) {
-            init_vim_test(cx, diff_view_style);
+            let fixture = Fixture {
+                split: diff_view_style == DiffViewStyle::Split,
+                fail_threads,
+                ..Fixture::default()
+            };
+            open_review(fixture, cx).await
+        }
+
+        /// A checkout of PR A at its head, with files shaped so that its threads' lines exist:
+        /// `src/engine.rs` changes lines 59, 100 and 134 and deletes old line 193,
+        /// `src/filters.rs` is added (71 lines), `src/util/strings.rs` changes line 48 and
+        /// `docs/guide.md` line 30. The fake GitHub has PR A's threads, summaries and files.
+        pub(crate) async fn open_review(
+            fixture: Fixture,
+            cx: &mut TestAppContext,
+        ) -> (
+            Arc<FakeFs>,
+            Entity<Workspace>,
+            Entity<ReviewView>,
+            SentRequests,
+            &mut VisualTestContext,
+        ) {
+            let Fixture {
+                split,
+                fail_threads,
+                local_edits,
+                extra_threads,
+                respond,
+            } = fixture;
+            init_vim_test(
+                cx,
+                if split {
+                    DiffViewStyle::Split
+                } else {
+                    DiffViewStyle::Unified
+                },
+            );
             let engine_old = numbered("engine", 269);
             let mut engine_new = engine_old.clone();
             for line in [59, 100, 134] {
@@ -1397,6 +1741,15 @@ mod tests {
             let mut guide_new = guide_old.clone();
             guide_new[29] = "GUIDE 30".into();
             let filters = text(&numbered("filter", 71));
+            let (engine_local, filters_local) = if local_edits {
+                let mut engine = engine_new.clone();
+                engine.splice(0..0, ["local 1".to_string(), "local 2".to_string()]);
+                let mut filters = numbered("filter", 71);
+                filters[21] = "filter 22 edited".into();
+                (text(&engine), text(&filters))
+            } else {
+                (text(&engine_new), filters.clone())
+            };
 
             let fs = FakeFs::new(cx.executor());
             fs.insert_tree(
@@ -1405,8 +1758,8 @@ mod tests {
                     ".git": {},
                     "docs": { "guide.md": text(&guide_new) },
                     "src": {
-                        "engine.rs": text(&engine_new),
-                        "filters.rs": filters.clone(),
+                        "engine.rs": engine_local,
+                        "filters.rs": filters_local,
                         "util": { "strings.rs": text(&strings_new) },
                     },
                 }),
@@ -1444,16 +1797,31 @@ mod tests {
                 dot_git(),
                 [(commit_data(PR1_HEAD_OID, None, "Outdate is_truthy"), false)],
             );
-            let (http, requests) = fake_github(move |request| match request.operation() {
-                Some("RepositoryContext") => repository_context_reply(request),
-                Some("PullRequestDetails") => Reply::json(PR1_DETAILS),
-                Some("ReviewThreads") if fail_threads.load(Ordering::SeqCst) => {
-                    Reply::status(401, r#"{"message":"Bad credentials"}"#)
+            let threads = if extra_threads.is_empty() {
+                PR1_THREADS.to_string()
+            } else {
+                let mut threads: serde_json::Value = serde_json::from_str(PR1_THREADS).unwrap();
+                threads["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(extra_threads);
+                threads.to_string()
+            };
+            let (http, requests) = fake_github(move |request| {
+                if let Some(reply) = respond.as_ref().and_then(|respond| respond(request)) {
+                    return reply;
                 }
-                Some("ReviewThreads") => Reply::json(PR1_THREADS),
-                Some("ReviewSummaries") => Reply::json(PR1_SUMMARIES),
-                None if request.uri.contains("/pulls/1/files") => Reply::json(PR1_FILES),
-                _ => Reply::status(500, "{}"),
+                match request.operation() {
+                    Some("RepositoryContext") => repository_context_reply(request),
+                    Some("PullRequestDetails") => Reply::json(PR1_DETAILS),
+                    Some("ReviewThreads") if fail_threads.load(Ordering::SeqCst) => {
+                        Reply::status(401, r#"{"message":"Bad credentials"}"#)
+                    }
+                    Some("ReviewThreads") => Reply::json(threads.clone()),
+                    Some("ReviewSummaries") => Reply::json(PR1_SUMMARIES),
+                    None if request.uri.contains("/pulls/1/files") => Reply::json(PR1_FILES),
+                    _ => Reply::status(500, "{}"),
+                }
             });
             cx.update(|cx| {
                 cx.set_http_client(http);
@@ -1950,6 +2318,20 @@ mod tests {
             assert_eq!(requests_of(&requests, "ReviewThreads"), 2);
             assert!(remote_keys(&review, cx).is_empty());
 
+            // Another checkout reviewed the pull request since, and was closed (a `pr-N`
+            // worktree's window): the forge is resolved from one still open.
+            {
+                let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+                cx.run_until_parked();
+                let repository = project.read_with(cx, |project, cx| {
+                    project.active_repository(cx).unwrap()
+                });
+                pull_request.update(cx, |pull_request, _| {
+                    pull_request.add_checkout(&repository, &project)
+                });
+            }
+            cx.run_until_parked();
+
             // A new token: reloading resolves the forge again.
             fail_threads.store(false, Ordering::SeqCst);
             dispatch(ReloadPullRequest, cx);
@@ -1977,6 +2359,181 @@ mod tests {
             expected.sort();
             assert_eq!(keys, expected);
             assert!(requests_of(&requests, "ReviewThreads") > threads_loaded);
+        }
+
+        /// GitHub numbers new lines in the pull request's head commit, the review shows the
+        /// working tree: threads and comments are mapped through the checkout's changes, and
+        /// lines changed locally take neither.
+        #[gpui::test]
+        async fn test_threads_and_comments_follow_local_changes(cx: &mut TestAppContext) {
+            let fixture = Fixture {
+                local_edits: true,
+                ..Fixture::default()
+            };
+            let (_fs, workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            let rhs = rhs_editor(&review, cx);
+
+            // HEAD's line 134 is two rows down in the working tree.
+            let row = move_to_row_with_text(&rhs, "ENGINE 134", cx);
+            assert_eq!(row_text(&rhs, row, cx), "ENGINE 134");
+            assert_eq!(
+                thread_row(&review, SINGLE, cx),
+                (false, display_row(&rhs, row, cx) + 1)
+            );
+            // A line of the range changed locally: the thread is with the file's moved ones.
+            let filters_moved = RemoteKey::Moved(RepoPath::new("src/filters.rs").unwrap());
+            let keys = remote_keys(&review, cx);
+            assert!(keys.contains(&filters_moved), "{keys:?}");
+            assert!(!keys.contains(&thread(RANGE)));
+            let blocks = review.read_with(cx, |review, _| review.comments().clone());
+            blocks.read_with(cx, |blocks, cx| {
+                assert_eq!(
+                    blocks.remote_view(&filters_moved).unwrap().read(cx).locations(),
+                    [Some("Lines 20–25 at 3f22f1b · changed locally".into())]
+                );
+            });
+
+            // HEAD's line 59 is inside GitHub's hunks; the inserted lines and the edited one
+            // aren't in the pull request.
+            notification_count(&workspace, cx);
+            move_to_row_with_text(&rhs, "ENGINE 59", cx);
+            cx.simulate_keystrokes("c");
+            assert!(has_open_comment_editor(&review, cx));
+            cx.simulate_input("ok");
+            cx.simulate_keystrokes("ctrl-enter");
+            let targets = review.read_with(cx, |review, cx| {
+                review
+                    .session()
+                    .read(cx)
+                    .comments()
+                    .iter()
+                    .map(|comment| comment.target.clone())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                targets,
+                [CommentTarget::Lines {
+                    path: RepoPath::new("src/engine.rs").unwrap(),
+                    side: Side::New,
+                    lines: 61..=61,
+                }]
+            );
+            for row_text in ["local 1", "filter 22 edited"] {
+                move_to_row_with_text(&rhs, row_text, cx);
+                cx.simulate_keystrokes("c");
+                assert!(!has_open_comment_editor(&review, cx), "{row_text}");
+                assert_eq!(notification_count(&workspace, cx), 1, "{row_text}");
+            }
+
+            // Why: the tab's checkout decides.
+            let (pull_request, local_changes) = review.read_with(cx, |review, _| {
+                (
+                    review.pull_request().unwrap().clone(),
+                    review.local_changes().unwrap().clone(),
+                )
+            });
+            let head: Oid = PR1_HEAD_OID.parse().unwrap();
+            let other: Oid = C1.parse().unwrap();
+            let engine = |lines: std::ops::RangeInclusive<u32>| CommentTarget::Lines {
+                path: RepoPath::new("src/engine.rs").unwrap(),
+                side: Side::New,
+                lines,
+            };
+            let file = CommentTarget::File {
+                path: RepoPath::new("docs/guide.md").unwrap(),
+            };
+            cx.update(|_, cx| {
+                let check = |target: &CommentTarget, local_head: Oid| {
+                    pull_request.read(cx).check_comment(
+                        target,
+                        Some(local_head),
+                        local_changes.read(cx),
+                        cx,
+                    )
+                };
+                assert_eq!(check(&engine(61..=61), head), Ok(()));
+                assert_eq!(
+                    check(&engine(1..=3), head),
+                    Err("These lines have local changes, which the pull request doesn't have"
+                        .into())
+                );
+                // Line 100 of the working tree is HEAD's 98, outside GitHub's hunks.
+                assert_eq!(
+                    check(&engine(100..=100), head),
+                    Err("GitHub only accepts comments within its diff hunks".into())
+                );
+                assert_eq!(
+                    check(&engine(61..=61), other),
+                    Err("Check out the pull request's head 3f22f1b to comment on its lines: \
+                         GitHub numbers them in that commit"
+                        .into())
+                );
+                assert_eq!(check(&file, other), Ok(()));
+            });
+        }
+
+        /// Threads on one line are visited in the order their blocks show them (GitHub's), not
+        /// by their ids.
+        #[gpui::test]
+        async fn test_threads_on_one_line_in_display_order(cx: &mut TestAppContext) {
+            let second = serde_json::json!({
+                "id": "PRRT_aaa",
+                "isResolved": false,
+                "isOutdated": false,
+                "subjectType": "LINE",
+                "path": "src/engine.rs",
+                "line": 134,
+                "startLine": null,
+                "originalLine": 134,
+                "originalStartLine": null,
+                "diffSide": "RIGHT",
+                "startDiffSide": null,
+                "comments": {
+                    "totalCount": 1,
+                    "nodes": [{
+                        "id": "PRRC_aaa",
+                        "databaseId": 1,
+                        "body": "Another reviewer",
+                        "createdAt": "2026-10-17T04:00:00Z",
+                        "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r1",
+                        "state": "SUBMITTED",
+                        "commit": { "oid": PR1_HEAD_OID },
+                        "author": { "__typename": "User", "login": "someone" },
+                    }],
+                },
+            });
+            let fixture = Fixture {
+                extra_threads: vec![second],
+                ..Fixture::default()
+            };
+            let (_fs, _workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let (_, first_row) = thread_row(&review, SINGLE, cx);
+            let (_, second_row) = thread_row(&review, "PRRT_aaa", cx);
+            assert!(first_row < second_row, "{first_row} {second_row}");
+
+            let blocks = review.read_with(cx, |review, _| review.comments().clone());
+            let targeted = |id: &str, cx: &mut VisualTestContext| {
+                blocks.read_with(cx, |blocks, cx| {
+                    blocks
+                        .remote_view(&thread(id))
+                        .unwrap()
+                        .read(cx)
+                        .is_targeted()
+                })
+            };
+            move_to_row_with_text(&rhs, "ENGINE 100", cx);
+            cx.simulate_keystrokes("] t");
+            assert!(targeted(SINGLE, cx));
+            cx.simulate_keystrokes("] t");
+            assert!(targeted("PRRT_aaa", cx));
+            assert_eq!(cursor_line(&rhs, cx), "ENGINE 134");
+            cx.simulate_keystrokes("] t");
+            assert_eq!(cursor_line(&rhs, cx), "engine 193");
+            cx.simulate_keystrokes("[ t");
+            assert!(targeted("PRRT_aaa", cx));
+            cx.simulate_keystrokes("[ t");
+            assert!(targeted(SINGLE, cx));
         }
     }
 }

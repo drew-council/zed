@@ -8,7 +8,7 @@ use crate::{
     ToggleOutdatedThreads, ToggleResolvedThreads, ToggleSingleFileMode,
     comments::{
         CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
-        RemoteItem, RemoteKey, RemoteThreadContent, Side, thread_location,
+        RemoteItem, RemoteKey, RemoteThreadContent, Side, open_web_link, thread_location,
     },
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
@@ -20,7 +20,8 @@ use crate::{
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
     pull_request::{
-        PullRequestEvent, PullRequestState, ThreadFilters, ThreadPlacement, place_thread,
+        LineMapping, LocalChanges, LocalChangesEvent, PullRequestEvent, PullRequestState,
+        ThreadFilters, ThreadPlacement, place_thread,
     },
     reviewed::paint_reviewed_hunks,
     session::{ReviewKey, ReviewSession, ReviewSessionEvent},
@@ -114,10 +115,10 @@ pub(crate) fn register(workspace: &mut Workspace) {
             pull_request.update(cx, |pull_request, cx| pull_request.reload(cx));
         }
     });
-    workspace.register_action(|workspace, _: &OpenPullRequestInBrowser, _, cx| {
+    workspace.register_action(|workspace, _: &OpenPullRequestInBrowser, window, cx| {
         if let Some(pull_request) = current_pull_request(workspace, cx) {
             let url = pull_request.read(cx).details().url.clone();
-            cx.open_url(&url);
+            open_web_link(&url, window, cx);
         }
     });
 }
@@ -365,20 +366,48 @@ fn head_oid(repo: &Entity<Repository>, cx: &App) -> Option<Oid> {
 }
 
 /// The pull request's threads the filters let through, where a review with `local_head` checked
-/// out shows them: below their lines, or in their file's item of outdated and moved threads
-/// (after the inline ones, by path).
+/// out, whose files differ from it as `local` says, shows them: below their lines, or in their
+/// file's item of outdated and moved threads (after the inline ones, by path). New lines are
+/// numbered in HEAD on GitHub: a thread on lines changed in the working tree is moved, and one
+/// whose file hasn't been compared with HEAD yet waits for that.
 fn remote_items(
     pull_request: &Entity<PullRequestState>,
     local_head: Option<Oid>,
+    local: &Entity<LocalChanges>,
     cx: &App,
 ) -> Vec<RemoteItem> {
     let pull_request = pull_request.read(cx);
+    let local = local.read(cx);
     let filters = pull_request.filters();
     let commentable = pull_request.commentable();
     let mut items = Vec::new();
     let mut moved = BTreeMap::<RepoPath, Vec<RemoteThreadContent>>::new();
     for thread in pull_request.threads() {
-        match place_thread(thread, local_head, commentable, filters) {
+        let placement = match place_thread(thread, local_head, commentable, filters) {
+            Some(ThreadPlacement::Inline(CommentTarget::Lines {
+                path,
+                side: Side::New,
+                lines,
+            })) => match local.head_to_working(&path, lines, cx) {
+                LineMapping::Lines(lines) => Some(ThreadPlacement::Inline(CommentTarget::Lines {
+                    path,
+                    side: Side::New,
+                    lines,
+                })),
+                LineMapping::Changed => {
+                    let location = thread_location(thread, true)
+                        .map(|location| format!("{location} · changed locally").into());
+                    moved.entry(path).or_default().push(RemoteThreadContent {
+                        thread: thread.clone(),
+                        location,
+                    });
+                    continue;
+                }
+                LineMapping::Unknown => continue,
+            },
+            placement => placement,
+        };
+        match placement {
             None => {}
             Some(ThreadPlacement::Inline(target)) => items.push(RemoteItem {
                 key: RemoteKey::Thread(thread.id.clone()),
@@ -518,6 +547,11 @@ pub struct ReviewView {
     comments: Entity<CommentBlocks>,
     /// The pull request a pull request review is of, shared with its other tabs.
     pull_request: Option<Entity<PullRequestState>>,
+    /// How this tab's working tree differs from HEAD (pull request reviews), which GitHub's line
+    /// numbers count in.
+    local_changes: Option<Entity<LocalChanges>>,
+    /// The commit checked out when the pull request's threads were last placed.
+    checked_out: Option<Oid>,
     filters: ReviewFilters,
     /// The generated and vendored files among the review's files.
     attributes: HashMap<RepoPath, FileAttributes>,
@@ -696,8 +730,13 @@ impl ReviewView {
                             this.update_session(window, cx);
                         }
                         // Threads are placed by the checked-out commit, and the pull request may
-                        // have moved on too.
+                        // have moved on too. (The branch's upstream changing doesn't count.)
                         ReviewTarget::PullRequest(_) => {
+                            let head = head_oid(repo, cx);
+                            if head == this.checked_out {
+                                return;
+                            }
+                            this.checked_out = head;
                             this.diff.update(cx, |diff, cx| diff.check_base(cx));
                             this.update_remote_items(window, cx);
                             if let Some(pull_request) = &this.pull_request {
@@ -711,7 +750,12 @@ impl ReviewView {
                 },
             ),
         ];
-        if let Some(pull_request) = &pull_request {
+        let checked_out = head_oid(&repo, cx);
+        let local_changes = pull_request.as_ref().map(|pull_request| {
+            pull_request.update(cx, |pull_request, _| {
+                pull_request.add_checkout(&repo, &project)
+            });
+            let local_changes = cx.new(|_| LocalChanges::new(&project));
             subscriptions.push(cx.observe(pull_request, |_, _, cx| {
                 cx.emit(EditorEvent::TitleChanged);
                 cx.notify();
@@ -721,20 +765,37 @@ impl ReviewView {
                 window,
                 |this, _, _: &PullRequestEvent, window, cx| this.update_remote_items(window, cx),
             ));
-            // GitHub only takes comments on the lines of its diff hunks.
-            let gate_source = pull_request.downgrade();
-            session.update(cx, |session, _| {
-                session.set_comment_gate(Some(Arc::new(move |target, cx| {
-                    gate_source
-                        .read_with(cx, |pull_request, _| pull_request.check_comment(target))
-                        .unwrap_or(Ok(()))
-                })))
-            });
-            let items = remote_items(pull_request, head_oid(&repo, cx), cx);
+            subscriptions.push(cx.subscribe_in(
+                &local_changes,
+                window,
+                |this, _, _: &LocalChangesEvent, window, cx| this.update_remote_items(window, cx),
+            ));
+            let gate = {
+                let pull_request = pull_request.downgrade();
+                let repo = repo.downgrade();
+                let local_changes = local_changes.downgrade();
+                move |target: &CommentTarget, cx: &App| {
+                    let (Some(pull_request), Some(local_changes)) =
+                        (pull_request.upgrade(), local_changes.upgrade())
+                    else {
+                        return Ok(());
+                    };
+                    let local_head = repo.upgrade().and_then(|repo| head_oid(&repo, cx));
+                    pull_request.read(cx).check_comment(
+                        target,
+                        local_head,
+                        local_changes.read(cx),
+                        cx,
+                    )
+                }
+            };
+            let items = remote_items(pull_request, checked_out, &local_changes, cx);
             comments.update(cx, |comments, cx| {
+                comments.set_gate(Some(Arc::new(gate)));
                 comments.set_remote_items(items, window, cx)
             });
-        }
+            local_changes
+        });
         let splittable = diff.read(cx).editor().clone();
         subscriptions.extend([
             cx.subscribe_in(
@@ -769,6 +830,8 @@ impl ReviewView {
             previous_sessions: HashMap::default(),
             comments,
             pull_request,
+            local_changes,
+            checked_out,
             filters: ReviewFilters::default(),
             attributes: HashMap::default(),
             project,
@@ -788,10 +851,11 @@ impl ReviewView {
     /// Shows the pull request's threads again (they, the filters or the checked-out commit
     /// changed).
     fn update_remote_items(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pull_request) = &self.pull_request else {
+        let (Some(pull_request), Some(local_changes)) = (&self.pull_request, &self.local_changes)
+        else {
             return;
         };
-        let items = remote_items(pull_request, head_oid(&self.repo, cx), cx);
+        let items = remote_items(pull_request, head_oid(&self.repo, cx), local_changes, cx);
         self.comments.update(cx, |comments, cx| {
             comments.set_remote_items(items, window, cx)
         });
@@ -889,12 +953,19 @@ impl ReviewView {
             ReviewDiffEvent::FileListChanged => {
                 self.recompute_hidden(window, cx);
                 self.reload_attributes(window, cx);
+                self.sync_local_changes(cx);
             }
-            ReviewDiffEvent::FilesChanged => self.recompute_hidden(window, cx),
+            ReviewDiffEvent::FilesChanged => {
+                self.recompute_hidden(window, cx);
+                self.sync_local_changes(cx);
+            }
             ReviewDiffEvent::FileDiffChanged {
                 path_key,
                 newly_shown,
             } => {
+                if *newly_shown {
+                    self.sync_local_changes(cx);
+                }
                 let diff = self.diff.read(cx);
                 // A file without changes isn't listed, so its mark keeps the last diff it had:
                 // `git stash pop` brings it back reviewed.
@@ -925,6 +996,25 @@ impl ReviewView {
             }
         }
         cx.notify();
+    }
+
+    /// Compares the review's files with HEAD (pull request reviews).
+    fn sync_local_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(local_changes) = &self.local_changes else {
+            return;
+        };
+        let diff = self.diff.read(cx);
+        let files = diff
+            .files(cx)
+            .into_iter()
+            .filter_map(|file| Some((file.repo_path, diff.display_buffer(&file.path_key)?.clone())))
+            .collect();
+        local_changes.update(cx, |local_changes, cx| local_changes.sync(files, cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_changes(&self) -> Option<&Entity<LocalChanges>> {
+        self.local_changes.as_ref()
     }
 
     pub(crate) fn filters(&self) -> &ReviewFilters {

@@ -211,6 +211,8 @@ pub struct RemoteThread {
     pub anchor: ThreadAnchor,
     /// The commit the line numbers refer to (normally the pull request's head).
     pub anchor_commit: Option<Oid>,
+    /// The commit the thread was made on, which an outdated thread's original lines refer to.
+    pub original_commit: Option<Oid>,
     pub is_resolved: bool,
     pub is_outdated: bool,
     /// The first comments (up to 100), oldest first.
@@ -299,7 +301,7 @@ impl Hunk {
 
     /// The row's index in the hunk, in diff order.
     fn row_index(&self, side: DiffSide, line: u32) -> Option<u32> {
-        let mut index = 0;
+        let mut index: u32 = 0;
         for rows in &self.rows {
             let start = match (side, rows.kind) {
                 (DiffSide::Left, HunkRowKind::Context | HunkRowKind::Deleted) => {
@@ -314,9 +316,9 @@ impl Hunk {
                 && line >= start
                 && line - start < rows.len
             {
-                return Some(index + line - start);
+                return Some(index.saturating_add(line - start));
             }
-            index += rows.len;
+            index = index.saturating_add(rows.len);
         }
         None
     }
@@ -347,7 +349,9 @@ impl ChangedFile {
             // ones, which is right for a hunk with one change.
             let row = hunk.row_index(side, line).unwrap_or(match side {
                 DiffSide::Left => line - hunk.old.start,
-                DiffSide::Right => hunk.old.len() as u32 + line - hunk.new.start,
+                DiffSide::Right => {
+                    (line - hunk.new.start).saturating_add(hunk.old.end - hunk.old.start)
+                }
             });
             Some((hunk_index, row))
         })

@@ -138,6 +138,9 @@ query ReviewThreads($owner: String!, $name: String!, $number: Int!, $after: Stri
               commit {
                 oid
               }
+              originalCommit {
+                oid
+              }
               author {
                 __typename
                 login

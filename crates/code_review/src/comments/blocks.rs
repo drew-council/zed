@@ -38,6 +38,9 @@ use ui::prelude::*;
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{Toast, Workspace, notifications::NotificationId};
 
+/// Refuses a comment the review tab can't take, saying why.
+pub(crate) type CommentGate = Arc<dyn Fn(&CommentTarget, &App) -> Result<(), SharedString>>;
+
 pub(crate) enum CommentBlocksEvent {
     /// A comment editor opened or closed, which the review tab's capability follows.
     EditingChanged,
@@ -68,6 +71,9 @@ pub(crate) struct CommentBlocks {
     /// the cursor stays on it.
     selected: Option<ItemKey>,
     targeted: Option<ItemKey>,
+    /// Refuses comments the review can't take (a pull request review: lines outside GitHub's
+    /// diff, or lines this tab's checkout numbers differently).
+    gate: Option<CommentGate>,
     focus_guard: Option<Subscription>,
     _session_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
@@ -112,6 +118,12 @@ struct RemoteBlock {
 
 /// Comments come after the threads at the same place, in creation order.
 const COMMENT_BLOCK_PRIORITY: usize = 1 << 20;
+
+fn comment_block_priority(id: CommentId) -> usize {
+    usize::try_from(id.0)
+        .unwrap_or(usize::MAX)
+        .saturating_add(COMMENT_BLOCK_PRIORITY)
+}
 
 /// The side of the diff a block is in. Old-side comments are on the left side of a split diff
 /// and on the removed rows of a unified one; everything else is on the right side.
@@ -260,6 +272,7 @@ impl CommentBlocks {
             lhs_editor_id,
             selected: None,
             targeted: None,
+            gate: None,
             focus_guard: None,
             _session_subscription: session_subscription,
             _subscriptions: subscriptions,
@@ -305,6 +318,10 @@ impl CommentBlocks {
         }
         cx.emit(CommentBlocksEvent::EditingChanged);
         cx.notify();
+    }
+
+    pub(crate) fn set_gate(&mut self, gate: Option<CommentGate>) {
+        self.gate = gate;
     }
 
     fn handle_session_event(
@@ -508,7 +525,7 @@ impl CommentBlocks {
             .comments()
             .iter()
             .filter(|comment| comment.target == CommentTarget::Review)
-            .filter(|comment| self.is_listed(comment, cx))
+            .filter(|comment| self.is_shown(comment, cx))
             .filter_map(|comment| self.views.get(&comment.id).cloned())
             .collect()
     }
@@ -517,6 +534,12 @@ impl CommentBlocks {
     /// written in some tab of the review. The other tabs don't show it.
     pub(crate) fn is_listed(&self, comment: &Comment, cx: &App) -> bool {
         !comment.body.is_empty() || self.is_editing_comment(comment.id, cx)
+    }
+
+    /// Whether the comment shows in the diff (or in the top block). Submitted comments are the
+    /// pull request's threads now, which show instead.
+    fn is_shown(&self, comment: &Comment, cx: &App) -> bool {
+        self.is_listed(comment, cx) && !comment.is_submitted()
     }
 
     fn is_editing_comment(&self, id: CommentId, cx: &App) -> bool {
@@ -578,7 +601,7 @@ impl CommentBlocks {
             let comments = session
                 .comments()
                 .iter()
-                .filter(|comment| self.is_listed(comment, cx))
+                .filter(|comment| self.is_shown(comment, cx))
                 .filter_map(|comment| {
                     let anchor = self
                         .anchors
@@ -624,9 +647,7 @@ impl CommentBlocks {
             .filter(|(key, _)| !self.hosted.contains_key(key))
             .filter_map(|(key, (host, placement))| {
                 let priority = match &key {
-                    ItemKey::Comment(id) => usize::try_from(id.0)
-                        .unwrap_or(usize::MAX)
-                        .saturating_add(COMMENT_BLOCK_PRIORITY),
+                    ItemKey::Comment(id) => comment_block_priority(*id),
                     ItemKey::Remote(remote) => self.remote.get(remote)?.order,
                 };
                 Some((
@@ -985,8 +1006,7 @@ impl CommentBlocks {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let gate = self.session.read(cx).comment_gate().cloned();
-        if let Some(gate) = gate
+        if let Some(gate) = &self.gate
             && let Err(reason) = gate(&new_comment.target, cx)
         {
             self.show_toast(reason, cx);
@@ -1397,7 +1417,7 @@ impl CommentBlocks {
                     .read(cx)
                     .comments()
                     .iter()
-                    .any(|comment| self.is_listed(comment, cx));
+                    .any(|comment| self.is_shown(comment, cx));
             self.show_toast(
                 if has_comments {
                     "No comments in the diff"
@@ -1412,7 +1432,7 @@ impl CommentBlocks {
         let current = self
             .items_at_cursor(cx)
             .and_then(|at_cursor| self.selected.clone().filter(|key| at_cursor.contains(key)))
-            .and_then(|key| items.iter().find(|item| item.3 == key).cloned());
+            .and_then(|key| items.iter().find(|item| item.4 == key).cloned());
         let target = match &current {
             Some(current) => match direction {
                 Direction::Next => items.iter().find(|item| *item > current),
@@ -1446,10 +1466,11 @@ impl CommentBlocks {
     }
 
     /// The line and file comments and the threads in the order of the diff: by file, file
-    /// comments first, then by the new file's line (old lines at the new line they face).
+    /// comments first, then by the new file's line (old lines at the new line they face), then
+    /// in the order their blocks show at one place (threads in GitHub's order, then comments).
     /// Comments in files the filters hide, and comments on lines the diff doesn't show, are left
     /// out.
-    fn comment_order(&self, cx: &App) -> Vec<(usize, i64, Side, ItemKey)> {
+    fn comment_order(&self, cx: &App) -> Vec<(usize, i64, Side, usize, ItemKey)> {
         let diff = self.diff.read(cx);
         let order = diff.file_order();
         let rhs = self.rhs_editor(cx);
@@ -1499,7 +1520,7 @@ impl CommentBlocks {
             .read(cx)
             .comments()
             .iter()
-            .filter(|comment| self.is_listed(comment, cx))
+            .filter(|comment| self.is_shown(comment, cx))
             .filter_map(|comment| {
                 let anchor = self
                     .anchors
@@ -1507,11 +1528,17 @@ impl CommentBlocks {
                     .get(&comment.id)
                     .map(|anchor| &anchor.range);
                 let (file_index, row, side) = position(&comment.target, anchor)?;
-                Some((file_index, row, side, ItemKey::Comment(comment.id)))
+                Some((
+                    file_index,
+                    row,
+                    side,
+                    comment_block_priority(comment.id),
+                    ItemKey::Comment(comment.id),
+                ))
             });
         let remote = self.remote.iter().filter_map(|(key, block)| {
             let (file_index, row, side) = position(&block.target, block.anchor.as_ref())?;
-            Some((file_index, row, side, ItemKey::Remote(key.clone())))
+            Some((file_index, row, side, block.order, ItemKey::Remote(key.clone())))
         });
         let mut items = comments.chain(remote).collect::<Vec<_>>();
         items.sort();

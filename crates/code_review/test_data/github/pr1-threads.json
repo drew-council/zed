@@ -33,6 +33,9 @@
                     "commit": {
                       "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
                     },
+                    "originalCommit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
+                    },
                     "author": {
                       "__typename": "User",
                       "login": "drew-council"
@@ -47,6 +50,9 @@
                     "state": "SUBMITTED",
                     "commit": {
                       "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "originalCommit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
                     },
                     "author": {
                       "__typename": "User",
@@ -81,6 +87,9 @@
                     "commit": {
                       "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
                     },
+                    "originalCommit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
+                    },
                     "author": {
                       "__typename": "User",
                       "login": "drew-council"
@@ -114,6 +123,9 @@
                     "commit": {
                       "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
                     },
+                    "originalCommit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
+                    },
                     "author": {
                       "__typename": "User",
                       "login": "drew-council"
@@ -145,6 +157,9 @@
                     "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301011963",
                     "state": "SUBMITTED",
                     "commit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
+                    },
+                    "originalCommit": {
                       "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
                     },
                     "author": {
@@ -180,6 +195,9 @@
                     "commit": {
                       "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
                     },
+                    "originalCommit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
+                    },
                     "author": {
                       "__typename": "User",
                       "login": "drew-council"
@@ -213,6 +231,9 @@
                     "commit": {
                       "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
                     },
+                    "originalCommit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
+                    },
                     "author": {
                       "__typename": "User",
                       "login": "drew-council"
@@ -244,6 +265,9 @@
                     "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301014871",
                     "state": "SUBMITTED",
                     "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "originalCommit": {
                       "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
                     },
                     "author": {

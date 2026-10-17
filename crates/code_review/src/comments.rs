@@ -3,7 +3,9 @@ mod remote;
 mod view;
 
 pub(crate) use blocks::{CommentBlocks, CommentBlocksEvent, ItemKey, RemoteItem, RemoteKey};
-pub(crate) use remote::{RemoteThreadContent, thread_location};
+pub(crate) use remote::{
+    HoveredLink, RemoteThreadContent, open_web_link, thread_location, untrusted_markdown,
+};
 
 use anyhow::{Context as _, Result};
 use git::repository::RepoPath;

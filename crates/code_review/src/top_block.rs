@@ -1,5 +1,5 @@
 use crate::{
-    comments::CommentBlocks,
+    comments::{CommentBlocks, HoveredLink, open_web_link, untrusted_markdown},
     commits::CommitChain,
     diff::ReviewDiff,
     forge::{ForgeRepo, PullRequestStatus, RemoteReviewSummary, ReviewDecision, ReviewState},
@@ -34,6 +34,7 @@ pub(crate) struct ReviewTopBlock {
     markdown: HashMap<SharedString, Entity<Markdown>>,
     scroll_handle: ScrollHandle,
     comments_scroll_handle: ScrollHandle,
+    hovered_link: HoveredLink,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -109,6 +110,7 @@ impl ReviewTopBlock {
             markdown: HashMap::default(),
             scroll_handle: ScrollHandle::new(),
             comments_scroll_handle: ScrollHandle::new(),
+            hovered_link: HoveredLink::default(),
             _subscriptions: subscriptions,
         };
         this.sync_pull_request_markdown(cx);
@@ -408,10 +410,13 @@ impl ReviewTopBlock {
                 IconButton::new("review-pull-request-open", IconName::ArrowUpRight)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Open on GitHub"))
+                    .tooltip({
+                        let url = url.clone();
+                        move |_, cx| Tooltip::with_meta("Open on GitHub", None, url.clone(), cx)
+                    })
                     .on_click({
                         let url = url.clone();
-                        move |_, _, cx| cx.open_url(&url)
+                        move |_, window, cx| open_web_link(&url, window, cx)
                     }),
             );
         let warnings = moved_head
@@ -450,13 +455,14 @@ impl ReviewTopBlock {
                 .iter()
                 .filter_map(|summary| {
                     let markdown = self.markdown.get(&summary.id)?.clone();
-                    Some(render_summary(
-                        summary,
+                    let body = untrusted_markdown(
                         markdown,
-                        timezone,
                         markdown_style.clone(),
+                        summary.id.clone(),
+                        |this: &mut Self| &mut this.hovered_link,
                         cx,
-                    ))
+                    );
+                    Some(render_summary(summary, body, timezone, cx))
                 })
                 .collect::<Vec<_>>();
             v_flex()
@@ -468,7 +474,7 @@ impl ReviewTopBlock {
                         .tooltip(Tooltip::text("Open on GitHub"))
                         .on_click({
                             let url = url.clone();
-                            move |_, _, cx| cx.open_url(&url)
+                            move |_, window, cx| open_web_link(&url, window, cx)
                         }),
                 )
                 .child(
@@ -487,7 +493,13 @@ impl ReviewTopBlock {
                                     Some(description) => div()
                                         .w_full()
                                         .text_sm()
-                                        .child(MarkdownElement::new(description, markdown_style))
+                                        .child(untrusted_markdown(
+                                            description,
+                                            markdown_style,
+                                            DESCRIPTION_KEY,
+                                            |this: &mut Self| &mut this.hovered_link,
+                                            cx,
+                                        ))
                                         .into_any_element(),
                                     None => Label::new("No description provided.")
                                         .size(LabelSize::Small)
@@ -658,7 +670,16 @@ impl ReviewTopBlock {
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll_handle)
                             .children(commits.iter().map(|commit| {
-                                render_commit(commit, timezone, markdown_style.clone(), cx)
+                                let body = commit.body.clone().map(|body| {
+                                    untrusted_markdown(
+                                        body,
+                                        markdown_style.clone(),
+                                        SharedString::from(commit.data.sha.to_string()),
+                                        |this: &mut Self| &mut this.hovered_link,
+                                        cx,
+                                    )
+                                });
+                                render_commit(commit, body, timezone, cx)
                             }))
                             .when(*truncated, |list| {
                                 list.child(
@@ -693,9 +714,8 @@ fn badge(label: &'static str, color: Color, cx: &App) -> impl IntoElement {
 
 fn render_summary(
     summary: &RemoteReviewSummary,
-    markdown: Entity<Markdown>,
+    body: MarkdownElement,
     timezone: UtcOffset,
-    markdown_style: markdown::MarkdownStyle,
     cx: &App,
 ) -> AnyElement {
     let state = match summary.state {
@@ -737,19 +757,14 @@ fn render_summary(
                     .color(Color::Muted),
                 ),
         )
-        .child(
-            div()
-                .pt_0p5()
-                .text_sm()
-                .child(MarkdownElement::new(markdown, markdown_style)),
-        )
+        .child(div().pt_0p5().text_sm().child(body))
         .into_any_element()
 }
 
 fn render_commit(
     commit: &TopBlockCommit,
+    body: Option<MarkdownElement>,
     timezone: UtcOffset,
-    markdown_style: markdown::MarkdownStyle,
     cx: &App,
 ) -> AnyElement {
     let data = &commit.data;
@@ -784,13 +799,8 @@ fn render_commit(
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
-        .when_some(commit.body.clone(), |element, body| {
-            element.child(
-                div()
-                    .pt_1()
-                    .text_sm()
-                    .child(MarkdownElement::new(body, markdown_style)),
-            )
+        .when_some(body, |element, body| {
+            element.child(div().pt_1().text_sm().child(body))
         })
         .into_any_element()
 }
@@ -822,7 +832,9 @@ impl Render for ReviewTopBlock {
         if content.is_none() && review_comments.is_empty() {
             return div().into_any_element();
         }
+        let hovered_link = self.hovered_link.render(cx);
         v_flex()
+            .relative()
             .w_full()
             .flex_none()
             .px_3()
@@ -859,6 +871,7 @@ impl Render for ReviewTopBlock {
                         ),
                 )
             })
+            .children(hovered_link)
             .into_any_element()
     }
 }

@@ -17,7 +17,6 @@ use language::{Anchor, BufferSnapshot};
 use std::{
     future::Future,
     ops::{Range, RangeInclusive},
-    sync::Arc,
 };
 use util::ResultExt as _;
 
@@ -35,10 +34,6 @@ pub struct ReviewKey(pub SharedString);
 struct ReviewSessions(HashMap<ReviewKey, WeakEntity<ReviewSession>>);
 
 impl Global for ReviewSessions {}
-
-/// Refuses a comment the review can't take, saying why: a pull request only takes comments on
-/// lines inside GitHub's diff hunks.
-pub(crate) type CommentGate = Arc<dyn Fn(&CommentTarget, &App) -> Result<(), SharedString>>;
 
 /// Set once old reviews have been pruned in this run.
 struct PrunedOldReviews;
@@ -70,8 +65,6 @@ pub(crate) struct ReviewSession {
     /// the text changed. Other tabs (maybe another project's buffers with other unsaved edits)
     /// take the result as is.
     unchecked: HashSet<CommentId>,
-    /// Shared by the review's tabs, like the comments.
-    comment_gate: Option<CommentGate>,
     _load_task: Task<()>,
 }
 
@@ -146,7 +139,6 @@ impl ReviewSession {
             comments: CommentStore::default(),
             moved_comments: HashSet::default(),
             unchecked: HashSet::default(),
-            comment_gate: None,
             _load_task: load_task,
         }
     }
@@ -339,14 +331,6 @@ impl ReviewSession {
 impl ReviewSession {
     pub(crate) fn comments(&self) -> &CommentStore {
         &self.comments
-    }
-
-    pub(crate) fn set_comment_gate(&mut self, gate: Option<CommentGate>) {
-        self.comment_gate = gate;
-    }
-
-    pub(crate) fn comment_gate(&self) -> Option<&CommentGate> {
-        self.comment_gate.as_ref()
     }
 
     /// Adds a comment, which is saved once it has text. `None` until the stored comments are

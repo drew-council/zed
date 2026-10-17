@@ -2,10 +2,98 @@ use crate::forge::{DiffSide, RemoteThread, ThreadAnchor};
 use editor::hover_markdown_style;
 use gpui::Entity;
 use language::LanguageRegistry;
-use markdown::{Markdown, MarkdownElement};
+use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
-use ui::{Tooltip, prelude::*};
+use ui::{LinkPreview, Tooltip, prelude::*};
+use util::ResultExt as _;
+use workspace::{Toast, Workspace, notifications::NotificationId};
+
+/// Opens a link only when it is a web page. Pull requests, their reviews and commits can be
+/// written by anyone, and a link there may name a local file or another application's URL scheme
+/// behind any text; so may a URL a GitHub server sent.
+pub(crate) fn open_web_link(url: &str, window: &mut Window, cx: &mut App) {
+    if is_web_link(url) {
+        cx.open_url(url);
+        return;
+    }
+    log::warn!("not opening {url:?}: only web links open from a review");
+    if let Some(workspace) = Workspace::for_window(window, cx) {
+        let message = format!("Not opening {url}: only http and https links open from a review");
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(NotificationId::unique::<HoveredLink>(), message).autohide(),
+                cx,
+            )
+        });
+    }
+}
+
+fn is_web_link(url: &str) -> bool {
+    http_client::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// The link under the mouse in one of a view's markdown texts (by the text's key), whose
+/// destination the view shows.
+#[derive(Default)]
+pub(crate) struct HoveredLink(Option<(SharedString, SharedString)>);
+
+impl HoveredLink {
+    /// Whether anything changed.
+    fn set(&mut self, key: &SharedString, url: Option<SharedString>) -> bool {
+        match url {
+            Some(url) => {
+                let hovered = Some((key.clone(), url));
+                let changed = self.0 != hovered;
+                self.0 = hovered;
+                changed
+            }
+            // Every text hears every mouse move; only the one that was hovered clears it.
+            None if self.0.as_ref().is_some_and(|(hovered, _)| hovered == key) => {
+                self.0 = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Where the hovered link goes, in the bottom left corner of a `relative` container.
+    pub(crate) fn render(&self, cx: &mut App) -> Option<impl IntoElement + use<>> {
+        let (_, url) = self.0.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .max_w_full()
+                .overflow_hidden()
+                .child(LinkPreview::new(url, cx)),
+        )
+    }
+}
+
+/// Markdown someone else wrote: its links show where they go while hovered (in the view's
+/// [`HoveredLink`], under `key`) and only open web pages.
+pub(crate) fn untrusted_markdown<V: 'static>(
+    markdown: Entity<Markdown>,
+    style: MarkdownStyle,
+    key: impl Into<SharedString>,
+    hovered_link: fn(&mut V) -> &mut HoveredLink,
+    cx: &Context<V>,
+) -> MarkdownElement {
+    let view = cx.weak_entity();
+    let key = key.into();
+    MarkdownElement::new(markdown, style)
+        .on_url_click(|url, window, cx| open_web_link(&url, window, cx))
+        .on_url_hover(move |url, _, cx| {
+            view.update(cx, |view, cx| {
+                if hovered_link(view).set(&key, url) {
+                    cx.notify();
+                }
+            })
+            .log_err();
+        })
+}
 
 /// A review thread of the pull request on GitHub, in a block of the diff (read-only), or a file's
 /// outdated and moved threads together in one block at the file.
@@ -16,6 +104,7 @@ pub(crate) struct RemoteThreadView {
     /// The thread at the cursor, which `]t` moved to.
     targeted: bool,
     language_registry: Arc<LanguageRegistry>,
+    hovered_link: HoveredLink,
 }
 
 /// What a [`RemoteThreadView`] shows of a thread.
@@ -44,6 +133,7 @@ impl RemoteThreadView {
             threads: Vec::new(),
             targeted: false,
             language_registry,
+            hovered_link: HoveredLink::default(),
         };
         this.set_threads(title, threads, cx);
         this
@@ -111,7 +201,7 @@ impl RemoteThreadView {
         entry: &ThreadEntry,
         show_source: bool,
         window: &mut Window,
-        cx: &App,
+        cx: &Context<Self>,
     ) -> impl IntoElement {
         let thread = &entry.content.thread;
         let url = thread
@@ -160,8 +250,11 @@ impl RemoteThreadView {
                     IconButton::new(("review-thread-open", index), IconName::ArrowUpRight)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Open on GitHub"))
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                        .tooltip({
+                            let url = url.clone();
+                            move |_, cx| Tooltip::with_meta("Open on GitHub", None, url.clone(), cx)
+                        })
+                        .on_click(move |_, window, cx| open_web_link(&url, window, cx)),
                 )
             });
         v_flex()
@@ -201,11 +294,13 @@ impl RemoteThreadView {
                                         .color(Color::Muted),
                                 ),
                         )
-                        .child(
-                            div()
-                                .w_full()
-                                .child(MarkdownElement::new(body.clone(), markdown_style.clone())),
-                        )
+                        .child(div().w_full().child(untrusted_markdown(
+                            body.clone(),
+                            markdown_style.clone(),
+                            format!("{index}-{comment_index}"),
+                            |view: &mut Self| &mut view.hovered_link,
+                            cx,
+                        )))
                 },
             ))
             .when(more > 0, |thread| {
@@ -236,20 +331,28 @@ pub(crate) fn thread_location(thread: &RemoteThread, is_moved: bool) -> Option<S
             format!("{many} {start}–{end}")
         }
     };
-    let at_commit = thread
-        .anchor_commit
-        .map(|commit| format!(" at {}", commit.display_short()))
-        .unwrap_or_default();
+    let at = |commit: Option<git::Oid>| {
+        commit
+            .map(|commit| format!(" at {}", commit.display_short()))
+            .unwrap_or_default()
+    };
+    let at_commit = at(thread.anchor_commit);
     let location = match &thread.anchor {
         ThreadAnchor::File => "File comment".to_string(),
+        // The original lines count in the commit the thread was made on; pushes since moved
+        // `anchor_commit` along until the lines changed.
         ThreadAnchor::Outdated {
             original_line,
             original_start,
         } => match (original_start, original_line) {
-            (Some(start), Some(line)) if start < line => {
-                format!("Originally lines {start}–{line}{at_commit}")
-            }
-            (_, Some(line)) => format!("Originally line {line}{at_commit}"),
+            (Some(start), Some(line)) if start < line => format!(
+                "Originally lines {start}–{line}{}",
+                at(thread.original_commit.or(thread.anchor_commit))
+            ),
+            (_, Some(line)) => format!(
+                "Originally line {line}{}",
+                at(thread.original_commit.or(thread.anchor_commit))
+            ),
             (_, None) => "Outdated".to_string(),
         },
         ThreadAnchor::Line { side, line } => {
@@ -314,6 +417,7 @@ impl Render for RemoteThreadView {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
+        let hovered_link = self.hovered_link.render(cx);
         let colors = cx.theme().colors();
         let border = if self.targeted {
             colors.border_focused
@@ -321,6 +425,7 @@ impl Render for RemoteThreadView {
             colors.border_variant
         };
         h_flex()
+            .relative()
             .w_full()
             .items_stretch()
             .overflow_hidden()
@@ -358,5 +463,41 @@ impl Render for RemoteThreadView {
                     })
                     .children(threads),
             )
+            .children(hovered_link)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_only_web_links_open() {
+        assert!(is_web_link("https://github.com/o/r/pull/1"));
+        assert!(is_web_link("http://ghe.corp:8080/o/r"));
+        for url in [
+            "file:///etc/passwd",
+            "zed://review?repo=/tmp",
+            "vscode://file/x",
+            "javascript:alert(1)",
+            "/relative/path",
+            "#anchor",
+            "",
+        ] {
+            assert!(!is_web_link(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn test_hovered_link_per_text() {
+        let mut hovered = HoveredLink::default();
+        let (description, summary) = (SharedString::from("a"), SharedString::from("b"));
+        assert!(hovered.set(&description, Some("https://x".into())));
+        assert!(!hovered.set(&description, Some("https://x".into())));
+        // Another text, not hovered, doesn't clear it; the hovered one does.
+        assert!(!hovered.set(&summary, None));
+        assert_eq!(hovered.0, Some((description.clone(), "https://x".into())));
+        assert!(hovered.set(&description, None));
+        assert_eq!(hovered.0, None);
     }
 }
