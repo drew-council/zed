@@ -720,25 +720,23 @@ impl StartReviewDelegate {
             .log_err();
     }
 
+    /// `in_new_worktree`: the secondary confirm, "Review in Worktree".
     fn open_pull_request(
         &self,
         reference: PullRequestReference,
-        _secondary: bool,
+        in_new_worktree: bool,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
         cx.emit(DismissEvent);
         let repo = self.repo.clone();
+        let options = OpenPullRequestOptions {
+            in_new_worktree,
+            ..OpenPullRequestOptions::default()
+        };
         self.workspace
             .update(cx, |workspace, cx| {
-                open_pull_request_and_notify(
-                    workspace,
-                    repo,
-                    reference,
-                    OpenPullRequestOptions::default(),
-                    window,
-                    cx,
-                );
+                open_pull_request_and_notify(workspace, repo, reference, options, window, cx);
             })
             .log_err();
     }
@@ -1238,6 +1236,21 @@ impl PickerDelegate for StartReviewDelegate {
                                     })),
                             )
                         })
+                        .when(
+                            matches!(
+                                selected,
+                                Some(EntryKey::PullRequest(_) | EntryKey::OpenReference)
+                            ),
+                            |buttons| {
+                                buttons.child(
+                                    Button::new("start-review-in-worktree", "Review in Worktree")
+                                        .key_binding(key_binding(&menu::SecondaryConfirm, cx))
+                                        .on_click(cx.listener(|picker, _, window, cx| {
+                                            picker.delegate.confirm(true, window, cx)
+                                        })),
+                                )
+                            },
+                        )
                         .when(matches!(selected, Some(EntryKey::Commit(_))), |buttons| {
                             buttons.child(
                                 Button::new("start-review-select-range", "Select Range")
