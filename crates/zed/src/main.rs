@@ -1256,6 +1256,17 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 })
                 .detach_and_log_err(cx);
             }
+            OpenRequestKind::Review { url } => {
+                let open_options = zed::open_options_for_request(
+                    request.open_behavior,
+                    &workspace::SerializedWorkspaceLocation::Local,
+                    cx,
+                );
+                cx.spawn(async move |cx| {
+                    code_review::cli::open_review_link(url, open_options, app_state, cx).await
+                })
+                .detach();
+            }
         }
 
         return;

@@ -321,6 +321,76 @@ fn validate_revision(revision: &str) -> Result<String> {
     Ok(revision.to_string())
 }
 
+/// A review target as named on the command line (`zed --review TARGET`) or in a `zed://review`
+/// link, before anything in the repository is resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TargetSpec {
+    Uncommitted,
+    /// `None`: the repository's default branch.
+    Branch {
+        base: Option<BranchBase>,
+    },
+    Commits(CommitSpec),
+    PullRequest(PullRequestReference),
+}
+
+const MAX_TARGET_LENGTH: usize = 1024;
+
+/// Parses `uncommitted`, `branch`, `branch:BASE`, `commit:REV`, `commits:A..B`, `pr:N`,
+/// `OWNER/REPO#N` and pull request URLs.
+pub(crate) fn parse_target_spec(input: &str) -> Result<TargetSpec> {
+    let input = input.trim();
+    if input.len() > MAX_TARGET_LENGTH {
+        bail!("The review target is longer than {MAX_TARGET_LENGTH} bytes");
+    }
+    if input == "uncommitted" {
+        return Ok(TargetSpec::Uncommitted);
+    }
+    if input == "branch" {
+        return Ok(TargetSpec::Branch { base: None });
+    }
+    if let Some(base) = input.strip_prefix("branch:") {
+        return Ok(TargetSpec::Branch {
+            base: Some(BranchBase::new(base.to_string())?),
+        });
+    }
+    if let Some(commit) = input.strip_prefix("commit:") {
+        return match parse_commit_spec(commit)? {
+            spec @ CommitSpec::Single(_) => Ok(TargetSpec::Commits(spec)),
+            CommitSpec::Range { .. } => bail!("commit: takes one commit; use commits:A..B"),
+        };
+    }
+    if let Some(commits) = input.strip_prefix("commits:") {
+        return match parse_commit_spec(commits)? {
+            spec @ CommitSpec::Range { .. } => Ok(TargetSpec::Commits(spec)),
+            CommitSpec::Single(_) => bail!("commits: takes a range A..B; use commit:REV"),
+        };
+    }
+    // A short commit sha can be all digits too, so a bare number is neither.
+    if !input.is_empty() && input.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!(
+            "{input:?} isn't a review target: did you mean pr:{input}? (A commit is commit:{input}.)"
+        );
+    }
+    let is_pull_request = input.starts_with("pr:")
+        || input.starts_with("https://")
+        || input.starts_with("http://")
+        || input.contains('#');
+    if is_pull_request {
+        return parse_pull_request_reference(input)
+            .map(TargetSpec::PullRequest)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{input:?} isn't a pull request: use pr:N, OWNER/REPO#N or a pull request URL"
+                )
+            });
+    }
+    bail!(
+        "Unknown review target {input:?}. Use uncommitted, branch, branch:BASE, commit:REV, \
+         commits:A..B, pr:N, OWNER/REPO#N or a pull request URL."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +556,91 @@ mod tests {
                 "{invalid:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_target_spec() {
+        let parse = |input: &str| parse_target_spec(input).unwrap();
+        let error = |input: &str| parse_target_spec(input).unwrap_err().to_string();
+        let base = |name: &str| Some(BranchBase::new(name).unwrap());
+        assert_eq!(parse("uncommitted"), TargetSpec::Uncommitted);
+        assert_eq!(parse(" uncommitted\n"), TargetSpec::Uncommitted);
+        assert_eq!(parse("branch"), TargetSpec::Branch { base: None });
+        assert_eq!(
+            parse("branch:origin/main"),
+            TargetSpec::Branch {
+                base: base("origin/main")
+            }
+        );
+        assert_eq!(
+            parse("commit:HEAD~1"),
+            TargetSpec::Commits(CommitSpec::Single("HEAD~1".into()))
+        );
+        assert_eq!(
+            parse("commits:HEAD~2..HEAD"),
+            TargetSpec::Commits(CommitSpec::Range {
+                from: "HEAD~2".into(),
+                to: "HEAD".into()
+            })
+        );
+        let pull_request =
+            |input: &str| TargetSpec::PullRequest(parse_pull_request_reference(input).unwrap());
+        for input in [
+            "pr:6",
+            "#6",
+            "drew-council/code-review-sandbox#6",
+            "https://github.com/drew-council/code-review-sandbox/pull/6",
+            "https://github.com/o/r/pull/6/files?diff=split#r1",
+        ] {
+            assert_eq!(parse(input), pull_request(input), "{input}");
+        }
+
+        assert_eq!(error("branch:"), "Invalid base \"\"");
+        assert_eq!(error("branch:-x"), "Invalid base \"-x\"");
+        assert_eq!(error("branch:a b"), "Invalid base \"a b\"");
+        assert_eq!(
+            error("commit:a..b"),
+            "commit: takes one commit; use commits:A..B"
+        );
+        assert_eq!(
+            error("commits:a"),
+            "commits: takes a range A..B; use commit:REV"
+        );
+        assert_eq!(
+            error("commits:a...b"),
+            "Use A..B for a commit range; A...B is not supported"
+        );
+        assert_eq!(error("commit:"), "No commit given");
+        assert_eq!(
+            error("123"),
+            "\"123\" isn't a review target: did you mean pr:123? (A commit is commit:123.)"
+        );
+        for invalid in [
+            "pr:0",
+            "pr:",
+            "pr:x",
+            "o#1",
+            "https://github.com/o/r/issues/1",
+        ] {
+            assert_eq!(
+                error(invalid),
+                format!(
+                    "{invalid:?} isn't a pull request: use pr:N, OWNER/REPO#N or a pull request URL"
+                )
+            );
+        }
+        for unknown in ["", "bogus", "Uncommitted", "branches", "HEAD"] {
+            assert!(
+                error(unknown).starts_with("Unknown review target"),
+                "{unknown:?}: {}",
+                error(unknown)
+            );
+        }
+        assert_eq!(
+            error(&format!("branch:{}", "a".repeat(1018))),
+            "The review target is longer than 1024 bytes"
+        );
+        assert!(parse_target_spec(&format!("branch:{}", "a".repeat(1017))).is_ok());
     }
 
     #[test]

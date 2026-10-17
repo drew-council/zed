@@ -491,7 +491,6 @@ impl ReviewSession {
 
     /// Resolves once the review is submitted or finished; canceled when every tab of the review
     /// is closed first (the session is released).
-    #[allow(dead_code, reason = "the CLI's `--wait` (milestone 8) waits for it")]
     pub(crate) fn wait_for_outcome(&mut self) -> oneshot::Receiver<ReviewOutcome> {
         let (sender, receiver) = oneshot::channel();
         self.outcome_waiters.retain(|waiter| !waiter.is_canceled());

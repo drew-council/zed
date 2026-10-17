@@ -1,4 +1,5 @@
 mod checkout;
+pub mod cli;
 mod comments;
 mod commits;
 mod diff;

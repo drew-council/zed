@@ -22,8 +22,9 @@ use git::{
     repository::{CreateWorktreeTarget, RepoPath},
 };
 use gpui::{
-    App, AppContext as _, AsyncWindowContext, BackgroundExecutor, Context, Entity, EntityId,
-    EventEmitter, Global, PromptLevel, SharedString, Subscription, Task, WeakEntity, Window,
+    App, AppContext as _, AsyncApp, AsyncWindowContext, BackgroundExecutor, Context, Entity,
+    EntityId, EventEmitter, Global, PromptLevel, SharedString, Subscription, Task, WeakEntity,
+    Window,
 };
 use language::{Buffer, BufferSnapshot, Point};
 use project::{
@@ -958,6 +959,18 @@ struct LoadedPullRequest {
     details: PullRequestDetails,
 }
 
+/// The user answered Cancel when asked before a checkout.
+#[derive(Debug)]
+pub(crate) struct ReviewCancelled;
+
+impl std::fmt::Display for ReviewCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Review cancelled")
+    }
+}
+
+impl std::error::Error for ReviewCancelled {}
+
 async fn check_out_and_open(
     workspace: WeakEntity<Workspace>,
     repository: Entity<Repository>,
@@ -1013,7 +1026,7 @@ async fn check_out_and_open(
             )
         })?;
         if answer.await? != 0 {
-            bail!("Review cancelled");
+            return Err(ReviewCancelled.into());
         }
     }
     run_checkout(&repository, steps, &workspace, cx).await?;
@@ -1120,7 +1133,7 @@ async fn open_in_new_worktree(
             )
             })?;
         if answer.await? != 0 {
-            bail!("Review cancelled");
+            return Err(ReviewCancelled.into());
         }
     }
     let creates = existing.is_none();
@@ -1216,10 +1229,10 @@ fn trust_worktree(workspace: &Entity<Workspace>, path: &Path, window: &mut Windo
 }
 
 /// The repository of a workspace just opened on the worktree at `path`, once Zed found it.
-async fn repository_at(
+pub(crate) async fn repository_at(
     workspace: &Entity<Workspace>,
     path: &Path,
-    cx: &mut AsyncWindowContext,
+    cx: &mut AsyncApp,
 ) -> Result<Entity<Repository>> {
     let scan = workspace.read_with(cx, |workspace, cx| {
         workspace.project().read(cx).wait_for_initial_scan(cx)
@@ -2322,6 +2335,87 @@ pub(crate) mod tests {
                     .unwrap()
                     .as_deref(),
                 Some(C1)
+            );
+        }
+
+        /// A link from outside Zed (`zed://review?…&target=pr:1`) asks before it moves the
+        /// checkout; `zed --review pr:1` doesn't, and neither does a link once the pull request is
+        /// checked out.
+        #[gpui::test]
+        async fn test_link_checkout_asks_first(cx: &mut TestAppContext) {
+            use crate::cli::tests::{Cli, clicked_link, command_line, exit, stderr};
+            use project::git_store::RepositoryState;
+
+            let (fs, workspace, review, requests, cx) =
+                open_pull_request_review(DiffViewStyle::Unified, Default::default(), cx).await;
+            drop(review);
+            let repository = workspace.read_with(cx, |workspace, cx| {
+                workspace.project().read(cx).active_repository(cx).unwrap()
+            });
+            let trusted = repository.update(cx, |repository, _| {
+                repository.send_job("trust", None, |state, _| async move {
+                    if let RepositoryState::Local(state) = state {
+                        state.backend.set_trusted(true);
+                    }
+                })
+            });
+            cx.run_until_parked();
+            trusted.await.unwrap();
+            assert!(repository.read_with(cx, |repository, _| repository.is_trusted()));
+            let set_head = |sha: &str| {
+                fs.with_git_state(dot_git(), true, |state| {
+                    state.refs.insert("HEAD".into(), sha.into());
+                })
+                .unwrap();
+            };
+            set_head(C1);
+            cx.run_until_parked();
+            let mut app_state = cx.update(|_, cx| workspace::AppState::test(cx));
+            Arc::get_mut(&mut app_state).unwrap().fs = fs.clone();
+            notification_count(&workspace, cx);
+
+            let details_loaded = requests_of(&requests, "PullRequestDetails");
+            let mut cli = Cli::run(clicked_link(path!("/project"), "pr:1"), &app_state, cx);
+            assert_eq!(
+                requests_of(&requests, "PullRequestDetails"),
+                details_loaded + 1
+            );
+            let (message, detail) = cx.pending_prompt().unwrap();
+            assert_eq!(message, "Check out pull request #1?");
+            assert!(
+                detail.starts_with(
+                    "Reviewing drew-council/code-review-sandbox#1 checks out \
+                     feature/template-filters in"
+                ),
+                "{detail}"
+            );
+            cx.simulate_prompt_answer("Cancel");
+            cx.run_until_parked();
+            assert_eq!(cli.received(), [stderr("Review cancelled"), exit(1)]);
+            assert_eq!(notification_count(&workspace, cx), 0);
+            assert_eq!(
+                fs.with_git_state(dot_git(), false, |state| state.refs.get("HEAD").cloned())
+                    .unwrap()
+                    .as_deref(),
+                Some(C1)
+            );
+
+            // Checked out already: nothing to ask, whoever sent it.
+            set_head(PR1_HEAD_OID);
+            cx.run_until_parked();
+            for request in [
+                command_line(path!("/project"), "pr:1", false),
+                clicked_link(path!("/project"), "pr:1"),
+            ] {
+                let mut cli = Cli::run(request, &app_state, cx);
+                assert!(!cx.has_pending_prompt());
+                assert_eq!(cli.received(), [exit(0)]);
+            }
+            assert_eq!(
+                workspace.read_with(cx, |workspace, cx| {
+                    workspace.items_of_type::<ReviewView>(cx).count()
+                }),
+                1
             );
         }
 

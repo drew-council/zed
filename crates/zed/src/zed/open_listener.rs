@@ -80,6 +80,9 @@ pub enum OpenRequestKind {
     GitCommit {
         sha: String,
     },
+    Review {
+        url: String,
+    },
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -118,6 +121,7 @@ impl std::fmt::Debug for OpenRequestKind {
                 .field("repo_url", repo_url)
                 .finish(),
             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
+            Self::Review { url } => f.debug_struct("Review").field("url", url).finish(),
         }
     }
 }
@@ -192,6 +196,8 @@ impl OpenRequest {
                 this.parse_git_clone_url(clone_path)?
             } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
                 this.parse_git_commit_url(commit_path)?
+            } else if code_review::cli::is_review_url(&url) {
+                this.kind = Some(OpenRequestKind::Review { url });
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
             } else if let Some(zed_link) = parse_zed_link(&url, cx) {
@@ -595,6 +601,27 @@ pub async fn handle_cli_connection(
                 dev_container,
                 cwd,
             } => {
+                if let [url] = urls.as_slice()
+                    && code_review::cli::is_review_url(url)
+                {
+                    let open_options = cx.update(|cx| OpenOptions {
+                        env,
+                        ..open_options_for_behavior(
+                            open_behavior,
+                            &SerializedWorkspaceLocation::Local,
+                            cx,
+                        )
+                    });
+                    let request = code_review::cli::CliReviewRequest {
+                        url: url.clone(),
+                        paths,
+                        wait,
+                        open_options,
+                    };
+                    code_review::cli::handle_cli_review(request, responses, app_state, cx).await;
+                    return;
+                }
+
                 if !urls.is_empty() {
                     cx.update(|cx| {
                         match OpenRequest::parse(
