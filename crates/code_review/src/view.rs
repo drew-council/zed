@@ -1624,14 +1624,21 @@ impl ReviewView {
     }
 
     /// The review's comments as Markdown for a coding agent (what `y` copies), or `None` when
-    /// there are none to send.
+    /// there are none to send. Comment editors open in this tab count with their current text.
     pub fn review_markdown(&self, cx: &App) -> Option<String> {
+        let unsaved = self.comments.read(cx).unsaved_bodies(cx);
         let comments = self
             .session
             .read(cx)
             .comments()
             .iter()
-            .cloned()
+            .map(|comment| {
+                let mut comment = comment.clone();
+                if let Some(body) = unsaved.get(&comment.id) {
+                    comment.body = body.clone();
+                }
+                comment
+            })
             .collect::<Vec<_>>();
         export::review_markdown(&self.export_preamble(cx), &comments)
     }

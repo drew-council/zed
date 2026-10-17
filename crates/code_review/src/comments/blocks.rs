@@ -376,6 +376,18 @@ impl CommentBlocks {
         }
     }
 
+    /// The text of the comment editors open in this tab, as leaving them would save it.
+    pub(crate) fn unsaved_bodies(&self, cx: &App) -> HashMap<CommentId, String> {
+        self.views
+            .iter()
+            .filter_map(|(id, view)| {
+                let text = view.read(cx).editor()?.read(cx).text(cx);
+                let text = text.trim();
+                (!text.is_empty()).then(|| (*id, text.to_string()))
+            })
+            .collect()
+    }
+
     pub(crate) fn is_editing(&self, cx: &App) -> bool {
         self.views
             .values()
@@ -733,13 +745,13 @@ impl CommentBlocks {
         Some((text, rows.count()))
     }
 
-    /// `Y`: the text of the comment at the cursor.
+    /// A comment being written for the first time has no text yet.
     pub(crate) fn body_at_cursor(&self, cx: &mut App) -> Option<String> {
         let id = self.comment_at_cursor(cx)?;
-        Some(self.session.read(cx).comments().get(id)?.body.clone())
+        let body = &self.session.read(cx).comments().get(id)?.body;
+        (!body.is_empty()).then(|| body.clone())
     }
 
-    /// `C`: comments on the file at the cursor.
     pub(crate) fn add_file_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let diff = self.diff.read(cx);
         let Some(path) = diff
@@ -3298,6 +3310,22 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         move_to_row_with_text(&rhs, "line 5", cx);
         cx.simulate_keystrokes("shift-y");
         assert_eq!(clipboard(cx), "fix this\nplease");
+
+        // The export has what open comment editors say.
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("i escape shift-g shift-a");
+        cx.simulate_input(" now");
+        crate::test_support::dispatch(crate::CopyReviewAsMarkdown, cx);
+        assert!(clipboard(cx).contains("`a.rs:3` - fix this\n   please now\n"));
+        cx.simulate_keystrokes("escape escape");
+        // A comment still being written has no text to copy.
+        move_to_row_with_text(&rhs, "line 1", cx);
+        cx.simulate_keystrokes("c");
+        cx.focus(&rhs);
+        cx.run_until_parked();
+        let before = clipboard(cx);
+        cx.simulate_keystrokes("shift-y");
+        assert_eq!(clipboard(cx), before);
 
         // Visual `y` copies the lines and leaves visual mode.
         move_to_row_with_text(&rhs, "line 4", cx);
