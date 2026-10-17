@@ -15,7 +15,8 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: milestone 4 (panel, reviewed marks, filters) done.** The long-lived fork branch `code-review`
+**Status: milestone 4 (panel, reviewed marks, filters) done, plus a hardening pass over the M1–M4
+code reviews (see "Hardening" below).** The long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
 (changeable in place), and one commit or a contiguous range (live when it ends at HEAD, a read-only
@@ -23,7 +24,7 @@ historic snapshot otherwise), opened from the `code_review::StartReview` picker 
 `ReviewUncommitted` / `ReviewBranch { base }` / `ReviewCommits { commits }`. Each tab has a
 tuicr-style line cursor and file navigation, a fixed top block (branch base, or the commit messages),
 per-file and per-hunk reviewed marks persisted in Zed's DB (reviewed files fold to their header,
-reviewed hunks are dimmed, marks clear when the diff content changes), and per-tab filters (include /
+reviewed hunks are dimmed, marks stop counting while the diff content differs), and per-tab filters (include /
 exclude regexes, hide reviewed, generated/vendored files from `.gitattributes` hidden by default). The
 review panel shows the active review's file tree with progress, filters, path search and a context
 menu. Next: milestone 5 (comments, §6).
@@ -35,8 +36,8 @@ What exists:
 | branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
 | `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
-| `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base }, Commits(CommitRange)}`, `is_same_review`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI) |
-| `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `validate_ref`) |
+| `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI) |
+| `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `check_branch_base`, `resolve_commits`) |
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
 | `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks of one review, shared by its tabs through the `ReviewSessions` global, loaded from/saved to the DB), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (`code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`), queued writes |
@@ -149,7 +150,7 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
 - **Branch**: the base is a ref *name* (`Repository::default_branch(true)`, e.g. `origin/main`), passed
   to `DiffBase::Merge`, so the review follows fetches; title "‹branch› vs ‹base›" ("HEAD" when
   detached, updated on `RepositoryEvent::HeadChanged`). `ReviewBranch { base: Some(..) }` checks the
-  ref first (`revparse_batch`, no leading `-`/whitespace), so a typo is an error toast instead of an
+  base before opening (`check_branch_base`, see Hardening), so a typo is an error toast instead of an
   empty review. No default branch → the branch picker opens. Until the first merge-base tree diff has
   started the review shows the spinner, not the empty label (`ReviewDiff::awaiting_tree_diff`).
 - **Change Base** works in place (Zed's Branch Diff precedent) through Zed's own branch picker
@@ -160,22 +161,26 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   base button calls the view directly.
 - **Commits**: git's `A..B` semantics (A excluded) in `ReviewCommits { commits }` and
   `parse_commit_spec`; a single commit is reviewed against its first parent (merges too, like
-  CommitView's `--first-parent`); full 40/64-hex shas are used as is, anything else resolves through
-  `rev^{commit}`. Root commits diff against git's empty tree. **Live vs snapshot is decided once**, when
-  the review opens (range head == HEAD): a live review keeps showing working-tree buffers even if HEAD
-  moves later. Live reviews list only the range's files (`diff-tree base head`) over project buffers
-  (`GitStore::open_diff_since`), so uncommitted edits to those files show, files changed only in the
-  worktree don't.
+  CommitView's `--first-parent`); every revision (full shas too) resolves through `rev^{commit}`.
+  Root commits diff against git's empty tree. **Live vs snapshot is decided once**, when the review
+  opens (range head == HEAD): a live review keeps showing working-tree buffers even if HEAD moves
+  later, and its split clones share its `CommitDiffList` (same mode, one load). Live reviews list only
+  the range's files (`diff-tree base head`) over project buffers (`GitStore::open_diff_since`), so
+  uncommitted edits to those files show, files changed only in the worktree don't.
 - **Snapshots**: `Capability::ReadOnly` buffers whose file is a `GitBlob` (`DiskState::Historic`, not
-  local → no language server), syntax highlighted. Deviation: both sides load through one
-  `git cat-file --batch` (`load_revisions` with `head:path` / `base:path` specs) instead of a
-  `load_blob_content` call per old blob. Binary files show a "(binary file not shown)" line as an
-  addition or deletion so they stay listed; entries git lists without a blob on one side (submodules)
-  are skipped with a warning. All snapshot buffers are built before the first excerpt appears. `e` on
+  local → no language server), syntax highlighted. Deviation: both sides load through
+  `git cat-file --batch` (`load_revisions` with `head:path` / `base:path` specs), one job per 32 files
+  (other git work runs in between; closing the tab stops the rest), instead of a `load_blob_content`
+  call per old blob. Binary files (a NUL byte in the first 8000, git's rule; other non-UTF-8 text is
+  decoded lossily) show a "(binary file not shown)" line as an addition or deletion so they stay
+  listed; entries git lists without a blob on one side (submodules) are skipped with a warning. A
+  `GitBlob`'s path is worktree-relative (the project may be a subdirectory of the repo). All snapshot
+  buffers are built before the first excerpt appears. `e` on
   a snapshot row opens the working-tree file at the same row (clamped), like CommitView's "open file
   at HEAD". The checkout, index and HEAD are never touched.
 - **Start Review picker**: Local section = "Uncommitted changes", "Branch vs ‹base›" (secondary
-  confirm or no default branch → base picker), then the first-parent chain from HEAD (50 commits).
+  confirm or no default branch → base picker; a failed default-branch lookup shows its error under the
+  row), then the first-parent chain from HEAD (50 commits).
   Range selection follows tuicr (`CommitSelection`: outside extends and fills gaps, ends shrink,
   middle cuts back to the newer commits), so non-contiguous selections are impossible; only commit
   rows get checkboxes. Multi-select via `tab` (bound in `StartReview > Picker > Editor`),
@@ -218,18 +223,27 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   comment_id)) STRICT` (`ON UPDATE CASCADE` lets a re-key move a review's rows). Tests set
   `db::AppDatabase::test_new()` in `init_test`.
 - **`ReviewKey`** (D4, `ReviewTarget::review_key(&RepositorySnapshot)`): `uncommitted:{work_dir}`,
-  `branch:{base}:{branch}:{common_dir}` ("HEAD" when detached), `commits:{base}..{head}:{common_dir}`
+  `branch:{base}:{branch}:{common_dir}` (`branch:{base}:HEAD:{work_dir}` when detached: any number of
+  worktrees can be detached; earlier detached keys are orphaned), `commits:{base}..{head}:{common_dir}`
   (empty base for a root commit); M7 adds `pr:{host}/{owner}/{name}#{n}`. Change Base and a branch
   switch change a branch review's key: the tab switches to that key's session (marks stay with their
   key; switching back restores them).
 - **Sessions** (D5): `ReviewSession::for_key` shares one entity per key through the `ReviewSessions`
   global (weak entries), so split tabs share marks; filters, the hidden set and single-file mode are per
-  tab and not persisted. Marks can't change until the stored ones have loaded.
-- **Hashes/invalidation** (D3): FNV-1a 64; hunk key `hunk-content-v1:{hash}` (span-qualified
-  `hunk-span-v1:…:{old_start}:{old_count}:{new_start}:{new_count}` when a file repeats a hunk); file
-  hash over the hunk hashes. Digests are taken in `sync_excerpts` only while the buffer has no unsaved
-  edits. Deviation: only files that still have hunks are reconciled, so a file whose changes vanish
-  (e.g. committed) keeps its mark and stays reviewed if it comes back unchanged.
+  tab and not persisted. Marks can't change until the stored ones have loaded; a failed load keeps
+  them unchangeable and shows a toast, as does a failed write (`ReviewSessionEvent::Failed`).
+- **Hashes/invalidation** (D3, made non-destructive in the hardening pass): FNV-1a 64; hunk key
+  `hunk-content-v1:{hash}` (span-qualified `hunk-span-v1:…:{old_start}:{old_count}:{new_start}:{new_count}`
+  when a file repeats a hunk); file hash over the hunk hashes. Digests are taken in `sync_excerpts` only
+  while the buffer has no unsaved edits, and survive refreshes (a re-registered buffer keeps `shown`,
+  `has_hunks` and its digest). **Rows are deleted only when the user unmarks.** A file counts as
+  reviewed while the hash it was marked with equals the last digest the session observed
+  (`observe_digest`; none observed yet → trusted), a hunk while its key is in the file's digest. So a
+  change that is undone, a `git stash`/`pop`, or a branch switch and back (marks of the other key are
+  never touched) brings the marks back. Digests of files without hunks aren't observed: a file whose
+  changes vanish keeps its state. Marking needs the file's digest; without one (unsaved edits since
+  the review opened) a toast says to save it. Stale hunk keys accumulate until pruning exists. Legacy
+  rows without a hash still adopt the next digest.
 - **Folding** (D7): fold when a file becomes reviewed or its excerpts reappear; unfold when unreviewed
   or invalidated; single-file mode shows its file unfolded and leaving re-folds. A session load or
   switch syncs every shown file (also unfolding unreviewed ones). Folding the RHS folds the LHS.
@@ -290,6 +304,56 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   a reviewed file's mark clearing after a shell edit while an unchanged hunk keeps its mark. Found and
   fixed there: the folded-header Visual-mode bug above.
 
+**Hardening (M1–M4 review findings, `reviews/M1-M3.md` and `reviews/M4.md` in the orchestrator's
+state dir):**
+
+- **Read-only guard**: the editor registers `git::ToggleStaged`, `git::StageAndNext`,
+  `git::UnstageAndNext` (staging first saves the dirty buffers under the cursor) and
+  `editor::ReloadFile` (drops the unsaved edits of every buffer in the review) without checking
+  `read_only`; they are captured on the `CodeReview` div (`block_write_action`, which also clears
+  vim's pending operator), covering both split sides, keymaps (`d u`, `d shift-o`, `d shift-u`,
+  `alt-y`…), the palette and `:e`/`:e!`. Audit of the rest: restore/apply hunk (`git::Restore`,
+  `RestoreFile`, `RestoreAndNext`, `Apply*DiffHunks`), format, organize imports, rename, code actions,
+  completions and inlay-hint edits are only registered on editable editors; plain edits are refused by
+  the read-only multibuffer; `ToggleReadOnlyFile` only acts on singleton buffers; `workspace::Save`
+  isn't registered for a read-only item and `SaveAs` does nothing (`can_save_as` false); workspace-level
+  git actions (stage all, stash…) are repo-wide and stay allowed. Breakpoints/bookmarks aren't file
+  writes and stay allowed.
+- **Branch bases** (one choke point): `ReviewTarget::Branch` holds a `BranchBase`, built only by
+  `BranchBase::new` (non-empty, no leading `-`, no whitespace/control characters), so nothing git
+  could parse as an option reaches `git diff --merge-base` (no `--end-of-options` there: it would need
+  an unapproved core patch). `check_branch_base` resolves `base^{commit}` (unknown, ambiguous and
+  non-commit bases are errors) and runs `diff-tree --merge-base` against HEAD ("no merge base" → "‹base›
+  and HEAD have no common history", "multiple merge bases" likewise). It runs before a typed base opens
+  (toast) and in every branch review (`ReviewDiff::check_base`: on open, Change Base and
+  `HeadChanged`): a failure replaces the empty label (spinner until the first result), and a tree diff
+  that failed although the check passed says "Couldn't compare HEAD with ‹base› (see the log)".
+- **Commit ranges**: revisions resolve in one `cat-file --batch-check` (`rev` and `rev^{commit}`, so
+  errors say unknown / ambiguous / not a commit). **`A..B` needs A on B's first-parent history**
+  (walked with the commit reader, up to 10,000 commits) and A ≠ B, else an error toast. Decision
+  (orchestrator: reject or merge-base): reject, because the diff from a diverged A would also revert
+  A's own changes (that is `git diff A..B`, which tuicr shows), and title, top block and key all
+  assume a run of consecutive commits; a merge-base base needs a `merge_base` backend call that only
+  exists inside `diff_tree` (core patch).
+- **Errors in the UI**: failed per-file loads (one toast per refresh), `e` from a snapshot and the
+  panel's Open File (`detach_and_notify_err`), the picker's default-branch lookup, mark load/save
+  failures. A built-in keymap with a bad binding keeps the others and logs the error
+  (`test_a_bad_binding_keeps_the_others`; `test_keymaps_load_without_errors` fails on any).
+- **Panel**: selection keys reveal the file in single-file mode (the window is passed through instead
+  of a nested window update that failed silently).
+- **Live harness**: the short link is `$XDG_RUNTIME_DIR/zh` (else `/tmp/zh-$UID`); a stale link is
+  only followed when owned by the user, and the other harness's PID is parsed, not sourced. The
+  harness mirrors the user's `autosave` (500 ms), so unsaved-edit checks there need `"autosave":
+  "off"` in `$(zh path config)/settings.json`.
+- **Live check** (scratch repo + an orphan branch): in an uncommitted review `d u`, `d shift-o`,
+  `d shift-u`, `alt-y`, `ctrl-alt-y`, `:e!` and `:e` left `git status`, the index and the files
+  untouched, and an unsaved edit in another tab survived `:e!`; "Branch vs" with the orphan branch as
+  base shows "lonely and HEAD have no common history", Change Base back to `main` recovers.
+- Not done: the per-file linear scans in `ReviewDiff` (`entry`, `repo_path_for`) (M4 L4; refreshes no
+  longer emit per-file events for unchanged files, which was the quadratic part), `.gitattributes`
+  macros / global attributes file (M4 L5), pruning the panel's `collapsed` set (M4 L6), and a sweep of
+  doc comments that restate their code (M1–M3 L11).
+
 **Known issues / notes for the next slices:**
 
 - Saving: for an active item whose `capability` isn't editable, the workspace doesn't register
@@ -320,25 +384,28 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   `ToggleSoftWrap` capture will also catch the action inside M5 comment editors — scope it then.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - Not run: `zed`'s own tests (incl. `test_action_namespaces`), clippy. `cargo test -p code_review`:
-  46 tests (M4), stable under `ITERATIONS=10`.
+  61 tests (after the hardening pass), stable under `ITERATIONS=5`.
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
   snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
   `]f`/`]c`/line cursor/`e` in branch, live and snapshot reviews.
-- M3 notes: a range `A..B` where A isn't on B's first-parent chain diffs tree(A) → tree(B) and the top
-  block walks back to the root or the limit ("N+ commits"). `DiffBufferList` only logs tree-diff
-  errors, so a base that disappears after the review opened shows "No changes against ‹base›". Huge
-  snapshot ranges load every blob before the first excerpt (switch to per-file `load` futures if that
-  is slow). Hover/go-to-definition in snapshots couldn't be checked live (the harness disables
-  language servers); snapshot buffers aren't local, so no server attaches by construction.
+- M3 notes: huge snapshot ranges load every blob (in 32-file jobs) before the first excerpt.
+  Hover/go-to-definition in snapshots couldn't be checked live (the harness disables language
+  servers); snapshot buffers aren't local, so no server attaches by construction. `DiffBufferList`
+  keeps its last tree diff when a reload fails, so a base deleted (or HEAD switched to an unrelated
+  branch) after a review opened shows the stale file list; the error label only replaces an empty
+  list (the base is re-checked on `HeadChanged`).
 - M5: drafts keyed per §2.6 must be re-keyed in `ReviewView::change_base` (the only place a target
   changes) and must handle a branch switch while a branch review is open (the branch name is part of
   the key; `RepositoryEvent::HeadChanged` is already subscribed). Review-level comments go into
   `ReviewTopBlock` (an entity rendered above the diff; add content after the commit/branch part).
-- M7 slots: `Section` in `picker.rs` (add the pull request section after Local in
-  `StartReviewDelegate::set_matches`, where a comment marks it), `StartReviewFocus` (add
+- M7 slots: `Section` in `picker.rs` (add the pull request section after the Local entries in
+  `StartReviewDelegate::set_matches`), `StartReviewFocus` (add
   `PullRequests` for `OpenPullRequest { number: None }`), `ReviewTarget` (add `PullRequest`; override
   `is_same_review` so `base_oid` is ignored), `DiffSource::new` (map it to
   `BufferList(DiffBase::Merge { base_ref: base_oid })`), `TopBlockContent` (add the PR description).
+  PR base refs and `zed://review?target=branch:…` bases are untrusted: build them with
+  `BranchBase::new` / `ReviewTarget::branch` (and go through `check_branch_base` for a pre-open
+  error), and commit specs with `parse_commit_spec` + `resolve_commit_spec`.
 - DESIGN's file:line pointers checked on `v1.25.0-pre` for this slice (`diff_buffer_list.rs`,
   `diff_multibuffer.rs`, `split.rs:1192`, `git_store.rs`, `zed.rs`, `main.rs`) match within a line or
   two. `git_ui` on the tag also has `staged_diff.rs` — a read-only `DiffMultibuffer` item, the
@@ -583,7 +650,8 @@ move line by line; there is no column.
   by head SHA, so new pushes don't start a new review. (M3: "branch" is the checked-out branch's name
   and "base" the base ref name as in `ReviewTarget::Branch`; "range" is `CommitRange`'s `base..head`
   shas. Change Base and branch switches change a branch review's key.) Reviewed marks clear when that file's/hunk's
-  diff content changes (tuicr: FNV-1a over hunk lines, `src/model/review.rs:164-189`). Drafts follow
+  diff content changes (tuicr: FNV-1a over hunk lines, `src/model/review.rs:164-189`; as built, a
+  mark stops counting while the content differs and counts again if it changes back, see §0). Drafts follow
   code via Zed anchors while running; after reload a draft whose line text no longer matches is
   flagged **outdated** (not dropped).
 
