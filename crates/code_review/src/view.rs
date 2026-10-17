@@ -8,7 +8,8 @@ use crate::{
     ToggleHunkReviewed, ToggleOutdatedThreads, ToggleResolvedThreads, ToggleSingleFileMode,
     comments::{
         CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
-        RemoteItem, RemoteKey, RemoteThreadContent, Side, open_web_link, thread_location,
+        RemoteItem, RemoteKey, RemoteThreadContent, Side, keep_scroll_at_start, open_web_link,
+        thread_location,
     },
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
@@ -878,6 +879,14 @@ impl ReviewView {
                     | EditorEvent::BuffersRemoved { .. }
                     | EditorEvent::BufferFoldToggled { .. } => this.repaint_reviewed_hunks(cx),
                     EditorEvent::Focused => this.stay_in_normal_mode_on_folded_header(window, cx),
+                    EditorEvent::ScrollPositionChanged { autoscroll, .. } => {
+                        let rhs = this.diff.read(cx).editor().read(cx).rhs_editor().clone();
+                        rhs.update(cx, |editor, cx| keep_scroll_at_start(editor, window, cx));
+                        if *autoscroll {
+                            this.comments
+                                .update(cx, |comments, cx| comments.show_file_start_at_cursor(cx));
+                        }
+                    }
                     _ => {}
                 },
             ),
@@ -3748,6 +3757,16 @@ mod tests {
             move_to_row_with_text(&editor, "short", cx);
             cx.simulate_keystrokes("; f");
             assert_eq!(excerpt_paths(&review, cx), ["long.txt"]);
+            let (scroll_top, header_row, _) = rows(cx);
+            assert_eq!(scroll_top, f64::from(header_row));
+
+            // A scroll following the cursor onto a file's first row (`gg` from the end) shows the
+            // file comment above it with the header.
+            cx.simulate_keystrokes("; f g g shift-c");
+            cx.simulate_input("the first file");
+            cx.simulate_keystrokes("ctrl-enter");
+            cx.simulate_keystrokes("shift-g g g");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("a.rs"));
             let (scroll_top, header_row, _) = rows(cx);
             assert_eq!(scroll_top, f64::from(header_row));
         }

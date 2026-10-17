@@ -3196,6 +3196,85 @@ pub(crate) mod tests {
             assert!(targeted(SINGLE, cx));
         }
 
+        /// The review's top stays its top when a thread of the first file shows up above that
+        /// file's first row: the first file's header doesn't go under the sticky header.
+        #[gpui::test]
+        async fn test_top_of_the_review_stays_when_threads_load(cx: &mut TestAppContext) {
+            let second_file_thread = serde_json::json!({
+                "id": "PRRT_guide",
+                "isResolved": false,
+                "isOutdated": false,
+                "subjectType": "FILE",
+                "path": "docs/guide.md",
+                "line": 1,
+                "startLine": null,
+                "originalLine": 1,
+                "originalStartLine": null,
+                "diffSide": "RIGHT",
+                "startDiffSide": null,
+                "comments": {
+                    "totalCount": 1,
+                    "nodes": [{
+                        "id": "PRRC_guide",
+                        "databaseId": 3,
+                        "body": "Another file comment",
+                        "createdAt": "2026-10-17T04:00:00Z",
+                        "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r3",
+                        "state": "SUBMITTED",
+                        "commit": { "oid": PR1_HEAD_OID },
+                        "author": { "__typename": "User", "login": "someone" },
+                    }],
+                },
+            });
+            let add_thread = Arc::new(AtomicBool::new(false));
+            let respond = {
+                let add_thread = add_thread.clone();
+                move |request: &SentRequest| {
+                    if request.operation() != Some("ReviewThreads")
+                        || !add_thread.load(Ordering::SeqCst)
+                    {
+                        return None;
+                    }
+                    let mut threads: serde_json::Value = serde_json::from_str(PR1_THREADS).unwrap();
+                    threads["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(second_file_thread.clone());
+                    Some(Reply::json(threads.to_string()))
+                }
+            };
+            let fixture = Fixture {
+                respond: Some(Arc::new(respond)),
+                ..Fixture::default()
+            };
+            let (_fs, _workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            let rhs = rhs_editor(&review, cx);
+            assert_eq!(
+                path_at_cursor(&review, cx).as_deref(),
+                Some("docs/guide.md")
+            );
+            // The cursor away from the file's first row, and the view scrolled to the top (as an
+            // autoscroll does, which anchors it on the first row).
+            cx.simulate_keystrokes("j j");
+            rhs.update_in(cx, |editor, window, cx| {
+                editor.set_scroll_position(gpui::point(0., 0.), window, cx);
+            });
+            cx.run_until_parked();
+            let scroll_top = |cx: &mut VisualTestContext| {
+                rhs.update(cx, |editor, cx| editor.scroll_position(cx).y)
+            };
+            assert_eq!(scroll_top(cx), 0.);
+
+            add_thread.store(true, Ordering::SeqCst);
+            let pull_request = review.read_with(cx, |review, _| review.pull_request().cloned());
+            pull_request
+                .unwrap()
+                .update(cx, |pull_request, cx| pull_request.reload(cx));
+            cx.run_until_parked();
+            assert!(remote_keys(&review, cx).contains(&thread("PRRT_guide")));
+            assert_eq!(scroll_top(cx), 0.);
+        }
+
         /// A file thread that shows up above the cursor on the file's first row (a reload, as
         /// after a submit) is shown with the file's header at the top, rather than where the
         /// view's top happens to be, which may leave it under the sticky header.

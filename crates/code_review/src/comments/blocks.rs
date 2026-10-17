@@ -4,7 +4,7 @@ use super::{
     view::{CommentView, EditingState, Leave},
 };
 use crate::{
-    diff::{ReviewDiff, file_start_autoscroll, review_path_key},
+    diff::{ReviewDiff, file_header_row, file_start_autoscroll, review_path_key},
     line_cursor::selected_rows,
     session::{ReviewSession, ReviewSessionEvent},
 };
@@ -14,7 +14,7 @@ use command_palette_hooks::GlobalCommandPaletteInterceptor;
 use editor::{
     Anchor, Bias, DisplayPoint, Editor, EditorEvent, EditorMode, SelectionEffects,
     display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
-    scroll::Autoscroll,
+    scroll::{Autoscroll, ScrollAnchor},
 };
 use futures::FutureExt as _;
 use git::repository::RepoPath;
@@ -505,31 +505,29 @@ impl CommentBlocks {
             let Some(hosted) = self.hosted.get(&ItemKey::Remote(key.clone())) else {
                 continue;
             };
-            if !hosted.placement.is_file {
-                continue;
+            if hosted.placement.is_file
+                && let Some(editor) = hosted.editor.upgrade()
+                && editor.update(cx, |editor, cx| {
+                    show_file_start(editor, hosted.placement.row, cx)
+                })
+            {
+                return;
             }
-            let Some(editor) = hosted.editor.upgrade() else {
-                continue;
-            };
-            let row = hosted.placement.row;
-            let scrolled = editor.update(cx, |editor, cx| {
-                let snapshot = editor.buffer().read(cx).snapshot(cx);
-                let cursor_row = editor
-                    .selections
-                    .newest_anchor()
-                    .head()
-                    .to_point(&snapshot)
-                    .row;
-                if cursor_row != row.to_point(&snapshot).row {
-                    return false;
-                }
-                let Some(autoscroll) = file_start_autoscroll(editor, row, cx) else {
-                    return false;
-                };
-                editor.request_autoscroll(autoscroll, cx);
-                true
-            });
-            if scrolled {
+        }
+    }
+
+    /// After a scroll that follows the cursor (vim's `gg`, a reload of the diff) onto a file's
+    /// first row with the file's comments or threads above it, the file's header goes to the
+    /// top: the scroll only keeps the cursor's row in view, which leaves them under the sticky
+    /// header.
+    pub(crate) fn show_file_start_at_cursor(&self, cx: &mut App) {
+        for hosted in self.hosted.values() {
+            if hosted.placement.is_file
+                && let Some(editor) = hosted.editor.upgrade()
+                && editor.update(cx, |editor, cx| {
+                    show_file_start(editor, hosted.placement.row, cx)
+                })
+            {
                 return;
             }
         }
@@ -762,13 +760,18 @@ impl CommentBlocks {
                 continue;
             };
             let block_ids = editor.update(cx, |editor, cx| {
-                editor.insert_blocks(
+                let scroll_position = editor.scroll_position(cx);
+                let block_ids = editor.insert_blocks(
                     blocks.iter().map(|(_, _, placement, view, priority)| {
                         block_properties(*placement, view.clone(), *priority)
                     }),
                     None,
                     cx,
-                )
+                );
+                if scroll_position.y == 0. {
+                    anchor_scroll_at_start(editor, scroll_position.x, window, cx);
+                }
+                block_ids
             });
             for ((_, key, placement, _, _), block) in blocks.into_iter().zip(block_ids) {
                 self.hosted.insert(
@@ -2114,6 +2117,71 @@ fn save_text(
         Leave::Keep if is_empty => {}
         Leave::Keep => session.set_comment_body(id, text, cx),
     });
+}
+
+/// Puts the file's header at the top of the view when the cursor is on the file's first row
+/// (`row`, which the file's blocks sit above) and the header isn't there already. Returns whether
+/// it scrolls.
+fn show_file_start(editor: &mut Editor, row: Anchor, cx: &mut Context<Editor>) -> bool {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let cursor_row = editor
+        .selections
+        .newest_anchor()
+        .head()
+        .to_point(&snapshot)
+        .row;
+    if cursor_row != row.to_point(&snapshot).row {
+        return false;
+    }
+    let Some((header_row, row)) = file_header_row(editor, row, cx) else {
+        return false;
+    };
+    if editor.scroll_position(cx).y == f64::from(header_row.0) {
+        return false;
+    }
+    editor.request_autoscroll(
+        Autoscroll::top_relative(f64::from(row.0 - header_row.0)),
+        cx,
+    );
+    true
+}
+
+/// Keeps a view scrolled to the very top there. Zed anchors it on the first file's first row
+/// (the file's header above that row is a block), so blocks above the row (a file's comments and
+/// threads, and their heights, measured once rendered) would push the header and themselves
+/// above the view's top, under the sticky header. The start of the multibuffer stays the top.
+pub(crate) fn keep_scroll_at_start(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let position = editor.scroll_position(cx);
+    if position.y == 0.
+        && editor
+            .scroll_manager
+            .shared_scroll_anchor(cx)
+            .scroll_anchor
+            .anchor
+            != Anchor::Min
+    {
+        anchor_scroll_at_start(editor, position.x, window, cx);
+    }
+}
+
+fn anchor_scroll_at_start(
+    editor: &mut Editor,
+    scroll_x: f64,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    editor.set_scroll_anchor(
+        ScrollAnchor {
+            offset: gpui::point(scroll_x, 0.),
+            anchor: Anchor::Min,
+        },
+        window,
+        cx,
+    );
 }
 
 /// Where the comment's block goes, if its lines (or file) are shown: line comments on the old

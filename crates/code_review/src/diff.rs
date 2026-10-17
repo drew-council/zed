@@ -1277,6 +1277,17 @@ pub(crate) fn file_start_autoscroll(
     position: editor::Anchor,
     cx: &mut Context<Editor>,
 ) -> Option<Autoscroll> {
+    let (header_row, row) = file_header_row(editor, position, cx)?;
+    Some(Autoscroll::top_relative(f64::from(row.0 - header_row.0)))
+}
+
+/// The display rows of the file header above `position` and of `position`'s row, when both
+/// fit in the view with the scroll margin below the row.
+pub(crate) fn file_header_row(
+    editor: &mut Editor,
+    position: editor::Anchor,
+    cx: &mut Context<Editor>,
+) -> Option<(DisplayRow, DisplayRow)> {
     // The row itself and the scroll margin below it.
     const ROWS_BELOW_BLOCKS: u32 = 4;
     let visible_lines = editor.visible_line_count()?;
@@ -1288,6 +1299,6 @@ pub(crate) fn file_start_autoscroll(
         .blocks_in_range(DisplayRow(row.0.saturating_sub(room))..row)
         .filter(|(_, block)| block.is_buffer_header())
         .map(|(header_row, _)| header_row)
-        .last();
-    header_row.map(|header_row| Autoscroll::top_relative(f64::from(row.0 - header_row.0)))
+        .last()?;
+    Some((header_row, row))
 }
