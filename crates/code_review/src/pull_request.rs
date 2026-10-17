@@ -4,27 +4,29 @@
 
 use crate::{
     checkout::{self, CheckoutStep, canonical_source, plan_checkout, run_checkout},
-    comments::{CommentTarget, Side},
+    comments::{CommentId, CommentTarget, Side},
     forge::{
         self, CommentableLines, DiffSide, Forge, ForgeRepoRef, GitHubError, PullRequestDetails,
-        RemoteReviewSummary, RemoteThread, RepositoryContext, ThreadAnchor,
+        RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewSubmission, SubmitAttempt,
+        SubmittedReview, ThreadAnchor,
     },
     github::{self, GitHubRemote},
-    session::ReviewKey,
+    session::{ReviewKey, ReviewOutcome, ReviewSession},
     target::{PullRequestReference, PullRequestTarget, ReviewTarget, validate_branch_name},
     view::ReviewView,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use buffer_diff::{BufferDiff, BufferDiffEvent, BufferDiffSnapshot};
 use collections::{HashMap, HashSet};
+use futures::channel::oneshot;
 use git::{
     Oid,
     repository::{CreateWorktreeTarget, RepoPath},
 };
 use gpui::{
-    App, AppContext as _, AsyncApp, AsyncWindowContext, BackgroundExecutor, Context, Entity,
-    EntityId, EventEmitter, Global, PromptLevel, SharedString, Subscription, Task, WeakEntity,
-    Window,
+    App, AppContext as _, AsyncApp, AsyncWindowContext, BackgroundExecutor, ClipboardItem, Context,
+    Entity, EntityId, EventEmitter, Global, PromptLevel, SharedString, Subscription, Task,
+    WeakEntity, Window,
 };
 use language::{Buffer, BufferSnapshot, Point};
 use project::{
@@ -43,7 +45,7 @@ use std::{
     time::Duration,
 };
 use util::{ResultExt as _, path_list::PathList};
-use workspace::{OpenMode, Workspace};
+use workspace::{OpenMode, Toast, Workspace, notifications::NotificationId};
 
 /// What the review tabs of one pull request share: the forge it is on, its details, and what it
 /// has on GitHub besides the code (threads, summaries, GitHub's own diff).
@@ -62,8 +64,59 @@ pub struct PullRequestState {
     load_errors: Vec<SharedString>,
     /// GitHub rejected the token: the next load resolves the forge, and so the token, again.
     forge_is_stale: bool,
+    /// A review is being posted (or an uncertain one checked): one at a time, from any tab or
+    /// window of the pull request, so that two can't post the same drafts.
+    submitting: bool,
+    /// The last submit may have posted the review: GitHub is asked before the drafts can be
+    /// sent again.
+    uncertain_submit: Option<UncertainSubmit>,
     _load_task: Task<()>,
+    /// Owned here, not by the submit modal: closing the modal (or every tab) mustn't cancel a
+    /// review GitHub may already be making.
+    _submit_task: Task<()>,
 }
+
+/// What a review tab sends to post its review.
+pub(crate) struct SubmitRequest {
+    pub(crate) submission: ReviewSubmission,
+    pub(crate) target: SubmitTarget,
+}
+
+/// Where a submit's result goes.
+#[derive(Clone)]
+pub(crate) struct SubmitTarget {
+    /// The session whose drafts are posted, marked submitted once they are.
+    pub(crate) session: Entity<ReviewSession>,
+    pub(crate) comment_ids: Vec<CommentId>,
+    /// The submitting tab's checkout: after GitHub rejected the token, the forge is resolved
+    /// again from it first (tokens are per project).
+    pub(crate) repository: WeakEntity<Repository>,
+    pub(crate) project: WeakEntity<Project>,
+    /// Where the success toast shows.
+    pub(crate) workspace: WeakEntity<Workspace>,
+}
+
+/// How a submit (or the check of an uncertain one) ended, for the modal that started it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SubmitReply {
+    Submitted {
+        url: SharedString,
+    },
+    /// Nothing was posted: the drafts can be sent again.
+    Failed(SharedString),
+    /// The review may have been posted: [`PullRequestState::check_uncertain_submit`] finds out.
+    Uncertain(SharedString),
+}
+
+/// A submit that may have posted the review.
+struct UncertainSubmit {
+    attempt: SubmitAttempt,
+    message: SharedString,
+    target: SubmitTarget,
+}
+
+/// The toast saying a review was posted.
+pub(crate) struct ReviewSubmittedToast;
 
 /// Which review threads and review summaries of a pull request show, for all its tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,7 +193,10 @@ impl PullRequestState {
                 is_loading: false,
                 load_errors: Vec::new(),
                 forge_is_stale: false,
+                submitting: false,
+                uncertain_submit: None,
                 _load_task: Task::ready(()),
+                _submit_task: Task::ready(()),
             };
             pull_request.load(false, cx);
             pull_request
@@ -287,18 +343,27 @@ impl PullRequestState {
         }
         let lines = match side {
             Side::Old => lines.clone(),
-            Side::New => match local.working_to_head(path, lines.clone(), cx) {
-                LineMapping::Lines(lines) => lines,
-                LineMapping::Changed => {
-                    return Err(
-                        "These lines have local changes, which the pull request doesn't have"
+            Side::New => {
+                match local.working_to_head(path, lines.clone(), self.details.head_oid, cx) {
+                    LineMapping::Lines(lines) => lines,
+                    LineMapping::Changed => {
+                        return Err(
+                            "These lines have local changes, which the pull request doesn't have"
+                                .into(),
+                        );
+                    }
+                    LineMapping::Unknown => {
+                        return Err("Comparing the file with HEAD… Try again in a moment.".into());
+                    }
+                    LineMapping::Failed => {
+                        return Err(
+                        "Couldn't compare the file with HEAD, so its lines can't be numbered as \
+                         GitHub numbers them"
                             .into(),
                     );
+                    }
                 }
-                LineMapping::Unknown => {
-                    return Err("Comparing the file with HEAD… Try again in a moment.".into());
-                }
-            },
+            }
         };
         check_comment_target(
             commentable,
@@ -364,10 +429,19 @@ impl PullRequestState {
     /// Resolves the forge again from a checkout reviewing the pull request, which looks its
     /// token up again; `None` when none is open.
     pub(crate) fn resolve_forge(&self, cx: &mut App) -> Option<Task<Result<Arc<dyn Forge>>>> {
-        let (repository, project) = self
-            .checkouts
-            .iter()
-            .rev()
+        self.resolve_forge_from(None, cx)
+    }
+
+    /// [`Self::resolve_forge`], from `preferred` while it is open (the checkout of the tab that
+    /// asks: its project may have its own token), else from the latest checkout still open.
+    fn resolve_forge_from(
+        &self,
+        preferred: Option<(WeakEntity<Repository>, WeakEntity<Project>)>,
+        cx: &mut App,
+    ) -> Option<Task<Result<Arc<dyn Forge>>>> {
+        let (repository, project) = preferred
+            .into_iter()
+            .chain(self.checkouts.iter().rev().cloned())
             .find_map(|(repository, project)| Some((repository.upgrade()?, project.upgrade()?)))?;
         let canonical = &self.forge.context().canonical;
         let reference = ForgeRepoRef {
@@ -381,6 +455,184 @@ impl PullRequestState {
             &project,
             cx,
         ))
+    }
+
+    /// Whether a review of the pull request is being posted (or an uncertain one checked).
+    pub(crate) fn is_submitting(&self) -> bool {
+        self.submitting
+    }
+
+    /// Why the last submit may have posted the review, while GitHub hasn't been asked.
+    pub(crate) fn uncertain_submit(&self) -> Option<&SharedString> {
+        self.uncertain_submit
+            .as_ref()
+            .map(|uncertain| &uncertain.message)
+    }
+
+    /// Posts a review of the pull request. The work belongs to the pull request, shared by its
+    /// tabs, so it finishes (marking the drafts submitted, telling `--wait` waiters, the toast)
+    /// whatever happens to the modal or the tab that asked. Refused while another submit runs
+    /// or the last one may have posted the review.
+    pub(crate) fn submit(
+        &mut self,
+        request: SubmitRequest,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<SubmitReply> {
+        let (reply, receiver) = oneshot::channel();
+        if self.submitting || self.uncertain_submit.is_some() {
+            reply
+                .send(SubmitReply::Failed(
+                    "Another review of this pull request is being submitted".into(),
+                ))
+                .ok();
+            return receiver;
+        }
+        let number = self.details.number;
+        let url = self.details.url.clone();
+        let forge = self.forge.clone();
+        let executor = cx.background_executor().clone();
+        // Held until the review is posted, even when every tab of the pull request closes
+        // meanwhile: its drafts must be marked submitted.
+        let pull_request = cx.entity();
+        self.submitting = true;
+        cx.notify();
+        self._submit_task = cx.spawn(async move |_, cx| {
+            let SubmitRequest { submission, target } = request;
+            let mut result = executor
+                .spawn(forge.submit_review(number, url.clone(), submission.clone()))
+                .await;
+            if let Err(error) = result {
+                result = retry_with_new_token(
+                    &pull_request,
+                    &target,
+                    number,
+                    url,
+                    submission,
+                    error,
+                    cx,
+                )
+                .await;
+            }
+            let answer =
+                pull_request.update(cx, |this, cx| this.submit_finished(result, target, cx));
+            reply.send(answer).ok();
+        });
+        receiver
+    }
+
+    fn submit_finished(
+        &mut self,
+        result: Result<SubmittedReview>,
+        target: SubmitTarget,
+        cx: &mut Context<Self>,
+    ) -> SubmitReply {
+        self.submitting = false;
+        cx.notify();
+        let error = match result {
+            Ok(review) => return self.posted(review, &target, cx),
+            Err(error) => error,
+        };
+        log::error!(
+            "submitting a review of pull request #{}: {error:#}",
+            self.details.number
+        );
+        let message = forge::error_message(&error);
+        match forge::github_error(&error) {
+            Some(GitHubError::ReviewUncertain { attempt, .. }) => {
+                self.uncertain_submit = Some(UncertainSubmit {
+                    attempt: (**attempt).clone(),
+                    message: message.clone(),
+                    target,
+                });
+                SubmitReply::Uncertain(message)
+            }
+            _ => SubmitReply::Failed(message),
+        }
+    }
+
+    /// Asks GitHub whether the last submit, which failed without saying, posted the review:
+    /// then it is a success; else nothing was posted and the drafts can be sent again. `None`
+    /// when there is nothing to check, or a submit runs.
+    pub(crate) fn check_uncertain_submit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<oneshot::Receiver<SubmitReply>> {
+        if self.submitting {
+            return None;
+        }
+        let uncertain = self.uncertain_submit.take()?;
+        let (reply, receiver) = oneshot::channel();
+        let number = self.details.number;
+        let forge = self.forge.clone();
+        let executor = cx.background_executor().clone();
+        let pull_request = cx.entity();
+        self.submitting = true;
+        cx.notify();
+        self._submit_task = cx.spawn(async move |_, cx| {
+            let found = executor
+                .spawn(forge.find_submitted_review(number, uncertain.attempt.clone()))
+                .await;
+            let answer = pull_request.update(cx, |this, cx| {
+                this.submitting = false;
+                cx.notify();
+                match found {
+                    Ok(Some(review)) => this.posted(review, &uncertain.target, cx),
+                    Ok(None) => SubmitReply::Failed(
+                        "GitHub has no review from the last attempt, so nothing was posted: \
+                         submit again."
+                            .into(),
+                    ),
+                    Err(error) => {
+                        log::error!("checking whether a review was posted: {error:#}");
+                        let message: SharedString = format!(
+                            "Couldn't ask GitHub whether the last review was posted: {}",
+                            forge::error_message(&error)
+                        )
+                        .into();
+                        this.uncertain_submit = Some(UncertainSubmit {
+                            message: message.clone(),
+                            ..uncertain
+                        });
+                        SubmitReply::Uncertain(message)
+                    }
+                }
+            });
+            reply.send(answer).ok();
+        });
+        Some(receiver)
+    }
+
+    /// The review was posted: its drafts are submitted, whoever waits for the review hears of
+    /// it, its threads come back from GitHub (in place of the drafts), and a toast says so.
+    fn posted(
+        &mut self,
+        review: SubmittedReview,
+        target: &SubmitTarget,
+        cx: &mut Context<Self>,
+    ) -> SubmitReply {
+        let url = review.url.clone();
+        target.session.update(cx, |session, cx| {
+            session.mark_submitted(&target.comment_ids, review.id.to_string().into(), cx);
+            session.resolve_outcome(ReviewOutcome::Submitted {
+                url: url.to_string(),
+            });
+        });
+        self.reload(cx);
+        let toast = Toast::new(
+            NotificationId::unique::<ReviewSubmittedToast>(),
+            format!("Review submitted: {url}"),
+        )
+        .on_click("Copy URL", {
+            let url = url.clone();
+            move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(url.to_string()))
+        });
+        match target.workspace.upgrade() {
+            Some(workspace) => {
+                workspace.update(cx, |workspace, cx| workspace.show_toast(toast, cx))
+            }
+            None => log::info!("review submitted: {url}"),
+        }
+        SubmitReply::Submitted { url }
     }
 
     fn fail(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
@@ -431,12 +683,74 @@ impl PullRequestState {
     }
 }
 
+/// After GitHub rejected the token of a submit (`error`; the token was marked revoked): the
+/// forge is resolved again, which looks the token up again, from the submitting tab's checkout
+/// first, and the review is tried once more. A pending review the rejected token couldn't
+/// delete is deleted with the new one first. Any other error is returned as it is.
+async fn retry_with_new_token(
+    pull_request: &Entity<PullRequestState>,
+    target: &SubmitTarget,
+    number: u64,
+    url: SharedString,
+    submission: ReviewSubmission,
+    error: anyhow::Error,
+    cx: &mut AsyncApp,
+) -> Result<SubmittedReview> {
+    let executor = cx.background_executor().clone();
+    let left_behind = match forge::github_error(&error) {
+        Some(GitHubError::Auth { .. }) => None,
+        Some(GitHubError::PendingReviewLeft {
+            cause,
+            review_id: Some(id),
+            ..
+        }) if matches!(**cause, GitHubError::Auth { .. }) => Some(*id),
+        _ => return Err(error),
+    };
+    let preferred = (target.repository.clone(), target.project.clone());
+    let Some(resolve) =
+        pull_request.update(cx, |this, cx| this.resolve_forge_from(Some(preferred), cx))
+    else {
+        return Err(error);
+    };
+    let forge = match resolve.await {
+        Ok(forge) => forge,
+        Err(resolve_error) => {
+            log::error!("resolving the forge again after a rejected token: {resolve_error:#}");
+            return Err(error);
+        }
+    };
+    pull_request.update(cx, |this, _| this.use_forge(forge.clone()));
+    if let Some(id) = left_behind
+        && let Err(discard_error) = executor
+            .spawn(forge.discard_pending_review(number, id))
+            .await
+    {
+        log::error!("deleting the pending review {id} with a new token: {discard_error:#}");
+        return Err(error);
+    }
+    executor
+        .spawn(forge.submit_review(number, url, submission))
+        .await
+}
+
 /// How a review tab's working tree differs from its HEAD commit, file by file. GitHub numbers a
 /// pull request's lines in its head commit, while the review shows the working tree with its
 /// uncommitted and unsaved changes: this translates between the two.
 pub(crate) struct LocalChanges {
     project: WeakEntity<Project>,
     files: HashMap<RepoPath, LocalFile>,
+    /// HEAD's text of some files, read from git: after HEAD moves, Zed reloads the diffs' base
+    /// texts some time later, so until a file's base text is this one its new lines can't be
+    /// numbered in that commit.
+    head_texts: Option<HeadTexts>,
+}
+
+struct HeadTexts {
+    head: Oid,
+    /// A hash of each file's text in `head`; `None`: the commit doesn't have the file.
+    hashes: HashMap<RepoPath, Option<u64>>,
+    reading: HashSet<RepoPath>,
+    _tasks: Vec<Task<()>>,
 }
 
 struct LocalFile {
@@ -453,7 +767,8 @@ enum LocalFileState {
         diff: Entity<BufferDiff>,
         _subscription: Subscription,
     },
-    /// The file couldn't be compared: its lines count as HEAD's.
+    /// The file couldn't be compared. Threads count its lines as HEAD's; comments can't be
+    /// numbered.
     Failed,
 }
 
@@ -465,6 +780,8 @@ pub(crate) enum LineMapping {
     Changed,
     /// The file hasn't been compared with HEAD yet.
     Unknown,
+    /// The file couldn't be compared with HEAD.
+    Failed,
 }
 
 /// A file was compared with HEAD, or its comparison changed.
@@ -477,7 +794,104 @@ impl LocalChanges {
         Self {
             project: project.downgrade(),
             files: HashMap::default(),
+            head_texts: None,
         }
+    }
+
+    /// Reads the text of `paths` in `head` from git (once per commit and file), which the
+    /// files' comparisons must be based on before their new lines map to that commit.
+    pub(crate) fn read_head_texts(
+        &mut self,
+        repository: &Entity<Repository>,
+        head: Oid,
+        paths: Vec<RepoPath>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .head_texts
+            .as_ref()
+            .is_none_or(|texts| texts.head != head)
+        {
+            self.head_texts = Some(HeadTexts {
+                head,
+                hashes: HashMap::default(),
+                reading: HashSet::default(),
+                _tasks: Vec::new(),
+            });
+        }
+        let Some(texts) = self.head_texts.as_mut() else {
+            return;
+        };
+        let paths = paths
+            .into_iter()
+            .filter(|path| !texts.hashes.contains_key(path) && !texts.reading.contains(path))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return;
+        }
+        texts.reading.extend(paths.iter().cloned());
+        let revisions = paths
+            .iter()
+            .map(|path| format!("{head}:{}", path.as_unix_str()))
+            .collect::<Vec<_>>();
+        let read = crate::commits::local_job(
+            repository,
+            "code review: read HEAD",
+            move |backend| async move { backend.load_revisions(revisions).await },
+            cx,
+        );
+        let task = cx.spawn(async move |this, cx| {
+            let read = read.await;
+            this.update(cx, |this, cx| {
+                let Some(texts) = this.head_texts.as_mut().filter(|texts| texts.head == head)
+                else {
+                    return;
+                };
+                for path in &paths {
+                    texts.reading.remove(path);
+                }
+                match read {
+                    Ok(blobs) => {
+                        for (path, blob) in paths.into_iter().zip(blobs) {
+                            let hash =
+                                blob.map(|bytes| text_hash(&String::from_utf8_lossy(&bytes)));
+                            texts.hashes.insert(path, hash);
+                        }
+                    }
+                    // Unchecked, the comparisons are taken as they are.
+                    Err(error) => log::error!("reading files at {head}: {error:#}"),
+                }
+                cx.emit(LocalChangesEvent);
+            })
+            .log_err();
+        });
+        texts._tasks.push(task);
+    }
+
+    /// Whether HEAD's texts are still being read from git.
+    pub(crate) fn is_reading_head_texts(&self) -> bool {
+        self.head_texts
+            .as_ref()
+            .is_some_and(|texts| !texts.reading.is_empty())
+    }
+
+    /// Whether the file's comparison is based on its text in `head`, as far as known.
+    fn is_based_on(&self, path: &RepoPath, head: Oid, diff: &BufferDiffSnapshot) -> bool {
+        let Some(texts) = self.head_texts.as_ref().filter(|texts| texts.head == head) else {
+            return true;
+        };
+        if texts.reading.contains(path) {
+            return false;
+        }
+        let Some(expected) = texts.hashes.get(path) else {
+            return true;
+        };
+        let base = diff
+            .base_text_exists()
+            .then(|| text_hash(&diff.base_text().text()));
+        base == *expected
     }
 
     /// Compares the review's files (with the buffers showing them) with HEAD, each buffer once,
@@ -547,31 +961,12 @@ impl LocalChanges {
         cx.emit(LocalChangesEvent);
     }
 
-    /// Where HEAD's `lines` (1-based) of the file are in the working tree.
+    /// Where HEAD's `lines` (1-based) of the file are in the working tree, to show threads. A
+    /// file that couldn't be compared counts as unchanged.
     pub(crate) fn head_to_working(
         &self,
         path: &RepoPath,
         lines: RangeInclusive<u32>,
-        cx: &App,
-    ) -> LineMapping {
-        self.map(path, lines, true, cx)
-    }
-
-    /// Where the working tree's `lines` (1-based) of the file are in HEAD.
-    pub(crate) fn working_to_head(
-        &self,
-        path: &RepoPath,
-        lines: RangeInclusive<u32>,
-        cx: &App,
-    ) -> LineMapping {
-        self.map(path, lines, false, cx)
-    }
-
-    fn map(
-        &self,
-        path: &RepoPath,
-        lines: RangeInclusive<u32>,
-        from_head: bool,
         cx: &App,
     ) -> LineMapping {
         let Some(file) = self.files.get(path) else {
@@ -583,14 +978,47 @@ impl LocalChanges {
             LocalFileState::Loaded { diff, .. } => {
                 let diff = diff.read(cx).snapshot(cx);
                 let buffer = file.buffer.read(cx).snapshot();
-                if from_head {
-                    head_lines_in_working_tree(&diff, &buffer, lines)
-                } else {
-                    working_lines_in_head(&diff, &buffer, lines)
-                }
+                head_lines_in_working_tree(&diff, &buffer, lines)
             }
         }
     }
+
+    /// Where the working tree's `lines` (1-based) of the file are in `head`, the checked-out
+    /// commit, to number comments.
+    pub(crate) fn working_to_head(
+        &self,
+        path: &RepoPath,
+        lines: RangeInclusive<u32>,
+        head: Oid,
+        cx: &App,
+    ) -> LineMapping {
+        let Some(file) = self.files.get(path) else {
+            return LineMapping::Unknown;
+        };
+        match &file.state {
+            LocalFileState::Loading { .. } => LineMapping::Unknown,
+            LocalFileState::Failed => LineMapping::Failed,
+            LocalFileState::Loaded { diff, .. } => {
+                let diff = diff.read(cx).snapshot(cx);
+                if !self.is_based_on(path, head, &diff) {
+                    return LineMapping::Unknown;
+                }
+                let buffer = file.buffer.read(cx).snapshot();
+                working_lines_in_head(&diff, &buffer, lines)
+            }
+        }
+    }
+}
+
+/// Compares texts the way git and Zed may store them differently (line endings, a BOM).
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.trim_start_matches('\u{feff}')
+        .chars()
+        .filter(|character| *character != '\r')
+        .for_each(|character| character.hash(&mut hasher));
+    hasher.finish()
 }
 
 /// Where HEAD's `lines` (the diff's base text, 1-based) are in the buffer, unless the buffer
@@ -1944,6 +2372,73 @@ pub(crate) mod tests {
             cx: &VisualTestContext,
         ) -> bool {
             review.read_with(cx, |review, cx| review.comments().read(cx).is_editing(cx))
+        }
+
+        /// HEAD's text of a file is reloaded some time after HEAD moves: until the file's
+        /// comparison is based on the checked-out commit's text (read from git), its new lines
+        /// aren't numbered in that commit. A file that couldn't be compared at all isn't either.
+        #[gpui::test]
+        async fn test_new_lines_wait_for_the_heads_text(cx: &mut TestAppContext) {
+            let fixture = Fixture {
+                local_edits: true,
+                ..Fixture::default()
+            };
+            let (fs, _workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            let local_changes =
+                review.read_with(cx, |review, _| review.local_changes().unwrap().clone());
+            let repository = review.read_with(cx, |review, _| review.repository().clone());
+            let engine = RepoPath::new("src/engine.rs").unwrap();
+            let head: Oid = PR1_HEAD_OID.parse().unwrap();
+            let map = |cx: &mut VisualTestContext| {
+                local_changes.read_with(cx, |local_changes, cx| {
+                    local_changes.working_to_head(&engine, 61..=61, head, cx)
+                })
+            };
+            let read_head = |cx: &mut VisualTestContext| {
+                local_changes.update(cx, |local_changes, cx| {
+                    local_changes.read_head_texts(&repository, head, vec![engine.clone()], cx)
+                });
+                cx.run_until_parked();
+            };
+            // The working tree has two lines more at the top than HEAD.
+            assert_eq!(map(cx), LineMapping::Lines(59..=59));
+            read_head(cx);
+            assert_eq!(map(cx), LineMapping::Lines(59..=59));
+
+            // HEAD's text in git gains a line at the top (as a checkout of a commit that has it
+            // would), before Zed reloads the comparison's base.
+            fs.with_git_state(dot_git(), false, |state| {
+                let text = state.head_contents.get(&engine).cloned().unwrap();
+                state
+                    .head_contents
+                    .insert(engine.clone(), [b"local 1\n".as_slice(), &text].concat());
+            })
+            .unwrap();
+            local_changes.update(cx, |local_changes, _| local_changes.head_texts = None);
+            read_head(cx);
+            assert_eq!(map(cx), LineMapping::Unknown);
+
+            // Zed reloads it: the first local line is HEAD's now.
+            fs.with_git_state(dot_git(), true, |_| {}).unwrap();
+            cx.run_until_parked();
+            assert_eq!(map(cx), LineMapping::Lines(60..=60));
+            local_changes.read_with(cx, |local_changes, _| {
+                assert!(!local_changes.is_reading_head_texts())
+            });
+
+            local_changes.update(cx, |local_changes, _| {
+                if let Some(file) = local_changes.files.get_mut(&engine) {
+                    file.state = LocalFileState::Failed;
+                }
+            });
+            assert_eq!(map(cx), LineMapping::Failed);
+            assert_eq!(
+                local_changes.read_with(cx, |local_changes, cx| {
+                    local_changes.head_to_working(&engine, 59..=59, cx)
+                }),
+                LineMapping::Lines(59..=59),
+                "threads still show"
+            );
         }
 
         #[gpui::test]

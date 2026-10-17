@@ -341,6 +341,16 @@ impl CommentBlocks {
                 self.reconcile(window, cx);
             }
             ReviewSessionEvent::Comment(CommentEvent::Changed(id)) => {
+                // Submitted from another tab: this tab's editor can't change it any more.
+                if self
+                    .session
+                    .read(cx)
+                    .comments()
+                    .get(*id)
+                    .is_some_and(|comment| comment.is_submitted())
+                {
+                    self.discard_editor(*id, window, cx);
+                }
                 self.update_views(&[*id], cx);
                 // Another tab's new comment shows once it has text.
                 self.reconcile(window, cx);
@@ -410,6 +420,20 @@ impl CommentBlocks {
         if self.targeted == Some(ItemKey::Comment(id)) {
             self.targeted = None;
         }
+    }
+
+    /// Closes the comment's editor without saving it.
+    fn discard_editor(&mut self, id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.views.get(&id).cloned() else {
+            return;
+        };
+        let Some(editing) = view.update(cx, |view, cx| view.take_editing(cx)) else {
+            return;
+        };
+        if editing.editor.focus_handle(cx).contains_focused(window, cx) {
+            self.return_focus_from(Some(id), editing.return_to.upgrade(), window, cx);
+        }
+        cx.emit(CommentBlocksEvent::EditingChanged);
     }
 
     /// Shows the pull request's threads (`items`) instead of those shown so far.

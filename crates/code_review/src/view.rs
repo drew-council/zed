@@ -118,11 +118,13 @@ pub(crate) fn register(workspace: &mut Workspace) {
     });
     workspace.register_action(|workspace, _: &SubmitReview, window, cx| {
         discard_vim_count(window, cx);
-        let Some(review) = current_review(workspace, cx) else {
+        // Only the review in front of the user: submitting posts it, finishing a local one
+        // overwrites the clipboard or ends `zed --review --wait`.
+        let Some(review) = workspace.active_item_as::<ReviewView>(cx) else {
             workspace.show_toast(
                 Toast::new(
                     NotificationId::unique::<SubmitReview>(),
-                    "Open a review first",
+                    "Switch to the review tab to submit its review",
                 )
                 .autohide(),
                 cx,
@@ -379,7 +381,7 @@ fn block_write_action(window: &mut Window, cx: &mut App) {
 }
 
 /// The repository's HEAD commit, as Zed last saw it.
-fn head_oid(repo: &Entity<Repository>, cx: &App) -> Option<Oid> {
+pub(crate) fn head_oid(repo: &Entity<Repository>, cx: &App) -> Option<Oid> {
     repo.read(cx)
         .head_commit
         .as_ref()
@@ -424,7 +426,7 @@ fn remote_items(
                     });
                     continue;
                 }
-                LineMapping::Unknown => continue,
+                LineMapping::Unknown | LineMapping::Failed => continue,
             },
             placement => placement,
         };
@@ -1452,9 +1454,12 @@ impl ReviewView {
         &self.workspace
     }
 
-    /// The reviewed repository's HEAD commit, as Zed last saw it.
-    pub(crate) fn head_oid(&self, cx: &App) -> Option<Oid> {
-        head_oid(&self.repo, cx)
+    pub(crate) fn repository(&self) -> &Entity<Repository> {
+        &self.repo
+    }
+
+    pub(crate) fn project(&self) -> &Entity<Project> {
+        &self.project
     }
 
     /// The base commit a pull request review compares against.

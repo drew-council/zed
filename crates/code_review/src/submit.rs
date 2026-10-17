@@ -5,24 +5,33 @@
 use crate::{
     comments::{Comment, CommentId, CommentState, CommentTarget, Side, open_web_link},
     forge::{
-        self, CommentableLines, DiffSide, GitHubError, HeadStatus, PullRequestStatus, ReviewEvent,
-        ReviewFileComment, ReviewLineComment, ReviewSubmission, SubmittedReview,
+        self, CommentableLines, DiffSide, HeadStatus, PullRequestStatus, ReviewEvent,
+        ReviewFileComment, ReviewLineComment, ReviewSubmission,
     },
-    pull_request::{LineMapping, PullRequestState, check_comment_target},
-    session::{ReviewOutcome, ReviewSession},
-    view::ReviewView,
+    pull_request::{
+        LineMapping, LocalChanges, LocalChangesEvent, PullRequestState, SubmitReply, SubmitRequest,
+        SubmitTarget, check_comment_target,
+    },
+    session::{ReviewOutcome, ReviewSession, ReviewSessionEvent},
+    view::{ReviewView, head_oid},
 };
-use anyhow::Result;
 use editor::hover_markdown_style;
+use futures::channel::oneshot;
 use git::{Oid, repository::RepoPath};
 use gpui::{
-    ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Task, WeakEntity,
+    ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
+    WeakEntity,
 };
+use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement};
-use std::ops::RangeInclusive;
+use project::{
+    Project,
+    git_store::{Repository, RepositoryEvent},
+};
+use std::{ops::RangeInclusive, sync::Arc};
 use ui::{ElevationIndex, KeyBinding, TintColor, Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
+use workspace::{DismissDecision, ModalView, Toast, Workspace, notifications::NotificationId};
 
 /// A comment's text as GitHub gets it: a typed comment starts with its type, as in tuicr.
 pub(crate) fn comment_body(comment: &Comment) -> String {
@@ -153,6 +162,15 @@ pub(crate) fn plan_review(
                             ));
                             continue;
                         }
+                        LineMapping::Failed => {
+                            planned.refused.push((
+                                location,
+                                "Its file couldn't be compared with HEAD, so its lines can't be \
+                                 numbered as GitHub numbers them"
+                                    .into(),
+                            ));
+                            continue;
+                        }
                     },
                 };
                 let target = CommentTarget::Lines {
@@ -189,6 +207,9 @@ pub(crate) fn plan_review(
     planned
 }
 
+/// The toast saying where a finished local review went.
+pub(crate) struct FinishedReviewToast;
+
 /// `; s` in a local review: its comments as Markdown go to `zed --review --wait` when it waits
 /// for the review, else to the clipboard. The comments stay drafts.
 pub(crate) fn finish_local_review(
@@ -215,17 +236,24 @@ pub(crate) fn finish_local_review(
         }
     };
     workspace.show_toast(
-        Toast::new(NotificationId::unique::<SubmitReviewModal>(), message).autohide(),
+        Toast::new(NotificationId::unique::<FinishedReviewToast>(), message).autohide(),
         cx,
     );
 }
 
 /// The modal of `; s` in a pull request review: Comment, Approve or Request Changes, what the
-/// review sends, and what keeps it from being sent.
+/// review sends, and what keeps it from being sent. It is planned again whenever the drafts,
+/// the pull request, the checkout or its changes change, except while it submits: then it shows
+/// what is being sent, and can't be closed (the submit itself belongs to the pull request).
 pub(crate) struct SubmitReviewModal {
     review: WeakEntity<ReviewView>,
     session: Entity<ReviewSession>,
     pull_request: Entity<PullRequestState>,
+    repository: Entity<Repository>,
+    project: WeakEntity<Project>,
+    workspace: WeakEntity<Workspace>,
+    local_changes: Option<Entity<LocalChanges>>,
+    language_registry: Arc<LanguageRegistry>,
     planned: PlannedReview,
     event: ReviewEvent,
     /// GitHub doesn't let authors approve their own pull request or request changes on it.
@@ -238,12 +266,22 @@ pub(crate) struct SubmitReviewModal {
     status: PullRequestStatus,
     /// The pull request's base on GitHub isn't the one the review compares against.
     base_moved: bool,
+    /// The drafts haven't loaded from the database yet.
+    session_loading: bool,
+    /// HEAD's texts of the files with new-side drafts are being read, to check that their
+    /// comparisons with HEAD are up to date.
+    reading_head_texts: bool,
+    /// Another tab or window of the pull request is submitting a review.
+    submitting_elsewhere: bool,
+    /// The last submit may have posted the review (see [`PullRequestState::uncertain_submit`]).
+    uncertain: Option<SharedString>,
     head_check: HeadCheck,
     submit_state: SubmitState,
     body: Option<Entity<Markdown>>,
     focus_handle: FocusHandle,
     _head_check_task: Task<()>,
-    _submit_task: Task<()>,
+    _reply_task: Task<()>,
+    _subscriptions: Vec<Subscription>,
 }
 
 /// What GitHub says about the pull request now, asked when the modal opens.
@@ -257,6 +295,7 @@ pub(crate) enum HeadCheck {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SubmitState {
     Ready,
+    /// This modal's submit (or check of an uncertain one) runs.
     Submitting,
     Failed(SharedString),
 }
@@ -267,9 +306,11 @@ pub(crate) enum SubmitAction {
     Submit,
     /// The review needs a body: write a review comment first.
     AddReviewComment,
+    /// The last submit may have posted the review: ask GitHub before sending it again.
+    CheckGitHub,
     /// Something keeps the review from being sent.
     Blocked,
-    /// Checking the pull request, or submitting.
+    /// Checking the pull request or the files, loading the drafts, or submitting.
     Busy,
 }
 
@@ -290,7 +331,18 @@ impl Notice {
 }
 
 impl EventEmitter<DismissEvent> for SubmitReviewModal {}
-impl ModalView for SubmitReviewModal {}
+
+impl ModalView for SubmitReviewModal {
+    /// Escape, Cancel, a click outside and another modal (the command palette, say) all ask to
+    /// close the modal: not while its submit runs, whose result it shows.
+    fn on_before_dismiss(&mut self, _: &mut Window, _: &mut Context<Self>) -> DismissDecision {
+        if self.submit_state == SubmitState::Submitting {
+            DismissDecision::Pending
+        } else {
+            DismissDecision::Dismiss(true)
+        }
+    }
+}
 
 impl Focusable for SubmitReviewModal {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -320,32 +372,13 @@ impl SubmitReviewModal {
     ) -> Self {
         let view = review.read(cx);
         let session = view.session().clone();
-        let local_head = view.head_oid(cx);
+        let repository = view.repository().clone();
+        let project = view.project().downgrade();
+        let workspace = view.workspace().clone();
         let local_changes = view.local_changes().cloned();
-        let review_base = view.pull_request_base();
         let language_registry = view.language_registry(cx);
-        let state = pull_request.read(cx);
-        let details = state.details().clone();
-        let forge = state.forge().clone();
-        let comments = session
-            .read(cx)
-            .comments()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let planned = plan_review(
-            &comments,
-            state.commentable(),
-            local_head == Some(details.head_oid),
-            |path, lines| match &local_changes {
-                Some(local_changes) => local_changes.read(cx).working_to_head(path, lines, cx),
-                None => LineMapping::Unknown,
-            },
-        );
-        let body = (!planned.body.is_empty()).then(|| {
-            let body = SharedString::from(planned.body.clone());
-            cx.new(|cx| Markdown::new(body, Some(language_registry), None, cx))
-        });
+        let details = pull_request.read(cx).details().clone();
+        let forge = pull_request.read(cx).forge().clone();
         let check = cx
             .background_executor()
             .spawn(forge.pull_request_head(details.number));
@@ -363,27 +396,145 @@ impl SubmitReviewModal {
             })
             .log_err();
         });
-        let canonical = forge.context().canonical.to_string();
-        Self {
+        let mut subscriptions = vec![
+            cx.subscribe(
+                &session,
+                |this, _, event: &ReviewSessionEvent, cx| match event {
+                    ReviewSessionEvent::Loaded | ReviewSessionEvent::Comment(_) => this.replan(cx),
+                    ReviewSessionEvent::FilesChanged(_)
+                    | ReviewSessionEvent::HunksChanged
+                    | ReviewSessionEvent::Failed(_) => {}
+                },
+            ),
+            // Loads, and submits from any tab.
+            cx.observe(&pull_request, |this, _, cx| this.replan(cx)),
+            cx.subscribe(&repository, |this, _, event: &RepositoryEvent, cx| {
+                if matches!(event, RepositoryEvent::HeadChanged) {
+                    this.replan(cx);
+                }
+            }),
+        ];
+        if let Some(local_changes) = &local_changes {
+            subscriptions.push(
+                cx.subscribe(local_changes, |this, _, _: &LocalChangesEvent, cx| {
+                    this.replan(cx)
+                }),
+            );
+        }
+        let mut modal = Self {
             review: review.downgrade(),
             session,
-            planned,
+            pull_request,
+            repository,
+            project,
+            workspace,
+            local_changes,
+            language_registry,
+            planned: PlannedReview::default(),
             event: ReviewEvent::Comment,
             own_pull_request: details.viewer_is_author,
             commit: details.head_oid,
-            local_head,
-            title: format!("{canonical}#{}: {}", details.number, details.title).into(),
+            local_head: None,
+            title: SharedString::default(),
             url: details.url.clone(),
             status: details.state,
-            base_moved: review_base.is_some_and(|base| base != details.base_oid),
+            base_moved: false,
+            session_loading: false,
+            reading_head_texts: false,
+            submitting_elsewhere: false,
+            uncertain: None,
             head_check: HeadCheck::Checking,
             submit_state: SubmitState::Ready,
-            body,
+            body: None,
             focus_handle: cx.focus_handle(),
-            pull_request,
             _head_check_task: head_check_task,
-            _submit_task: Task::ready(()),
+            _reply_task: Task::ready(()),
+            _subscriptions: subscriptions,
+        };
+        modal.replan(cx);
+        modal
+    }
+
+    /// Plans the review again from the drafts, the pull request and the checkout as they are
+    /// now. Not while this modal submits: it shows what is being sent.
+    fn replan(&mut self, cx: &mut Context<Self>) {
+        let state = self.pull_request.read(cx);
+        self.submitting_elsewhere =
+            state.is_submitting() && self.submit_state != SubmitState::Submitting;
+        self.uncertain = state.uncertain_submit().cloned();
+        if self.submit_state == SubmitState::Submitting {
+            cx.notify();
+            return;
         }
+        let details = state.details().clone();
+        let canonical = state.forge().context().canonical.to_string();
+        let local_head = head_oid(&self.repository, cx);
+        let at_head = local_head == Some(details.head_oid);
+        let review_base = self
+            .review
+            .upgrade()
+            .and_then(|review| review.read(cx).pull_request_base());
+        let session = self.session.read(cx);
+        self.session_loading = !session.is_loaded();
+        let comments = session.comments().iter().cloned().collect::<Vec<_>>();
+        // New lines are numbered in HEAD through each file's comparison with it, which must be
+        // a comparison with this commit's text: Zed reloads it some time after a checkout.
+        if at_head && let Some(local_changes) = &self.local_changes {
+            let paths = comments
+                .iter()
+                .filter(|comment| !comment.is_submitted() && !comment.body.is_empty())
+                .filter_map(|comment| match &comment.target {
+                    CommentTarget::Lines {
+                        path,
+                        side: Side::New,
+                        ..
+                    } => Some(path.clone()),
+                    CommentTarget::Lines { .. }
+                    | CommentTarget::File { .. }
+                    | CommentTarget::Review => None,
+                })
+                .collect::<Vec<_>>();
+            let repository = self.repository.clone();
+            local_changes.update(cx, |local_changes, cx| {
+                local_changes.read_head_texts(&repository, details.head_oid, paths, cx)
+            });
+        }
+        let local_changes = self
+            .local_changes
+            .as_ref()
+            .map(|local_changes| local_changes.read(cx));
+        self.reading_head_texts =
+            local_changes.is_some_and(|local_changes| local_changes.is_reading_head_texts());
+        let planned = plan_review(
+            &comments,
+            self.pull_request.read(cx).commentable(),
+            at_head,
+            |path, lines| match local_changes {
+                Some(local_changes) => {
+                    local_changes.working_to_head(path, lines, details.head_oid, cx)
+                }
+                None => LineMapping::Unknown,
+            },
+        );
+        if planned.body != self.planned.body || self.body.is_none() {
+            self.body = (!planned.body.is_empty()).then(|| {
+                let body = SharedString::from(planned.body.clone());
+                let language_registry = self.language_registry.clone();
+                cx.new(|cx| Markdown::new(body, Some(language_registry), None, cx))
+            });
+        }
+        self.planned = planned;
+        self.own_pull_request = details.viewer_is_author;
+        if !self.is_allowed(self.event) {
+            self.event = ReviewEvent::Comment;
+        }
+        self.commit = details.head_oid;
+        self.local_head = local_head;
+        self.title = format!("{canonical}#{}: {}", details.number, details.title).into();
+        self.url = details.url.clone();
+        self.status = details.state;
+        self.base_moved = review_base.is_some_and(|base| base != details.base_oid);
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -483,21 +634,35 @@ impl SubmitReviewModal {
     /// What may be unexpected about the review, which is sent anyway.
     pub(crate) fn warnings(&self) -> Vec<Notice> {
         let mut warnings = Vec::new();
+        if let Some(uncertain) = &self.uncertain {
+            warnings.push(Notice {
+                text: format!(
+                    "The last submit may have posted the review: {uncertain} Enter asks GitHub."
+                )
+                .into(),
+                link: Some(self.url.clone()),
+            });
+        }
+        // What GitHub says now, else what it said when the pull request loaded.
+        let mut status = self.status;
         match &self.head_check {
-            HeadCheck::Checked(status) if status.head_oid != self.commit => {
-                warnings.push(Notice::new(format!(
-                    "The pull request moved on to {} since it was loaded: the comments are \
-                     made on {}, the commit reviewed here.",
-                    status.head_oid.display_short(),
-                    self.commit.display_short()
-                )))
+            HeadCheck::Checked(head) => {
+                status = head.state;
+                if head.head_oid != self.commit {
+                    warnings.push(Notice::new(format!(
+                        "The pull request moved on to {} since it was loaded: the comments are \
+                         made on {}, the commit reviewed here.",
+                        head.head_oid.display_short(),
+                        self.commit.display_short()
+                    )))
+                }
             }
             HeadCheck::Failed(error) => warnings.push(Notice::new(format!(
                 "Couldn't check the pull request on GitHub: {error}"
             ))),
-            HeadCheck::Checking | HeadCheck::Checked(_) => {}
+            HeadCheck::Checking => {}
         }
-        match self.status {
+        match status {
             PullRequestStatus::Open => {}
             PullRequestStatus::Closed => warnings.push(Notice::new("This pull request is closed.")),
             PullRequestStatus::Merged => warnings.push(Notice::new("This pull request is merged.")),
@@ -520,8 +685,15 @@ impl SubmitReviewModal {
     }
 
     pub(crate) fn action(&self) -> SubmitAction {
-        if self.submit_state == SubmitState::Submitting || self.head_check == HeadCheck::Checking {
+        if self.submit_state == SubmitState::Submitting
+            || self.submitting_elsewhere
+            || self.head_check == HeadCheck::Checking
+            || self.session_loading
+            || self.reading_head_texts
+        {
             SubmitAction::Busy
+        } else if self.uncertain.is_some() {
+            SubmitAction::CheckGitHub
         } else if !self.blockers().is_empty() {
             SubmitAction::Blocked
         } else if needs_body(self.event, self.comment_count(), &self.planned.body) {
@@ -533,14 +705,17 @@ impl SubmitReviewModal {
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         match self.action() {
-            SubmitAction::Submit => self.submit(window, cx),
+            SubmitAction::Submit => self.submit(cx),
             SubmitAction::AddReviewComment => self.add_review_comment(window, cx),
+            SubmitAction::CheckGitHub => self.check_github(cx),
             SubmitAction::Blocked | SubmitAction::Busy => {}
         }
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(DismissEvent);
+        if self.submit_state != SubmitState::Submitting {
+            cx.emit(DismissEvent);
+        }
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -576,87 +751,67 @@ impl SubmitReviewModal {
         });
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let submission = ReviewSubmission {
-            commit_id: self.commit,
-            event: self.event,
-            body: self.planned.body.clone(),
-            line_comments: self.planned.line_comments.clone(),
-            file_comments: self.planned.file_comments.clone(),
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        let request = SubmitRequest {
+            submission: ReviewSubmission {
+                commit_id: self.commit,
+                event: self.event,
+                body: self.planned.body.clone(),
+                line_comments: self.planned.line_comments.clone(),
+                file_comments: self.planned.file_comments.clone(),
+            },
+            target: SubmitTarget {
+                session: self.session.clone(),
+                comment_ids: self.planned.comment_ids.clone(),
+                repository: self.repository.downgrade(),
+                project: self.project.clone(),
+                workspace: self.workspace.clone(),
+            },
         };
-        let pull_request = self.pull_request.clone();
-        let (forge, number) = {
-            let pull_request = pull_request.read(cx);
-            (pull_request.forge().clone(), pull_request.details().number)
-        };
-        let url = self.url.clone();
-        let executor = cx.background_executor().clone();
         self.submit_state = SubmitState::Submitting;
         cx.notify();
-        self._submit_task = cx.spawn_in(window, async move |this, cx| {
-            let mut submitted = executor
-                .spawn(forge.submit_review(number, url.clone(), submission.clone()))
-                .await;
-            // A token GitHub rejected was marked revoked: the forge is resolved again, with
-            // whatever token there is now, and the review tried once more (nothing was made).
-            let rejected_token = submitted.as_ref().err().is_some_and(|error| {
-                matches!(forge::github_error(error), Some(GitHubError::Auth { .. }))
-            });
-            if rejected_token {
-                let resolve =
-                    pull_request.update(cx, |pull_request, cx| pull_request.resolve_forge(cx));
-                if let Some(resolve) = resolve
-                    && let Some(forge) = resolve.await.log_err()
-                {
-                    pull_request
-                        .update(cx, |pull_request, _| pull_request.use_forge(forge.clone()));
-                    submitted = executor
-                        .spawn(forge.submit_review(number, url, submission))
-                        .await;
-                }
-            }
-            this.update_in(cx, |this, window, cx| this.submitted(submitted, window, cx))
+        let reply = self
+            .pull_request
+            .update(cx, |pull_request, cx| pull_request.submit(request, cx));
+        self.await_reply(reply, cx);
+    }
+
+    /// Asks GitHub whether the last submit posted the review.
+    fn check_github(&mut self, cx: &mut Context<Self>) {
+        let reply = self.pull_request.update(cx, |pull_request, cx| {
+            pull_request.check_uncertain_submit(cx)
+        });
+        if let Some(reply) = reply {
+            self.submit_state = SubmitState::Submitting;
+            cx.notify();
+            self.await_reply(reply, cx);
+        }
+    }
+
+    fn await_reply(&mut self, reply: oneshot::Receiver<SubmitReply>, cx: &mut Context<Self>) {
+        self._reply_task = cx.spawn(async move |this, cx| {
+            let reply = reply.await;
+            this.update(cx, |this, cx| this.replied(reply, cx))
                 .log_err();
         });
     }
 
-    fn submitted(
-        &mut self,
-        submitted: Result<SubmittedReview>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let review = match submitted {
-            Ok(review) => review,
-            Err(error) => {
-                log::error!("submitting a review of {}: {error:#}", self.title);
-                self.submit_state = SubmitState::Failed(forge::error_message(&error));
-                cx.notify();
+    fn replied(&mut self, reply: Result<SubmitReply, oneshot::Canceled>, cx: &mut Context<Self>) {
+        self.submit_state = SubmitState::Ready;
+        match reply {
+            // The pull request shows the toast.
+            Ok(SubmitReply::Submitted { .. }) => {
+                cx.emit(DismissEvent);
                 return;
             }
-        };
-        let ids = self.planned.comment_ids.clone();
-        let url = review.url.clone();
-        self.session.update(cx, |session, cx| {
-            session.mark_submitted(&ids, review.id.to_string().into(), cx);
-            session.resolve_outcome(ReviewOutcome::Submitted {
-                url: url.to_string(),
-            });
-        });
-        // Its threads come back from GitHub, in place of the drafts.
-        self.pull_request
-            .update(cx, |pull_request, cx| pull_request.reload(cx));
-        if let Some(workspace) = Workspace::for_window(window, cx) {
-            let toast = Toast::new(
-                NotificationId::unique::<SubmitReviewModal>(),
-                format!("Review submitted: {url}"),
-            )
-            .on_click("Copy URL", move |_, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(url.to_string()))
-            });
-            workspace.update(cx, |workspace, cx| workspace.show_toast(toast, cx));
+            Ok(SubmitReply::Failed(message)) => self.submit_state = SubmitState::Failed(message),
+            // The notice says so.
+            Ok(SubmitReply::Uncertain(_)) => {}
+            Err(oneshot::Canceled) => {
+                self.submit_state = SubmitState::Failed("The submit was interrupted".into())
+            }
         }
-        cx.emit(DismissEvent);
+        self.replan(cx);
     }
 
     fn render_counts(&self) -> impl IntoElement {
@@ -761,22 +916,24 @@ impl Render for SubmitReviewModal {
         };
         let blockers = self.blockers();
         let warnings = self.warnings();
+        let muted =
+            |text: &'static str| Some(Label::new(text).size(LabelSize::Small).color(Color::Muted));
         let status = match (&self.submit_state, &self.head_check, action) {
-            (SubmitState::Submitting, _, _) => Some(
-                Label::new("Submitting…")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            ),
+            (SubmitState::Submitting, _, _) if self.uncertain.is_some() => {
+                muted("Asking GitHub whether the review was posted…")
+            }
+            (SubmitState::Submitting, _, _) => muted("Submitting…"),
             (SubmitState::Failed(error), _, _) => Some(
                 Label::new(error.clone())
                     .size(LabelSize::Small)
                     .color(Color::Error),
             ),
-            (_, HeadCheck::Checking, _) => Some(
-                Label::new("Checking the pull request on GitHub…")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            ),
+            _ if self.submitting_elsewhere => {
+                muted("A review of this pull request is being submitted from another tab…")
+            }
+            (_, HeadCheck::Checking, _) => muted("Checking the pull request on GitHub…"),
+            _ if self.session_loading => muted("Loading the review's comments…"),
+            _ if self.reading_head_texts => muted("Comparing the files with HEAD…"),
             (_, _, SubmitAction::AddReviewComment) => Some(
                 Label::new(match self.event {
                     ReviewEvent::RequestChanges => {
@@ -793,10 +950,12 @@ impl Render for SubmitReviewModal {
         };
         let confirm_label = match action {
             SubmitAction::AddReviewComment => "Add Review Comment".to_string(),
+            SubmitAction::CheckGitHub => "Check GitHub".to_string(),
             SubmitAction::Submit | SubmitAction::Blocked | SubmitAction::Busy => {
                 format!("Submit: {}", self.event.label())
             }
         };
+        let submitting = self.submit_state == SubmitState::Submitting;
         let focus_handle = self.focus_handle.clone();
 
         v_flex()
@@ -874,12 +1033,15 @@ impl Render for SubmitReviewModal {
                         Button::new("submit-review-cancel", "Cancel")
                             .label_size(LabelSize::Small)
                             .layer(ElevationIndex::ModalSurface)
+                            .disabled(submitting)
                             .key_binding(KeyBinding::for_action_in(
                                 &menu::Cancel,
                                 &focus_handle,
                                 cx,
                             ))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&menu::Cancel, window, cx)
+                            })),
                     )
                     .child(
                         Button::new("submit-review-confirm", confirm_label)
@@ -1103,6 +1265,22 @@ mod tests {
         assert!(planned.line_comments.is_empty());
         assert!(planned.file_comments.is_empty());
         assert_eq!(planned.refused.len(), 9);
+
+        // A file that couldn't be compared with HEAD: its working tree's numbers may not be
+        // HEAD's, so its new lines aren't sent.
+        let planned = plan_review(&comments[2..3], Some(&commentable), true, |_, _| {
+            LineMapping::Failed
+        });
+        assert!(planned.line_comments.is_empty());
+        assert_eq!(
+            planned.refused,
+            [(
+                "src/engine.rs:61".into(),
+                "Its file couldn't be compared with HEAD, so its lines can't be numbered as \
+                 GitHub numbers them"
+                    .into()
+            )]
+        );
     }
 }
 
@@ -1125,6 +1303,35 @@ mod review_tests {
     use std::sync::{Arc, Mutex};
 
     const PR1_URL: &str = "https://github.com/drew-council/code-review-sandbox/pull/1";
+
+    /// Another modal, which the modal layer would open instead of the submit modal.
+    struct OtherModal(FocusHandle);
+
+    impl EventEmitter<DismissEvent> for OtherModal {}
+    impl ModalView for OtherModal {}
+
+    impl Focusable for OtherModal {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.0.clone()
+        }
+    }
+
+    impl Render for OtherModal {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.0)
+        }
+    }
+
+    fn post_count(requests: &crate::github::test_support::SentRequests) -> usize {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method == Method::POST && request.uri.ends_with("/pulls/1/reviews")
+            })
+            .count()
+    }
 
     fn review_reply(id: u64, state: &str) -> Reply {
         Reply::json(
@@ -1515,5 +1722,438 @@ mod review_tests {
                     .all(|comment| comment.state == CommentState::Draft)
             )
         });
+    }
+
+    /// The submit belongs to the pull request, not the modal: while it runs, the modal doesn't
+    /// close (Escape, a click outside, another modal), and no other tab or window can submit the
+    /// drafts again. Once GitHub answers, the drafts are submitted and the modal closes.
+    #[gpui::test]
+    async fn test_closing_the_modal_while_submitting(cx: &mut TestAppContext) {
+        let (answer, gate) = oneshot::channel::<()>();
+        let gate = gate.shared();
+        let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> =
+            Arc::new(move |request| match request.operation() {
+                Some("PullRequestHead") => Some(Reply::json(PR1_HEAD)),
+                None if request.uri.ends_with("/pulls/1/reviews") => {
+                    Some(review_reply(9, "COMMENTED").after(gate.clone()))
+                }
+                _ => None,
+            });
+        let fixture = Fixture {
+            respond: Some(respond),
+            ..Fixture::default()
+        };
+        let (fs, workspace, review, requests, cx) = open_review(fixture, cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "ENGINE 59", cx);
+        comment("c", "fifty-nine", cx);
+        let session = review.read_with(cx, |review, _| review.session().clone());
+        let mut outcome = session.update(cx, |session, _| session.wait_for_outcome());
+        let pull_request = review.read_with(cx, |review, _| review.pull_request().unwrap().clone());
+
+        cx.simulate_keystrokes("; s");
+        cx.simulate_keystrokes("enter");
+        let submitting = modal(&review, cx).expect("the modal stays open while submitting");
+        submitting.read_with(cx, |modal, _| {
+            assert_eq!(modal.submit_state(), &SubmitState::Submitting);
+            assert_eq!(modal.action(), SubmitAction::Busy);
+        });
+        assert!(pull_request.read_with(cx, |pull_request, _| pull_request.is_submitting()));
+
+        cx.simulate_keystrokes("escape");
+        assert_eq!(modal(&review, cx), Some(submitting.clone()));
+        let hidden =
+            workspace.update_in(cx, |workspace, window, cx| workspace.hide_modal(window, cx));
+        assert!(
+            !hidden,
+            "a click outside the modal hides it through the modal layer"
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |_, cx| OtherModal(cx.focus_handle()))
+        });
+        assert_eq!(modal(&review, cx), Some(submitting.clone()));
+        assert_eq!(outcome.try_recv(), Ok(None));
+
+        // Another window on the same pull request: its modal waits, and its tab can't submit.
+        let project = project::Project::test(
+            fs.clone(),
+            [std::path::Path::new(util::path!("/project"))],
+            &mut cx.cx,
+        )
+        .await;
+        let other_window =
+            cx.add_window(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let mut other_cx = VisualTestContext::from_window(other_window.into(), cx);
+        let other_workspace = other_window
+            .read_with(&other_cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        other_cx.run_until_parked();
+        crate::test_support::dispatch(
+            crate::OpenPullRequest {
+                reference: Some("1".into()),
+            },
+            &mut other_cx,
+        );
+        let other_review = crate::test_support::active_review(&other_workspace, &mut other_cx);
+        assert_eq!(
+            other_review.read_with(&other_cx, |review, _| review.pull_request().cloned()),
+            Some(pull_request.clone())
+        );
+        other_workspace.update_in(&mut other_cx, |workspace, window, cx| {
+            SubmitReviewModal::open(
+                workspace,
+                other_review.clone(),
+                pull_request.clone(),
+                window,
+                cx,
+            )
+        });
+        other_cx.run_until_parked();
+        let other_modal = modal(&other_review, &mut other_cx).unwrap();
+        other_modal.read_with(&other_cx, |modal, _| {
+            assert_eq!(modal.action(), SubmitAction::Busy)
+        });
+        let refused = pull_request.update(cx, |pull_request, cx| {
+            pull_request.submit(
+                SubmitRequest {
+                    submission: ReviewSubmission {
+                        commit_id: PR1_HEAD_OID.parse().unwrap(),
+                        event: ReviewEvent::Comment,
+                        body: "again".into(),
+                        line_comments: Vec::new(),
+                        file_comments: Vec::new(),
+                    },
+                    target: SubmitTarget {
+                        session: session.clone(),
+                        comment_ids: Vec::new(),
+                        repository: WeakEntity::new_invalid(),
+                        project: WeakEntity::new_invalid(),
+                        workspace: WeakEntity::new_invalid(),
+                    },
+                },
+                cx,
+            )
+        });
+        assert!(
+            matches!(refused.now_or_never(), Some(Ok(SubmitReply::Failed(_)))),
+            "a second submit runs while the first does"
+        );
+        assert_eq!(post_count(&requests), 1);
+
+        // GitHub answers.
+        answer.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(modal(&review, cx), None);
+        session.read_with(cx, |session, _| {
+            assert!(
+                session
+                    .comments()
+                    .iter()
+                    .all(|comment| comment.is_submitted())
+            )
+        });
+        assert_eq!(
+            outcome.try_recv(),
+            Ok(Some(ReviewOutcome::Submitted {
+                url: format!("{PR1_URL}#pullrequestreview-9")
+            }))
+        );
+        // The other window's modal has nothing left to submit.
+        other_cx.run_until_parked();
+        other_modal.read_with(&other_cx, |modal, _| {
+            assert_eq!(modal.planned().comment_ids, []);
+            assert_eq!(modal.action(), SubmitAction::AddReviewComment);
+        });
+        assert_eq!(post_count(&requests), 1);
+        assert!(notification_count(&workspace, cx) > 0);
+    }
+
+    /// A submit that fails without saying whether GitHub made the review (a 5xx here) and whose
+    /// lookup fails too isn't offered again: Enter asks GitHub. Finding nothing, the drafts can
+    /// be sent again; a review GitHub has from the attempt is the success, without a second post.
+    #[gpui::test]
+    async fn test_uncertain_submit_is_checked_before_sending_again(cx: &mut TestAppContext) {
+        // What `GET …/reviews` answers: an error, no review, then the posted one.
+        let listed = Arc::new(Mutex::new(Reply::status(500, "{}")));
+        let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> = Arc::new({
+            let listed = listed.clone();
+            move |request| match request.operation() {
+                Some("PullRequestHead") => Some(Reply::json(PR1_HEAD)),
+                None if request.method == Method::POST => Some(Reply::status(502, "{}")),
+                None if request.uri.contains("/reviews/77/comments") => {
+                    Some(Reply::json(r#"[{"body": "fifty-nine"}]"#))
+                }
+                None if request.uri.contains("/pulls/1/reviews") => {
+                    let listed = listed.lock().unwrap();
+                    Some(Reply::status(listed.status, listed.body.clone()))
+                }
+                _ => None,
+            }
+        });
+        let fixture = Fixture {
+            respond: Some(respond),
+            ..Fixture::default()
+        };
+        let (_fs, _workspace, review, requests, cx) = open_review(fixture, cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "ENGINE 59", cx);
+        comment("c", "fifty-nine", cx);
+        let session = review.read_with(cx, |review, _| review.session().clone());
+
+        cx.simulate_keystrokes("; s");
+        cx.simulate_keystrokes("enter");
+        let modal = modal(&review, cx).unwrap();
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.action(), SubmitAction::CheckGitHub);
+            let warnings = modal.warnings();
+            assert!(
+                warnings[0]
+                    .text
+                    .starts_with("The last submit may have posted the review"),
+                "{warnings:?}"
+            );
+        });
+        // The pull request remembers it, for every modal.
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("; s");
+        let modal = super::review_tests::modal(&review, cx).unwrap();
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.action(), SubmitAction::CheckGitHub)
+        });
+        assert_eq!(post_count(&requests), 1);
+
+        // GitHub has no review from it: nothing was posted, and the drafts can be sent again.
+        *listed.lock().unwrap() = Reply::json("[]");
+        cx.simulate_keystrokes("enter");
+        modal.read_with(cx, |modal, _| {
+            assert!(
+                matches!(modal.submit_state(), SubmitState::Failed(message) if message.starts_with("GitHub has no review from the last attempt")),
+                "{:?}",
+                modal.submit_state()
+            );
+            assert_eq!(modal.action(), SubmitAction::Submit);
+        });
+        assert_eq!(post_count(&requests), 1);
+
+        // The second post fails the same way, but GitHub made the review this time.
+        let submitted_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        *listed.lock().unwrap() = Reply::json(
+            serde_json::json!([{
+                "id": 77,
+                "user": { "login": "drew-council" },
+                "body": "",
+                "state": "COMMENTED",
+                "html_url": format!("{PR1_URL}#pullrequestreview-77"),
+                "commit_id": PR1_HEAD_OID,
+                "submitted_at": submitted_at,
+            }])
+            .to_string(),
+        );
+        cx.simulate_keystrokes("enter");
+        assert!(super::review_tests::modal(&review, cx).is_none());
+        assert_eq!(post_count(&requests), 2);
+        session.read_with(cx, |session, _| {
+            for comment in session.comments().iter() {
+                assert_eq!(
+                    comment.state,
+                    CommentState::Submitted {
+                        review_id: "77".into()
+                    }
+                );
+            }
+        });
+    }
+
+    /// A submitted comment can't change: an editor of it open in another tab closes without
+    /// saving, and the session refuses to change or delete it.
+    #[gpui::test]
+    async fn test_submitted_comments_cant_change(cx: &mut TestAppContext) {
+        let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> =
+            Arc::new(|request| match request.operation() {
+                Some("PullRequestHead") => Some(Reply::json(PR1_HEAD)),
+                None if request.uri.ends_with("/pulls/1/reviews") => {
+                    Some(review_reply(9, "COMMENTED"))
+                }
+                _ => None,
+            });
+        let fixture = Fixture {
+            respond: Some(respond),
+            ..Fixture::default()
+        };
+        let (_fs, workspace, review, _requests, cx) = open_review(fixture, cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "ENGINE 59", cx);
+        comment("c", "fifty-nine", cx);
+        let session = review.read_with(cx, |review, _| review.session().clone());
+
+        // A split clone edits the comment, without leaving the editor.
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let split = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.split_and_clone(pane, workspace::SplitDirection::Right, window, cx)
+        });
+        cx.run_until_parked();
+        drop(split);
+        let clone = crate::test_support::active_review(&workspace, cx);
+        assert_ne!(clone, review);
+        let clone_rhs = rhs_editor(&clone, cx);
+        move_to_row_with_text(&clone_rhs, "ENGINE 59", cx);
+        cx.simulate_keystrokes("i");
+        cx.simulate_input("not sent ");
+        assert!(has_open_comment_editor(&clone, cx));
+
+        // The original tab submits.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&review, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("; s");
+        cx.simulate_keystrokes("enter");
+        assert!(modal(&review, cx).is_none());
+        assert!(!has_open_comment_editor(&clone, cx));
+        let id = session.read_with(cx, |session, _| {
+            let comment = session.comments().iter().next().unwrap();
+            assert_eq!(comment.body, "fifty-nine");
+            assert!(comment.is_submitted());
+            comment.id
+        });
+        session.update(cx, |session, cx| {
+            session.set_comment_body(id, "changed", cx);
+            session.set_comment_type(id, Some(crate::comments::CommentType::Issue), cx);
+            session.delete_comment(id, cx);
+        });
+        session.read_with(cx, |session, _| {
+            let comment = session.comments().get(id).unwrap();
+            assert_eq!(comment.body, "fifty-nine");
+            assert_eq!(comment.comment_type, None);
+        });
+    }
+
+    /// GitHub rejected the token after the pending review was made, so the rejected token
+    /// couldn't delete it either: the forge is resolved again, the pending review deleted with
+    /// the new token, and the review posted once more.
+    #[gpui::test]
+    async fn test_rejected_token_after_the_pending_review(cx: &mut TestAppContext) {
+        let events = Arc::new(Mutex::new(0));
+        let deletes = Arc::new(Mutex::new(0));
+        let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> = Arc::new({
+            let events = events.clone();
+            let deletes = deletes.clone();
+            move |request| {
+                let bad_credentials = || Reply::status(401, r#"{"message":"Bad credentials"}"#);
+                match request.operation() {
+                    Some("PullRequestHead") => Some(Reply::json(PR1_HEAD)),
+                    Some("AddFileThread") => Some(Reply::json(
+                        r#"{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_new"}}}}"#,
+                    )),
+                    None if request.uri.ends_with("/pulls/1/reviews/9/events") => {
+                        let mut events = events.lock().unwrap();
+                        *events += 1;
+                        Some(if *events == 1 {
+                            bad_credentials()
+                        } else {
+                            review_reply(9, "COMMENTED")
+                        })
+                    }
+                    None if request.uri.ends_with("/pulls/1/reviews/9")
+                        && request.method == Method::DELETE =>
+                    {
+                        let mut deletes = deletes.lock().unwrap();
+                        *deletes += 1;
+                        Some(if *deletes == 1 {
+                            bad_credentials()
+                        } else {
+                            Reply::status(204, "")
+                        })
+                    }
+                    None if request.uri.ends_with("/pulls/1/reviews/9") => Some(bad_credentials()),
+                    None if request.uri.ends_with("/pulls/1/reviews") => {
+                        Some(review_reply(9, "PENDING"))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        let fixture = Fixture {
+            respond: Some(respond),
+            ..Fixture::default()
+        };
+        let (_fs, _workspace, review, requests, cx) = open_review(fixture, cx).await;
+        comment("shift-c", "the engine", cx);
+        let resolutions = requests_of(&requests, "RepositoryContext");
+
+        cx.simulate_keystrokes("; s");
+        cx.simulate_keystrokes("enter");
+        assert!(modal(&review, cx).is_none(), "submitted with the new token");
+        assert_eq!(requests_of(&requests, "RepositoryContext"), resolutions + 1);
+        let reviews =
+            "https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews";
+        assert_eq!(
+            posted(&requests),
+            [
+                format!("POST {reviews}"),
+                "AddFileThread".to_string(),
+                format!("POST {reviews}/9/events"),
+                format!("DELETE {reviews}/9"),
+                format!("DELETE {reviews}/9"),
+                format!("POST {reviews}"),
+                "AddFileThread".to_string(),
+                format!("POST {reviews}/9/events"),
+            ]
+        );
+        let session = review.read_with(cx, |review, _| review.session().clone());
+        session.read_with(cx, |session, _| {
+            assert!(
+                session
+                    .comments()
+                    .iter()
+                    .all(|comment| comment.is_submitted())
+            )
+        });
+    }
+
+    /// `; s` (and the palette's Submit Review) act on the review tab in front only: from another
+    /// tab, nothing is finished.
+    #[gpui::test]
+    async fn test_submit_needs_the_review_tab(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "line 3", cx);
+        comment("c", "fix this", cx);
+        let session = review.read_with(cx, |review, _| review.session().clone());
+        let mut outcome = session.update(cx, |session, _| session.wait_for_outcome());
+
+        let project_path = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .find_project_path(util::path!("/project/a.rs"), cx)
+                .unwrap()
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(project_path, None, true, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        crate::test_support::dispatch(crate::SubmitReview, cx);
+        assert_eq!(outcome.try_recv(), Ok(None));
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<SubmitReviewModal>(cx).is_none()
+        }));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&review, true, true, window, cx)
+        });
+        crate::test_support::dispatch(crate::SubmitReview, cx);
+        assert!(matches!(
+            outcome.try_recv(),
+            Ok(Some(ReviewOutcome::Finished { markdown: Some(_) }))
+        ));
     }
 }

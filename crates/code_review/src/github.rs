@@ -6,7 +6,7 @@ use crate::forge::{
     ForgeRepoRef, HeadStatus, Hunk, HunkRowKind, HunkRows, PendingReview, PullRequestDetails,
     PullRequestListFilter, PullRequestStatus, PullRequestSummary, RemoteComment,
     RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewDecision, ReviewEvent,
-    ReviewLineComment, ReviewState, ReviewSubmission, SubmittedReview, ThreadAnchor,
+    ReviewLineComment, ReviewState, ReviewSubmission, SubmitAttempt, SubmittedReview, ThreadAnchor,
 };
 use anyhow::anyhow;
 use collections::HashMap;
@@ -109,6 +109,21 @@ pub enum GitHubError {
     FileCommentRefused {
         path: SharedString,
     },
+    /// A submit failed (`cause`) after GitHub made its pending review, which couldn't be
+    /// deleted: it keeps GitHub from taking another review of the viewer. `review_id` is its id,
+    /// when known.
+    PendingReviewLeft {
+        cause: Arc<GitHubError>,
+        pull_request_url: SharedString,
+        review_id: Option<u64>,
+    },
+    /// A submit failed (`cause`) without saying whether GitHub made the review, and GitHub
+    /// couldn't be asked afterwards.
+    ReviewUncertain {
+        cause: Arc<GitHubError>,
+        pull_request_url: SharedString,
+        attempt: Box<SubmitAttempt>,
+    },
     /// The request failed, GitHub answered with an unexpected status, or the response wasn't what
     /// GitHub sends.
     Transport(Arc<anyhow::Error>),
@@ -208,6 +223,26 @@ impl GitHubError {
             GitHubError::FileCommentRefused { path } => {
                 format!("GitHub rejected the file comment on {path} (file not in the PR?).").into()
             }
+            GitHubError::PendingReviewLeft {
+                cause,
+                pull_request_url,
+                ..
+            } => format!(
+                "{} A pending review was left on the pull request, which keeps GitHub from taking \
+                 another review: discard it there, then try again. {pull_request_url}",
+                sentence(&cause.hint())
+            )
+            .into(),
+            GitHubError::ReviewUncertain {
+                cause,
+                pull_request_url,
+                ..
+            } => format!(
+                "{} GitHub may have posted the review anyway, and couldn't be asked: check \
+                 again before submitting it again ({pull_request_url}).",
+                sentence(&cause.hint())
+            )
+            .into(),
             GitHubError::GraphQl { messages } => {
                 format!("GitHub API error: {}", messages.join("; ")).into()
             }
@@ -226,6 +261,15 @@ impl std::error::Error for GitHubError {}
 
 fn transport(error: impl Into<anyhow::Error>) -> GitHubError {
     GitHubError::Transport(Arc::new(error.into()))
+}
+
+/// A hint followed by more text: it ends with a full stop.
+fn sentence(hint: &str) -> String {
+    if hint.ends_with(['.', '!', '?']) {
+        hint.to_string()
+    } else {
+        format!("{hint}.")
+    }
 }
 
 fn rate_limit_hint(reset: Option<i64>, now: i64) -> String {
@@ -1219,11 +1263,9 @@ fn pending_review(reviews: Connection<PendingReviewNode>) -> Option<PendingRevie
         .into_iter()
         .flatten()
         .find(|review| review.viewer_did_author)
-        .and_then(|review| {
-            Some(PendingReview {
-                node_id: review.id.into(),
-                database_id: review.database_id?,
-            })
+        .map(|review| PendingReview {
+            node_id: review.id.into(),
+            database_id: review.database_id,
         })
 }
 
@@ -1864,18 +1906,24 @@ impl GitHubClient {
     /// Posts a review in one request, or, when it has file comments (which REST can't make), as
     /// a pending review that gets them through GraphQL and is then submitted. A pending review
     /// is deleted again when anything after it fails, since it would block every later review.
+    ///
+    /// A failure that doesn't say whether GitHub carried the request out (see [`is_ambiguous`])
+    /// is followed by asking GitHub what became of the review, so that it isn't posted twice:
+    /// a review it has is a success.
     async fn submit_review(
         &self,
         repo: &ForgeRepo,
         number: u64,
         url: SharedString,
         submission: ReviewSubmission,
+        viewer: &str,
     ) -> Result<SubmittedReview, GitHubError> {
         let what = pull_request_name(repo, number);
-        let reviews = format!("repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.name);
+        let reviews = reviews_path(repo, number);
         let refused = |error| review_refused(error, &url, submission.commit_id);
+        let started = OffsetDateTime::now_utc().unix_timestamp();
         if submission.file_comments.is_empty() {
-            let bytes = self
+            let error = match self
                 .rest_send(
                     Method::POST,
                     &reviews,
@@ -1883,12 +1931,26 @@ impl GitHubClient {
                     &what,
                 )
                 .await
-                .map_err(refused)?;
-            let review: ReviewResponse = parse_json(&bytes, "create review")?;
-            return Ok(review.into());
+            {
+                Ok(bytes) => match parse_json::<SubmittedResponse>(&bytes, "create review") {
+                    Ok(review) => return Ok(review.into()),
+                    // GitHub made the review (it answered 2xx), which its list has.
+                    Err(error) => error,
+                },
+                Err(error) if !is_ambiguous(&error) => return Err(refused(error)),
+                Err(error) => error,
+            };
+            let attempt = SubmitAttempt {
+                submission,
+                started,
+                pending_review: None,
+            };
+            return self
+                .reconcile(repo, number, &url, viewer, attempt, error)
+                .await;
         }
 
-        let bytes = self
+        let pending = match self
             .rest_send(
                 Method::POST,
                 &reviews,
@@ -1896,22 +1958,36 @@ impl GitHubClient {
                 &what,
             )
             .await
-            .map_err(refused)?;
-        let pending: ReviewResponse = parse_json(&bytes, "create pending review")?;
-        let submitted = self
+        {
+            Ok(bytes) => match parse_json::<ReviewResponse>(&bytes, "create pending review") {
+                Ok(pending) => pending,
+                Err(error) => {
+                    return Err(self
+                        .discard_unknown_pending_review(repo, number, &url, error)
+                        .await);
+                }
+            },
+            Err(error) if !is_ambiguous(&error) => return Err(refused(error)),
+            Err(error) => {
+                return Err(self
+                    .pending_review_after_failure(repo, number, &url, error)
+                    .await);
+            }
+        };
+        let error = match self
             .finish_pending_review(&reviews, &pending, &submission, &what)
             .await
-            .map_err(refused);
-        if submitted.is_err() {
-            let delete = format!("{reviews}/{}", pending.id);
-            if let Err(error) = self.rest_send(Method::DELETE, &delete, None, &what).await {
-                log::error!(
-                    "deleting the pending review {} of {what} after a failed submit: {error}",
-                    pending.id
-                );
-            }
-        }
-        submitted
+        {
+            Ok(review) => return Ok(review),
+            Err(error) => refused(error),
+        };
+        let attempt = SubmitAttempt {
+            submission,
+            started,
+            pending_review: Some(pending.id),
+        };
+        self.clean_up_pending_review(repo, number, &url, &pending, attempt, error)
+            .await
     }
 
     async fn finish_pending_review(
@@ -1955,11 +2031,357 @@ impl GitHubClient {
                 what,
             )
             .await?;
-        let review: ReviewResponse = parse_json(&bytes, "submit review")?;
-        Ok(review.into())
+        // A 2xx submitted the review, whatever its body says.
+        Ok(parse_json::<SubmittedResponse>(&bytes, "submit review")
+            .map(SubmittedReview::from)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                pending.submitted()
+            }))
+    }
+
+    /// After the pending review's submit failed with `error`: deletes the pending review, or
+    /// finds out that GitHub submitted it after all.
+    async fn clean_up_pending_review(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        url: &SharedString,
+        pending: &ReviewResponse,
+        attempt: SubmitAttempt,
+        error: GitHubError,
+    ) -> Result<SubmittedReview, GitHubError> {
+        let what = pull_request_name(repo, number);
+        let review = format!("{}/{}", reviews_path(repo, number), pending.id);
+        let delete_error = match self.rest_send(Method::DELETE, &review, None, &what).await {
+            Ok(_) => return Err(error),
+            Err(delete_error) => delete_error,
+        };
+        // GitHub only deletes pending reviews: the request that submitted this one failed after
+        // GitHub carried it out (a timeout, say).
+        if is_not_pending(&delete_error) {
+            return Ok(pending.submitted());
+        }
+        if matches!(delete_error, GitHubError::NotFound { .. }) {
+            return Err(error);
+        }
+        log::error!(
+            "deleting the pending review {} of {what} after a failed submit: {delete_error}",
+            pending.id
+        );
+        let left = |error: GitHubError| GitHubError::PendingReviewLeft {
+            cause: Arc::new(error),
+            pull_request_url: url.clone(),
+            review_id: Some(pending.id),
+        };
+        match self.review_state(repo, number, pending.id).await {
+            Ok(Some(state)) if state == "PENDING" => Err(left(error)),
+            Ok(Some(_)) => Ok(pending.submitted()),
+            Ok(None) => Err(error),
+            Err(lookup_error) => {
+                log::error!(
+                    "asking GitHub about the review {}: {lookup_error}",
+                    pending.id
+                );
+                if is_ambiguous(&error) {
+                    Err(GitHubError::ReviewUncertain {
+                        cause: Arc::new(error),
+                        pull_request_url: url.clone(),
+                        attempt: Box::new(attempt),
+                    })
+                } else {
+                    Err(left(error))
+                }
+            }
+        }
+    }
+
+    /// GitHub answered the pending review's `POST` with 2xx but something unreadable
+    /// (`error`): it made the pending review, the viewer's only one on the pull request, so
+    /// that one is deleted.
+    async fn discard_unknown_pending_review(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        url: &SharedString,
+        error: GitHubError,
+    ) -> GitHubError {
+        let left = |error: GitHubError, review_id| GitHubError::PendingReviewLeft {
+            cause: Arc::new(error),
+            pull_request_url: url.clone(),
+            review_id,
+        };
+        let pending = match self.pull_request_head(repo, number).await {
+            Ok(status) => status.pending_review,
+            Err(lookup_error) => {
+                log::error!("looking for the pending review of {repo}#{number}: {lookup_error}");
+                return left(error, None);
+            }
+        };
+        let Some(pending) = pending else {
+            return error;
+        };
+        let Some(id) = pending.database_id else {
+            return left(error, None);
+        };
+        let what = pull_request_name(repo, number);
+        let review = format!("{}/{id}", reviews_path(repo, number));
+        match self.rest_send(Method::DELETE, &review, None, &what).await {
+            Ok(_) => error,
+            Err(delete_error) => {
+                log::error!("deleting the pending review {id} of {what}: {delete_error}");
+                left(error, Some(id))
+            }
+        }
+    }
+
+    /// The pending review's `POST` failed without saying whether GitHub made it (`error`). One
+    /// that is there now is left alone (it might be the viewer's own from GitHub's page) but
+    /// named, since it blocks the next review.
+    async fn pending_review_after_failure(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        url: &SharedString,
+        error: GitHubError,
+    ) -> GitHubError {
+        match self.pull_request_head(repo, number).await {
+            Ok(HeadStatus {
+                pending_review: Some(pending),
+                ..
+            }) => GitHubError::PendingReviewLeft {
+                cause: Arc::new(error),
+                pull_request_url: url.clone(),
+                review_id: pending.database_id,
+            },
+            // Nothing was made. If GitHub can't be asked, a retry is safe anyway: GitHub
+            // refuses a second pending review, with a hint that links to the first.
+            Ok(_) | Err(_) => error,
+        }
+    }
+
+    /// A review posted in one request failed without saying whether GitHub made it (`error`):
+    /// the review GitHub has from this attempt is the result.
+    async fn reconcile(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        url: &SharedString,
+        viewer: &str,
+        attempt: SubmitAttempt,
+        error: GitHubError,
+    ) -> Result<SubmittedReview, GitHubError> {
+        match self
+            .find_submitted_review(repo, number, viewer, &attempt)
+            .await
+        {
+            Ok(Some(review)) => Ok(review),
+            Ok(None) => Err(error),
+            Err(lookup_error) => {
+                log::error!("looking for the review of a failed submit: {lookup_error}");
+                Err(GitHubError::ReviewUncertain {
+                    cause: Arc::new(error),
+                    pull_request_url: url.clone(),
+                    attempt: Box::new(attempt),
+                })
+            }
+        }
+    }
+
+    /// The review `attempt` posted, if GitHub has it: its pending review once submitted, or a
+    /// review of the viewer on the same commit, with the same event, body and comments, submitted
+    /// after the attempt started. A pending review the attempt left is deleted.
+    async fn find_submitted_review(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        viewer: &str,
+        attempt: &SubmitAttempt,
+    ) -> Result<Option<SubmittedReview>, GitHubError> {
+        let what = pull_request_name(repo, number);
+        if let Some(id) = attempt.pending_review {
+            let path = format!("{}/{id}", reviews_path(repo, number));
+            let review: ListedReview = match self.rest_get(&path, &what).await {
+                Ok(review) => review,
+                Err(GitHubError::NotFound { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if review.state != "PENDING" {
+                return Ok(Some(review.into()));
+            }
+            return match self.rest_send(Method::DELETE, &path, None, &what).await {
+                Ok(_) | Err(GitHubError::NotFound { .. }) => Ok(None),
+                Err(error) if is_not_pending(&error) => Ok(Some(review.into())),
+                Err(error) => Err(error),
+            };
+        }
+        let submission = &attempt.submission;
+        let state = submitted_state(submission.event);
+        let commit = submission.commit_id.to_string();
+        let mut candidates = self
+            .list_reviews(repo, number)
+            .await?
+            .into_iter()
+            .filter(|review| {
+                review
+                    .user
+                    .as_ref()
+                    .is_some_and(|user| user.login.eq_ignore_ascii_case(viewer))
+                    && review.state == state
+                    && review.commit_id.as_deref() == Some(commit.as_str())
+                    && same_text(review.body.as_deref().unwrap_or_default(), &submission.body)
+                    && review.submitted_at.is_some_and(|submitted_at| {
+                        submitted_at.unix_timestamp()
+                            >= attempt.started.saturating_sub(CLOCK_SKEW_SECONDS)
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|review| std::cmp::Reverse(review.submitted_at));
+        let mut expected = submission
+            .line_comments
+            .iter()
+            .map(|comment| normalized_text(&comment.body))
+            .collect::<Vec<_>>();
+        expected.sort();
+        for review in candidates {
+            let mut bodies = self.review_comment_bodies(repo, number, review.id).await?;
+            bodies.sort();
+            if bodies == expected {
+                return Ok(Some(review.into()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The state of the review `id`; `None` when GitHub doesn't have it.
+    async fn review_state(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        id: u64,
+    ) -> Result<Option<String>, GitHubError> {
+        let what = pull_request_name(repo, number);
+        let path = format!("{}/{id}", reviews_path(repo, number));
+        match self.rest_get::<ListedReview>(&path, &what).await {
+            Ok(review) => Ok(Some(review.state)),
+            Err(GitHubError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn discard_pending_review(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        id: u64,
+    ) -> Result<(), GitHubError> {
+        let what = pull_request_name(repo, number);
+        let path = format!("{}/{id}", reviews_path(repo, number));
+        match self.rest_send(Method::DELETE, &path, None, &what).await {
+            Ok(_) | Err(GitHubError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Every review of the pull request (pending ones only the viewer's), oldest first.
+    async fn list_reviews(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+    ) -> Result<Vec<ListedReview>, GitHubError> {
+        let what = pull_request_name(repo, number);
+        let path = reviews_path(repo, number);
+        self.rest_pages(&path, &what).await
+    }
+
+    async fn review_comment_bodies(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        id: u64,
+    ) -> Result<Vec<String>, GitHubError> {
+        let what = pull_request_name(repo, number);
+        let path = format!("{}/{id}/comments", reviews_path(repo, number));
+        let comments: Vec<ListedReviewComment> = self.rest_pages(&path, &what).await?;
+        Ok(comments
+            .into_iter()
+            .map(|comment| normalized_text(&comment.body))
+            .collect())
+    }
+
+    /// Every item of a REST list, page by page (at most [`MAX_FILE_PAGES`]).
+    async fn rest_pages<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &SharedString,
+    ) -> Result<Vec<T>, GitHubError> {
+        let mut items = Vec::new();
+        for page in 1..=MAX_FILE_PAGES {
+            let entries: Vec<T> = self
+                .rest_get(
+                    &format!("{path}?per_page={FILES_PER_PAGE}&page={page}"),
+                    what,
+                )
+                .await?;
+            let full_page = entries.len() == FILES_PER_PAGE;
+            items.extend(entries);
+            if !full_page {
+                break;
+            }
+        }
+        Ok(items)
     }
 }
 
+/// Reviews submitted this long before an attempt started may still be the attempt's: this
+/// machine's clock may be ahead of GitHub's.
+const CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+
+/// Whether a request that failed with `error` may have been carried out by GitHub anyway: it
+/// timed out or lost its connection, GitHub answered 5xx (it does for slow writes that still
+/// complete), or the answer couldn't be read. A 4xx means it wasn't.
+fn is_ambiguous(error: &GitHubError) -> bool {
+    matches!(error, GitHubError::Transport(_))
+}
+
+/// GitHub's answer to deleting a review that isn't pending (any more).
+fn is_not_pending(error: &GitHubError) -> bool {
+    match error {
+        GitHubError::Validation {
+            messages,
+            raw_message,
+        } => {
+            raw_message.contains("non-pending")
+                || messages
+                    .iter()
+                    .any(|message| message.contains("non-pending"))
+        }
+        _ => false,
+    }
+}
+
+fn reviews_path(repo: &ForgeRepo, number: u64) -> String {
+    format!("repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.name)
+}
+
+/// A review's state on GitHub once submitted with `event`.
+fn submitted_state(event: ReviewEvent) -> &'static str {
+    match event {
+        ReviewEvent::Comment => "COMMENTED",
+        ReviewEvent::Approve => "APPROVED",
+        ReviewEvent::RequestChanges => "CHANGES_REQUESTED",
+    }
+}
+
+fn normalized_text(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn same_text(left: &str, right: &str) -> bool {
+    normalized_text(left) == normalized_text(right)
+}
+
+/// A pending review GitHub made.
 #[derive(Deserialize)]
 struct ReviewResponse {
     id: u64,
@@ -1967,13 +2389,60 @@ struct ReviewResponse {
     html_url: String,
 }
 
-impl From<ReviewResponse> for SubmittedReview {
-    fn from(review: ReviewResponse) -> Self {
+impl ReviewResponse {
+    /// The review, once submitted: its id and URL stay.
+    fn submitted(&self) -> SubmittedReview {
+        SubmittedReview {
+            id: self.id,
+            url: self.html_url.clone().into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SubmittedResponse {
+    id: u64,
+    html_url: String,
+}
+
+impl From<SubmittedResponse> for SubmittedReview {
+    fn from(review: SubmittedResponse) -> Self {
         SubmittedReview {
             id: review.id,
             url: review.html_url.into(),
         }
     }
+}
+
+/// An entry of REST `GET /repos/{owner}/{repo}/pulls/{number}/reviews`.
+#[derive(Deserialize)]
+struct ListedReview {
+    id: u64,
+    #[serde(default)]
+    user: Option<LoginNode>,
+    #[serde(default)]
+    body: Option<String>,
+    state: String,
+    html_url: String,
+    #[serde(default)]
+    commit_id: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    submitted_at: Option<OffsetDateTime>,
+}
+
+impl From<ListedReview> for SubmittedReview {
+    fn from(review: ListedReview) -> Self {
+        SubmittedReview {
+            id: review.id,
+            url: review.html_url.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ListedReviewComment {
+    #[serde(default)]
+    body: String,
 }
 
 #[derive(Deserialize)]
@@ -2133,7 +2602,39 @@ impl Forge for GitHubForge {
     ) -> BoxFuture<'static, anyhow::Result<SubmittedReview>> {
         let client = self.client.clone();
         let repo = self.context.canonical.clone();
-        async move { Ok(client.submit_review(&repo, number, url, submission).await?) }.boxed()
+        let viewer = self.context.viewer.clone();
+        async move {
+            Ok(client
+                .submit_review(&repo, number, url, submission, &viewer)
+                .await?)
+        }
+        .boxed()
+    }
+
+    fn find_submitted_review(
+        &self,
+        number: u64,
+        attempt: SubmitAttempt,
+    ) -> BoxFuture<'static, anyhow::Result<Option<SubmittedReview>>> {
+        let client = self.client.clone();
+        let repo = self.context.canonical.clone();
+        let viewer = self.context.viewer.clone();
+        async move {
+            Ok(client
+                .find_submitted_review(&repo, number, &viewer, &attempt)
+                .await?)
+        }
+        .boxed()
+    }
+
+    fn discard_pending_review(
+        &self,
+        number: u64,
+        id: u64,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        let client = self.client.clone();
+        let repo = self.context.canonical.clone();
+        async move { Ok(client.discard_pending_review(&repo, number, id).await?) }.boxed()
     }
 }
 
@@ -2399,6 +2900,10 @@ pub(crate) mod test_support {
         pub(crate) status: u16,
         pub(crate) headers: Vec<(&'static str, String)>,
         pub(crate) body: String,
+        /// No answer: the request fails as a timeout does.
+        pub(crate) timed_out: bool,
+        /// The answer comes once this resolves.
+        pub(crate) gate: Option<Shared<futures::channel::oneshot::Receiver<()>>>,
     }
 
     impl Reply {
@@ -2411,6 +2916,23 @@ pub(crate) mod test_support {
                 status,
                 headers: Vec::new(),
                 body: body.into(),
+                timed_out: false,
+                gate: None,
+            }
+        }
+
+        pub(crate) fn after(
+            mut self,
+            gate: Shared<futures::channel::oneshot::Receiver<()>>,
+        ) -> Self {
+            self.gate = Some(gate);
+            self
+        }
+
+        pub(crate) fn timeout() -> Self {
+            Self {
+                timed_out: true,
+                ..Self::status(200, "")
             }
         }
 
@@ -2449,6 +2971,10 @@ pub(crate) mod test_support {
                     };
                     let reply = respond(&sent);
                     requests.lock().unwrap().push(sent);
+                    if let Some(gate) = reply.gate.clone() {
+                        gate.await.ok();
+                    }
+                    anyhow::ensure!(!reply.timed_out, "operation timed out");
                     let mut response = Response::builder().status(reply.status);
                     for (name, value) in reply.headers {
                         response = response.header(name, value);
@@ -3126,7 +3652,7 @@ mod tests {
             details.pending_review,
             Some(PendingReview {
                 node_id: "PRR_pending".into(),
-                database_id: 5555705425,
+                database_id: Some(5555705425),
             })
         );
         assert_eq!(details.head_repository, None);
@@ -4001,6 +4527,7 @@ mod tests {
 
     const REVIEWS: &str =
         "https://api.github.com/repos/drew-council/code-review-sandbox/pulls/2/reviews";
+    const VIEWER: &str = "drew-council";
 
     fn expected_line_comments() -> Value {
         json!([
@@ -4021,9 +4548,14 @@ mod tests {
     #[test]
     fn test_submit_review_in_one_request() {
         let (http, requests) = fake_github(|_| review_reply(5, "CHANGES_REQUESTED"));
-        let review =
-            block_on(client(http).submit_review(&sandbox(), 2, PR2_URL.into(), submission(&[])))
-                .unwrap();
+        let review = block_on(client(http).submit_review(
+            &sandbox(),
+            2,
+            PR2_URL.into(),
+            submission(&[]),
+            VIEWER,
+        ))
+        .unwrap();
         assert_eq!(
             review,
             SubmittedReview {
@@ -4062,6 +4594,7 @@ mod tests {
             2,
             PR2_URL.into(),
             submission(&["docs/notes.md", "src/settings.rs"]),
+            VIEWER,
         ))
         .unwrap();
         assert_eq!(review.id, 7);
@@ -4097,31 +4630,34 @@ mod tests {
     }
 
     /// A pending review is deleted when anything after it fails: it would keep GitHub from
-    /// taking any other review. A failed delete is only logged.
+    /// taking any other review. When the delete fails, the error says the pending review is
+    /// still there, with the pull request's link.
     #[test]
     fn test_failed_submit_deletes_the_pending_review() {
-        for (case, null_thread, events_status, delete_status, expected_hint) in [
+        let left = format!(
+            "Could not comment pull request review. A pending review was left on the pull \
+             request, which keeps GitHub from taking another review: discard it there, then try \
+             again. {PR2_URL}"
+        );
+        for (case, null_thread, events_status, delete_status, expected_hint, last) in [
             (
                 "file not in the pull request",
                 true,
                 200,
                 200,
-                "GitHub rejected the file comment on docs/notes.md (file not in the PR?).",
+                "GitHub rejected the file comment on docs/notes.md (file not in the PR?).".into(),
+                Method::DELETE,
             ),
             (
                 "submitting fails",
                 false,
                 422,
                 200,
-                "Could not comment pull request review.",
+                "Could not comment pull request review.".to_string(),
+                Method::DELETE,
             ),
-            (
-                "deleting fails too",
-                false,
-                422,
-                500,
-                "Could not comment pull request review.",
-            ),
+            // GitHub is asked whether the review is still pending.
+            ("deleting fails too", false, 422, 500, left, Method::GET),
         ] {
             let (http, requests) = fake_github(move |request| match request.operation() {
                 Some("AddFileThread") if null_thread => {
@@ -4142,6 +4678,7 @@ mod tests {
                 2,
                 PR2_URL.into(),
                 submission(&["docs/notes.md"]),
+                VIEWER,
             ))
             .unwrap_err();
             assert_eq!(error.hint(), expected_hint, "{case}");
@@ -4150,9 +4687,298 @@ mod tests {
                 requests
                     .last()
                     .map(|(method, uri, _)| (method.clone(), uri.clone())),
-                Some((Method::DELETE, format!("{REVIEWS}/7"))),
+                Some((last, format!("{REVIEWS}/7"))),
                 "{case}"
             );
+        }
+    }
+
+    fn listed_review(id: u64, login: &str, state: &str, body: &str, submitted_at: &str) -> Value {
+        json!({
+            "id": id,
+            "node_id": format!("PRR_{id}"),
+            "user": { "login": login },
+            "body": body,
+            "state": state,
+            "html_url": format!("{PR2_URL}#pullrequestreview-{id}"),
+            "commit_id": PR1_HEAD_OID,
+            "submitted_at": submitted_at,
+        })
+    }
+
+    fn now_rfc3339(offset_seconds: i64) -> String {
+        (OffsetDateTime::now_utc() + time::Duration::seconds(offset_seconds))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    /// A one-request review that fails without saying whether GitHub made it (a timeout, a
+    /// 5xx, an unreadable answer) is looked up instead of being offered again: the viewer's
+    /// review with the same commit, event, body and comments, submitted since the attempt
+    /// started, is the result. Without one, the failure stands; when GitHub can't be asked, the
+    /// review may have been posted, which a later check finds out.
+    #[test]
+    fn test_ambiguous_failure_looks_the_review_up() {
+        let expected_bodies = json!([
+            { "body": "[NOTE] one line" }, { "body": "a range" }, { "body": "an old line" },
+            { "body": "old lines" }, { "body": "old to new" }, { "body": "seven" },
+        ]);
+        let body = "[ISSUE] Overall\n\nSecond";
+        let reviews = json!([
+            // Before the attempt.
+            listed_review(1, VIEWER, "CHANGES_REQUESTED", body, &now_rfc3339(-3600)),
+            // Someone else's.
+            listed_review(2, "someone", "CHANGES_REQUESTED", body, &now_rfc3339(0)),
+            // Another body.
+            listed_review(3, VIEWER, "CHANGES_REQUESTED", "other", &now_rfc3339(0)),
+            listed_review(4, VIEWER, "CHANGES_REQUESTED", body, &now_rfc3339(1)),
+        ]);
+        for (case, post, listed, expected) in [
+            ("5xx, posted", Reply::status(502, "{}"), true, Ok(4)),
+            ("timeout, posted", Reply::timeout(), true, Ok(4)),
+            ("unreadable 2xx", Reply::json("{"), true, Ok(4)),
+            ("timeout, not posted", Reply::timeout(), false, Err(false)),
+            ("list fails", Reply::status(502, "{}"), true, Err(true)),
+        ] {
+            let post = std::sync::Mutex::new(Some(post));
+            let reviews = reviews.clone();
+            let expected_bodies = expected_bodies.clone();
+            let list_fails = case == "list fails";
+            let (http, requests) = fake_github(move |request| {
+                if request.method == Method::POST {
+                    return post.lock().unwrap().take().unwrap();
+                }
+                if request.uri.contains("/reviews/4/comments") {
+                    return Reply::json(expected_bodies.to_string());
+                }
+                if request.uri.contains("/comments") {
+                    return Reply::json("[]");
+                }
+                if list_fails {
+                    return Reply::status(500, "{}");
+                }
+                Reply::json(if listed {
+                    reviews.to_string()
+                } else {
+                    "[]".into()
+                })
+            });
+            let result = block_on(client(http).submit_review(
+                &sandbox(),
+                2,
+                PR2_URL.into(),
+                submission(&[]),
+                VIEWER,
+            ));
+            match (result, expected) {
+                (Ok(review), Ok(id)) => assert_eq!(review.id, id, "{case}"),
+                (Err(GitHubError::ReviewUncertain { attempt, .. }), Err(true)) => {
+                    assert_eq!(attempt.pending_review, None, "{case}");
+                    assert_eq!(attempt.submission, submission(&[]), "{case}");
+                }
+                (Err(GitHubError::Transport(_)), Err(false)) => {}
+                (result, expected) => panic!("{case}: {result:?}, expected {expected:?}"),
+            }
+            // One post, never a second one.
+            let posts = sent(&requests)
+                .iter()
+                .filter(|(method, _, _)| *method == Method::POST)
+                .count();
+            assert_eq!(posts, 1, "{case}");
+        }
+    }
+
+    /// A pending review's submit that fails without saying whether GitHub carried it out: the
+    /// cleanup's delete tells (GitHub refuses to delete a submitted review), else GitHub is asked
+    /// about the review. An unreadable 2xx to the submit means it was submitted. A 401 leaves the
+    /// pending review behind (the token is dead), which the error names with its id.
+    #[test]
+    fn test_pending_review_after_an_ambiguous_failure() {
+        let not_pending = r#"{"message":"Can not delete a non-pending pull request review"}"#;
+        for (case, events, delete, state, expected) in [
+            (
+                "events time out, GitHub submitted",
+                Reply::timeout(),
+                Reply::status(422, not_pending),
+                None,
+                "submitted",
+            ),
+            (
+                "events time out, deleted",
+                Reply::timeout(),
+                Reply::status(204, ""),
+                None,
+                "failed",
+            ),
+            (
+                "events 502, delete fails, submitted",
+                Reply::status(502, "{}"),
+                Reply::status(500, "{}"),
+                Some(review_reply(7, "COMMENTED")),
+                "submitted",
+            ),
+            (
+                "events 502, delete and lookup fail",
+                Reply::status(502, "{}"),
+                Reply::status(500, "{}"),
+                Some(Reply::status(500, "{}")),
+                "uncertain",
+            ),
+            (
+                "unreadable 2xx",
+                Reply::json("<html>"),
+                Reply::status(500, "{}"),
+                None,
+                "submitted",
+            ),
+            (
+                "token rejected",
+                Reply::status(401, r#"{"message":"Bad credentials"}"#),
+                Reply::status(401, r#"{"message":"Bad credentials"}"#),
+                Some(Reply::status(401, r#"{"message":"Bad credentials"}"#)),
+                "left",
+            ),
+        ] {
+            let replies = std::sync::Mutex::new((Some(events), Some(delete), state));
+            let (http, requests) = fake_github(move |request| {
+                let mut replies = replies.lock().unwrap();
+                match request.operation() {
+                    Some("AddFileThread") => Reply::json(
+                        r#"{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_1"}}}}"#,
+                    ),
+                    _ if request.uri.ends_with("/events") => replies.0.take().unwrap(),
+                    _ if request.method == Method::DELETE => replies.1.take().unwrap(),
+                    _ if request.method == Method::GET => replies.2.take().unwrap(),
+                    _ => review_reply(7, "PENDING"),
+                }
+            });
+            let result = block_on(client(http).submit_review(
+                &sandbox(),
+                2,
+                PR2_URL.into(),
+                submission(&["docs/notes.md"]),
+                VIEWER,
+            ));
+            match (expected, result) {
+                ("submitted", Ok(review)) => assert_eq!(review.id, 7, "{case}"),
+                ("failed", Err(GitHubError::Transport(_))) => {}
+                ("uncertain", Err(GitHubError::ReviewUncertain { attempt, .. })) => {
+                    assert_eq!(attempt.pending_review, Some(7), "{case}")
+                }
+                (
+                    "left",
+                    Err(GitHubError::PendingReviewLeft {
+                        cause, review_id, ..
+                    }),
+                ) => {
+                    assert!(
+                        matches!(*cause, GitHubError::Auth { .. }),
+                        "{case}: {cause:?}"
+                    );
+                    assert_eq!(review_id, Some(7), "{case}");
+                }
+                (expected, result) => panic!("{case}: {result:?}, expected {expected}"),
+            }
+            let posts = sent(&requests)
+                .iter()
+                .filter(|(method, uri, _)| *method == Method::POST && uri.ends_with("/reviews"))
+                .count();
+            assert_eq!(posts, 1, "{case}");
+        }
+    }
+
+    /// GitHub answered the pending review's `POST` with something unreadable: it made the
+    /// pending review, which is found (the viewer can have only one) and deleted. Later, a check
+    /// of an uncertain attempt finds its pending review submitted, or deletes it.
+    #[test]
+    fn test_pending_review_cleanup_and_later_checks() {
+        let head = |pending: bool| {
+            let mut head: Value = serde_json::from_str(PR1_HEAD).unwrap();
+            if pending {
+                head["data"]["repository"]["pullRequest"]["pendingReviews"]["nodes"] = json!([
+                    { "id": "PRR_7", "databaseId": 7, "viewerDidAuthor": true }
+                ]);
+            }
+            Reply::json(head.to_string())
+        };
+        let (http, requests) = fake_github(move |request| match request.operation() {
+            Some("PullRequestHead") => head(true),
+            _ if request.method == Method::DELETE => Reply::status(204, ""),
+            _ => Reply::json("not json"),
+        });
+        let error = block_on(client(http).submit_review(
+            &sandbox(),
+            2,
+            PR2_URL.into(),
+            submission(&["docs/notes.md"]),
+            VIEWER,
+        ))
+        .unwrap_err();
+        assert!(matches!(error, GitHubError::Transport(_)), "{error:?}");
+        assert_eq!(
+            sent(&requests)
+                .last()
+                .map(|(method, uri, _)| (method.clone(), uri.clone())),
+            Some((Method::DELETE, format!("{REVIEWS}/7")))
+        );
+
+        // The pending POST timed out, and a pending review is there now: named, not deleted.
+        let (http, requests) = fake_github(move |request| match request.operation() {
+            Some("PullRequestHead") => head(true),
+            _ => Reply::timeout(),
+        });
+        let error = block_on(client(http).submit_review(
+            &sandbox(),
+            2,
+            PR2_URL.into(),
+            submission(&["docs/notes.md"]),
+            VIEWER,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                GitHubError::PendingReviewLeft {
+                    review_id: Some(7),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            sent(&requests)
+                .iter()
+                .all(|(method, _, _)| *method != Method::DELETE)
+        );
+
+        let attempt = SubmitAttempt {
+            submission: submission(&["docs/notes.md"]),
+            started: OffsetDateTime::now_utc().unix_timestamp(),
+            pending_review: Some(7),
+        };
+        for (state, delete, expected) in [
+            ("COMMENTED", 204, Some(7)),
+            ("PENDING", 204, None),
+            ("PENDING", 422, Some(7)),
+        ] {
+            let (http, requests) = fake_github(move |request| {
+                if request.method == Method::DELETE {
+                    Reply::status(
+                        delete,
+                        r#"{"message":"Can not delete a non-pending pull request review"}"#,
+                    )
+                } else {
+                    review_reply(7, state)
+                }
+            });
+            let found =
+                block_on(client(http).find_submitted_review(&sandbox(), 2, VIEWER, &attempt))
+                    .unwrap();
+            assert_eq!(found.map(|review| review.id), expected, "{state} {delete}");
+            let deleted = sent(&requests)
+                .iter()
+                .any(|(method, _, _)| *method == Method::DELETE);
+            assert_eq!(deleted, state == "PENDING", "{state} {delete}");
         }
     }
 
@@ -4184,6 +5010,7 @@ mod tests {
                 2,
                 PR2_URL.into(),
                 submission(&[]),
+                VIEWER,
             ))
             .unwrap_err();
             assert_eq!(error.hint(), expected);

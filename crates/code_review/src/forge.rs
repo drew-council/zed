@@ -125,7 +125,8 @@ pub enum ReviewDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingReview {
     pub node_id: SharedString,
-    pub database_id: u64,
+    /// `None` when GitHub doesn't say: the review still blocks new ones.
+    pub database_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -500,6 +501,19 @@ pub struct SubmittedReview {
     pub url: SharedString,
 }
 
+/// A submit that failed without saying whether GitHub made the review (a timeout, a dropped
+/// connection, a 5xx, a response that couldn't be read), to find that out later instead of
+/// posting the review twice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitAttempt {
+    pub submission: ReviewSubmission,
+    /// When it started, in Unix seconds of this machine's clock.
+    pub started: i64,
+    /// Its pending review (a review with file comments is made pending first), once GitHub made
+    /// it.
+    pub pending_review: Option<u64>,
+}
+
 /// A forge's pull request API for one repository. Futures are `'static` and `Send`, so callers
 /// can run them in the background.
 pub trait Forge: Send + Sync + 'static {
@@ -523,14 +537,27 @@ pub trait Forge: Send + Sync + 'static {
 
     fn changed_files(&self, number: u64) -> BoxFuture<'static, Result<CommentableLines>>;
 
-    /// Posts a review of the pull request whose URL is `url`. Nothing is left behind when it
-    /// fails.
+    /// Posts a review of the pull request whose URL is `url`. A failure made nothing, except
+    /// when it is a [`GitHubError::PendingReviewLeft`] (a pending review couldn't be deleted) or
+    /// a [`GitHubError::ReviewUncertain`] (the review may have been posted).
     fn submit_review(
         &self,
         number: u64,
         url: SharedString,
         submission: ReviewSubmission,
     ) -> BoxFuture<'static, Result<SubmittedReview>>;
+
+    /// The review a submit that failed with [`GitHubError::ReviewUncertain`] posted, if GitHub
+    /// has it. The attempt's pending review, when it is still pending, is deleted: then nothing
+    /// was posted.
+    fn find_submitted_review(
+        &self,
+        number: u64,
+        attempt: SubmitAttempt,
+    ) -> BoxFuture<'static, Result<Option<SubmittedReview>>>;
+
+    /// Deletes the viewer's pending review `id`, which a failed submit left behind.
+    fn discard_pending_review(&self, number: u64, id: u64) -> BoxFuture<'static, Result<()>>;
 }
 
 /// The forge of `repository`'s GitHub remote (the current branch's upstream remote, else

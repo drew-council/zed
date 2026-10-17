@@ -362,9 +362,14 @@ impl ReviewSession {
         Some(id)
     }
 
-    /// Saves the comment's text, which is trimmed first.
+    /// Saves the comment's text, which is trimmed first. A submitted comment can't change: it
+    /// is on GitHub as it was.
     pub(crate) fn set_comment_body(&mut self, id: CommentId, body: &str, cx: &mut Context<Self>) {
-        let Some(comment) = self.comments.get_mut(id) else {
+        let Some(comment) = self
+            .comments
+            .get_mut(id)
+            .filter(|comment| !comment.is_submitted())
+        else {
             return;
         };
         let body = body.trim();
@@ -383,7 +388,11 @@ impl ReviewSession {
         comment_type: Option<CommentType>,
         cx: &mut Context<Self>,
     ) {
-        let Some(comment) = self.comments.get_mut(id) else {
+        let Some(comment) = self
+            .comments
+            .get_mut(id)
+            .filter(|comment| !comment.is_submitted())
+        else {
             return;
         };
         if comment.comment_type == comment_type {
@@ -396,6 +405,13 @@ impl ReviewSession {
     }
 
     pub(crate) fn delete_comment(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        if self
+            .comments
+            .get(id)
+            .is_some_and(|comment| comment.is_submitted())
+        {
+            return;
+        }
         if self.comments.remove(id).is_some() {
             self.moved_comments.remove(&id);
             self.unchecked.remove(&id);

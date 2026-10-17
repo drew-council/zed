@@ -13,13 +13,17 @@ use workspace::{Toast, Workspace, notifications::NotificationId};
 /// written by anyone, and a link there may name a local file or another application's URL scheme
 /// behind any text; so may a URL a GitHub server sent.
 pub(crate) fn open_web_link(url: &str, window: &mut Window, cx: &mut App) {
-    if is_web_link(url) {
-        cx.open_url(url);
+    // What was checked is what opens: the parsed URL, not the text it came from.
+    if let Some(web_link) = web_link(url) {
+        cx.open_url(web_link.as_str());
         return;
     }
     log::warn!("not opening {url:?}: only web links open from a review");
     if let Some(workspace) = Workspace::for_window(window, cx) {
-        let message = format!("Not opening {url}: only http and https links open from a review");
+        let message = format!(
+            "Not opening {}: only http and https links open from a review",
+            util::truncate_and_trailoff(url, 80)
+        );
         workspace.update(cx, |workspace, cx| {
             workspace.show_toast(
                 Toast::new(NotificationId::unique::<HoveredLink>(), message).autohide(),
@@ -29,8 +33,15 @@ pub(crate) fn open_web_link(url: &str, window: &mut Window, cx: &mut App) {
     }
 }
 
+fn web_link(url: &str) -> Option<http_client::Url> {
+    http_client::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+#[cfg(test)]
 fn is_web_link(url: &str) -> bool {
-    http_client::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    web_link(url).is_some()
 }
 
 /// The link under the mouse in one of a view's markdown texts (by the text's key), whose
