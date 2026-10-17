@@ -24,8 +24,10 @@ reviews from the picker with checkout in place or in a new worktree (see "Milest
 and slice (c), the pull request's description and its review threads read-only in the diff, with
 GitHub's comment gate (see "Milestone 7, slice (c)"), then a third hardening pass over the M7 (a) +
 (b) review: token scoping, safe checkouts, Restricted Mode (see "Hardening 3"), then slice (d),
-submitting reviews, with the M7 (c) review's fixes (see "Milestone 7, slice (d)"). M7 is complete;
-M8 (CLI) is next.** The
+submitting reviews, with the M7 (c) review's fixes (see "Milestone 7, slice (d)"). M7 is complete,
+and so is M8, the CLI: `zed [-n|-e|-a] [--wait] --review TARGET [REPO_DIR]` and `zed://review` links
+(see "Milestone 8"). Next: the final validation (`plans/FINAL-validation.md`), then M9 (fork
+ops).** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
@@ -53,7 +55,11 @@ threads hidden by default, with toggles; GitHub's line numbers are translated th
 checkout's uncommitted and unsaved changes), and only takes comments on lines inside GitHub's diff
 hunks, with the pull request's head checked out. `; s` submits a pull request review (Comment /
 Approve / Request Changes, from a modal that shows what is sent and what blocks it) or finishes a
-local one (its Markdown to the clipboard, or to a `--wait` waiter). Next: M8 (CLI).
+local one (its Markdown to the clipboard, or to a `--wait` waiter). `zed --review TARGET [REPO_DIR]`
+opens any of these reviews from a terminal in the window that has the repository open (`--wait`:
+the posted review's URL or the finished review's Markdown on stdout, exit 0; closed or Zed quit,
+exit 2; errors, exit 1), and `zed://review?repo=PATH&target=TARGET` links open them too (asking
+before a pull request's checkout).
 
 What exists:
 
@@ -62,10 +68,10 @@ What exists:
 | branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
 | `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
-| `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange), PullRequest(PullRequestTarget)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI), `PullRequestReference` + `parse_pull_request_reference` (M8 reuses it), `validate_branch_name` (forge branch names) |
+| `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange), PullRequest(PullRequestTarget)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`), `PullRequestReference` + `parse_pull_request_reference`, `validate_branch_name` (forge branch names); M8: `TargetSpec` + `parse_target_spec` (the CLI's TARGET grammar) |
 | `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `check_branch_base`, `resolve_commits`) |
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
-| `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned; M7d: `mark_submitted`, `ReviewOutcome` + `wait_for_outcome`/`has_outcome_waiters`/`resolve_outcome` for M8's `--wait`), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
+| `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned; M7d: `mark_submitted`, `ReviewOutcome` + `wait_for_outcome`/`has_outcome_waiters`/`resolve_outcome` for `--wait`; M8: `move_outcome_waiters_to` on a key switch), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
 | `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
 | `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch) with the outdated check, deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
@@ -74,7 +80,9 @@ What exists:
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
 | `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`; M7d: `ReviewEvent`, `ReviewSubmission`, `ReviewLineComment`/`ReviewFileComment`, `SubmittedReview`), the `Forge` trait (with `submit_review`), `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
 | `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, host rules (`GitHubHost::{Cloud, Configured, Unverified}`, `GitHubHosts`: user-configured providers, registry hosts, SSH aliases via `ssh -G`), remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup (gh's rules) and cache per (host, work dir), `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache (keyed by every remote URL); `test_support` (fake GitHub `HttpClient`, fixtures, `FakeLookups`) and tests, an ignored live test |
-| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point M8 calls; one at a time per repository, `OpeningPullRequest`), the in-place flow, `plan_worktree_fetch`, `trusts_head_repository` and the new-worktree flow (own `git worktree add --detach`, `trust_worktree`, `repository_at`). M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors, from any open checkout: `add_checkout`, `resolve_forge`, `use_forge`), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment` (the per-tab gate)/`check_comment_target`; M7d: `LocalChanges` (per tab: each file's diff against HEAD, `head_to_working`/`working_to_head` → `LineMapping`); PR review GPUI tests and their `Fixture` |
+| `crates/code_review/src/cli.rs` | M8: `is_review_url`, `ReviewLink` (`zed://review` parsing), `CliReviewRequest` + `handle_cli_review` (the CLI's request: open, `--wait`, the quit hook, one `Exit` per request through `CliReply`), `open_review_link` (a link Zed got without the CLI), `open_review` (a `TargetSpec` in a repository: checks, then `deploy_in_repo` or `open_pull_request`), `repository_root`, `find_review_workspace`; CLI GPUI tests with a fake response sink (`tests::Cli`, also used by the pull request link test) |
+| `crates/cli/src/review.rs` | M8 (fork file in the upstream `cli` crate): `--review` → the `zed://review` link + the repository's canonical path, its usage errors, `requested()` (exit 1 for clap's usage errors) |
+| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point the CLI calls; one at a time per repository, `OpeningPullRequest`; M8: `ReviewCancelled`, `repository_at` crate-visible), the in-place flow, `plan_worktree_fetch`, `trusts_head_repository` and the new-worktree flow (own `git worktree add --detach`, `trust_worktree`, `repository_at`). M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors, from any open checkout: `add_checkout`, `resolve_forge`, `use_forge`), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment` (the per-tab gate)/`check_comment_target`; M7d: `LocalChanges` (per tab: each file's diff against HEAD, `head_to_working`/`working_to_head` → `LineMapping`); PR review GPUI tests and their `Fixture` |
 | `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, `LocalState` (`read_local_state`/`local_state`: HEAD, base present, local branches + upstreams, read from git), the pure `plan_checkout`, `head_remote`, `RestrictedMode` + `ensure_trusted`, `run_checkout` (Zed's fetch and branch switch, plus our own git jobs: `fast_forward` with the branch check, `ensure_fast_forward`, detach; `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
 | `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
 | `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
@@ -89,7 +97,7 @@ What exists:
 | `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
-| `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks |
+| `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks. M8: `zh cli [-C DIR] ARGS` runs the fork's CLI against the isolated instance only |
 | `target/` (gitignored) | **Warm build cache** (see §8.3): `release-fast` for `-p zed` plus `debug` test artifacts, 43 GB |
 | `.rules` ("Drew's Zed fork" section) | Pointer to this file for agent sessions (`CLAUDE.md`/`AGENTS.md` symlink to it) |
 | `README.md` first two lines | `> [!IMPORTANT]` banner required by the `.rules` HARD RULE; never remove it (the user does) |
@@ -98,7 +106,11 @@ Upstream glue so far (all append-style, §3.10): root `Cargo.toml` (member + wor
 `crates/zed/Cargo.toml` (dep), `crates/zed/src/main.rs` (`code_review::init` after `git_ui::init`),
 `crates/zed/src/zed.rs` (`ReviewPanel::load` in `initialize_panels`; `code_review::key_bindings`
 after the base keymap and `code_review::vim_key_bindings` right after `vim.json` in
-`load_default_keymap`; `"code_review"` in `test_action_namespaces`). Core patches #1 and #2 are
+`load_default_keymap`; `"code_review"` in `test_action_namespaces`); M8: `crates/zed/src/zed/
+open_listener.rs` (+27: `OpenRequestKind::Review`, the link in `parse`, the CLI request routed to
+`code_review::cli::handle_cli_review`), `crates/zed/src/main.rs` (+11: the `Review` arm of
+`handle_open_request`), `crates/cli/src/main.rs` (+53/−3: `--review`, help, `try_parse`, the link
+and path, "Zed exited before the review finished") and the new `crates/cli/src/review.rs`. Core patches #1 and #2 are
 applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10). M3 and M4 added
 no upstream glue (M4: new deps `db`, `file_icons`, `fs`, `ignore`, `regex`, `smallvec`, all already in
 `zed`'s graph; dev-deps `db` and `buffer_diff` with `test-support`).
@@ -1165,19 +1177,118 @@ new dependency (keymaps: `; s` in `code_review_vim.json`, the modal's arrows in 
   is back on `feature/template-filters`. Not verified live: the auth retry, refused-review hints, a
   failed pending flow (fake HTTP tests cover them).
 
+**Milestone 8 (CLI)** — `plans/M8-cli-v2.md` (D1–D9) unless noted. Upstream glue in `cli`
+(`main.rs` + the new `review.rs`), `zed/src/zed/open_listener.rs` and `zed/src/main.rs` (§3.10); new
+dependency `cli` (lib only, already in `zed`'s graph):
+
+- **Command line**: `zed [-n|-e|-a] [--wait] --review TARGET [REPO_DIR]` (`--review` before the
+  path: clap passes everything after the first path through as paths, so a later `--review` is "--review
+  must come before the repository path"; more than one path, a missing or non-directory path are
+  errors too; `--diff` conflicts). The CLI canonicalizes the directory (default: the current one) and
+  sends `urls = [zed://review?repo=<path>&target=<target>]` (every byte but `A-Za-z0-9-._~/`
+  percent-encoded) **plus `paths = [<path>]`**: Zed trusts a request only when its paths are exactly
+  the link's repository (D1: xdg-open runs the CLI with the link alone, a browser can't add a path).
+  With `--review`, clap's usage errors exit 1 instead of 2 (`try_parse` + `review::requested()`),
+  and a Zed that goes away without an `Exit` is "Zed exited before the review finished" (exit 1, so
+  a crash never looks like a submit). `zed --help` documents the targets, `--wait`'s exit codes and
+  links; `before_help` has the `zed --review pr:123` example.
+- **TARGET** (`parse_target_spec`, checked before anything opens): `uncommitted`, `branch` (the
+  default branch; none → "No default branch: use branch:BASE"), `branch:BASE` (checked like a typed
+  base: `BranchBase::new` + `check_branch_base`), `commit:REV` (one commit only), `commits:A..B`
+  (a range only), `pr:N`, `#N`, `OWNER/REPO#N`, PR URLs; a bare number is refused with "did you mean
+  pr:123? (A commit is commit:123.)"; anything else lists the forms. Trimmed, at most 1024 bytes.
+- **Zed side** (`code_review::cli`, D2: GPUI-testable in the crate instead of `zed/review_cli.rs`):
+  `handle_cli_connection` hands a request whose only URL is a review link to `handle_cli_review`
+  (with the CLI's open behaviour as `OpenOptions` and its environment); `OpenRequest::parse` maps a
+  review link to `OpenRequestKind::Review`, which `handle_open_request` passes to `open_review_link`
+  (a link Zed got some other way: untrusted, errors as a toast). The repository is the deepest
+  directory at or above the link's path with a `.git` file, or a `.git` directory **with a HEAD**
+  (deviation found live: `/tmp/.git` is an empty directory on this machine, and `--review
+  uncommitted /tmp` opened all of `/tmp`; git needs the HEAD too).
+- **Window reuse** (D5): unless `-n`/`-r` (`WorkspaceMatching::None`), the active window first,
+  then the others, each window's displayed workspace first: a local project with a visible worktree
+  at or above the repository's root and a repository whose work directory is the root (a window on a
+  subfolder doesn't count: the review couldn't open the other files). The window is activated and
+  that workspace shown. Otherwise `workspace::open_paths(root, open options)` (Zed's `zed DIR`
+  behaviour: a new window, or the existing window's sidebar when the multi-workspace sidebar is on;
+  no first-run "open behaviour" prompt) and `repository_at`.
+- **Opening** (`open_review`): `deploy_in_repo` (an open tab of the same review is activated) after
+  the target's checks, or `open_pull_request` with `confirm_checkout` for an untrusted link (D6: M7b's
+  "Check out pull request #N?" prompt, only when the checkout would move; nothing is ever posted or
+  finished by a link). Cancel is `pull_request::ReviewCancelled` ("Review cancelled", exit 1, no
+  toast). Without `--wait` the CLI exits 0 once the tab is open (a pull request: after its checkout).
+- **Errors** (D8): stderr gets `forge::error_message` (the GitHub hint, or the whole chain), exit 1;
+  an untrusted request's errors also show as a toast (in the workspace it opened in, else the active
+  window's), since nobody may see the terminal.
+- **`--wait`** (D4, D7): the handler keeps only a `ReviewSession::wait_for_outcome()` receiver (a
+  handle on the tab or session would keep the session alive) and pings the CLI every second.
+  `Submitted { url }` → the URL on stdout, exit 0; `Finished { markdown }` (`; s` in a local review,
+  M7d) → the Markdown without its last newline (the CLI's `println!` adds it back: byte-identical to
+  `y`), exit 0, nothing without comments; the receiver canceled (the session released: every tab of
+  the review closed, split clones and other windows included) → "Review closed without submitting",
+  exit 2; Zed quitting → an `on_app_quit` hook answers "Zed quit before the review was submitted",
+  exit 2 (tasks don't run again during shutdown); a failed ping (the CLI was killed) ends the wait, so
+  a later `; s` copies to the clipboard. `CliReply` sends exactly one `Exit`. **A tab whose review key
+  changes (Change Base, branch switch) moves the waiters to its new session**
+  (`ReviewView::update_session` → `move_outcome_waiters_to`), so a base change doesn't end the wait.
+- **Harness**: `zh cli [-C DIR] ARGS` (the CLI with its default open behaviour, against the isolated
+  instance; README row). `zh open` passes `--existing`.
+- Tests: 14 new (166 total + 1 ignored): `parse_target_spec`, `ReviewLink::parse` (`+`/`%2B`,
+  missing/relative repo, unknown keys), `repository_root` (nested, `.git` file, empty `.git`),
+  `find_review_workspace` (subfolder window, several windows, nested repository), and with a fake
+  response sink: wait until closed (pings, exit 2), finish (stdout, clipboard untouched, no waiter →
+  clipboard, no comments), submitted URL, no window (a new one on the root of `src/`), `-n`, errors
+  (trusted: stderr only; untrusted: a toast), split clone + two waiters (finish → both; closing the
+  last tab → both 2), a lost CLI and quitting, the waiter following Change Base, and the pull request
+  link prompt (Cancel → exit 1, no toast, HEAD unchanged; at the head → no prompt, both trusted and
+  not). The `cli` crate's `review.rs` tests (URL encoding, usage errors) were run with a standalone
+  `rustc --test` against the workspace's `anyhow`/`tempfile` rlibs, not `cargo test -p cli` (a cold
+  `-p` set). New GPUI tests stable under `ITERATIONS=5`; clippy (`-p code_review`) clean. A test
+  closing a tab must redraw the window (`window.refresh()`) before the session is released: the last
+  painted frame's listeners hold the tab's top block and comment blocks until the next draw (the app
+  draws after a tab closes anyway; live `:q` exits 2 at once).
+- **Live check** (harness, `validation/M8/`; local fixture of FINAL §1.3, the sandbox clone with
+  `ZH_EXTRA_ENV` token; nothing posted; leak grep clean; `reset.sh status` unchanged):
+
+  | Check | Result |
+  |---|---|
+  | `zh cli --help` / `-h` | PASS: the TARGET table, "--review must come before PATH", exit codes 0/2/1, links; example `zed --review pr:123` |
+  | `uncommitted`, `branch`, `branch:main`, `commit:HEAD~1`, `commits:HEAD~2..HEAD` | PASS: exit 0 each, matching tabs in the one window; again → the tab is activated |
+  | `commit:nope`, `bogus`, `123`, `branch:lonely`, `o/r#0`, `commit:a..b`, no value, after the path, two paths, missing dir, `--diff` | PASS: exit 1 with the messages above |
+  | `--review uncommitted /tmp` | FAIL → fixed: opened `/tmp` (empty `/tmp/.git`); now "/tmp isn't in a git repository", exit 1 |
+  | `REPO_DIR` = `$W/src`; `repo2` twice; `-n`; `-C $W/src --review branch` | PASS: same window; repo2 in a new window, then reused; `-n` a second window; the branch review in the active window with the repository |
+  | `--wait` + `:q` | PASS: no exit for 5 s, then exit 2 "Review closed without submitting" |
+  | `--wait`, `c` "cli comment", `; s` | PASS: exit 0, toast "Review sent to the terminal", clipboard still SENTINEL, stdout byte-identical to `y` |
+  | `--wait commit:HEAD~1`, `; s` (no comments) | PASS: exit 0, empty stdout |
+  | `--wait branch`, Change Base → `main`, `; s` | PASS: still waiting after the switch ("vs main"), exit 0 after `; s` |
+  | `--wait`, CLI killed (SIGINT), then `; s` | PASS: Zed alive, no toast; clipboard = the Markdown, "Review finished and copied as Markdown" |
+  | `--wait` + "zed: quit" / `kill -9` of Zed | PASS: exit 2 "Zed quit before the review was submitted" / exit 1 "Zed exited before the review finished" |
+  | links via the CLI: `branch:origin/main` (+ an unknown key), `repo two` (space), `relative/path` | PASS: exit 0, branch tab; repo two opens; exit 1 + toast |
+  | a link plus another URL (Zed's generic URL path → `open_review_link`) | PASS: `commit:HEAD` opens; `bogus` → toast |
+  | sandbox: link `pr:1` with `main` checked out | PASS: "Check out pull request #1?" prompt before anything moved; Cancel → exit 1 "Review cancelled", no toast, HEAD `main` |
+  | `--wait --review pr:6` | PASS: no prompt, `fix/truncate-ellipsis` at `632ee13`, tab "PR #6: …"; `:q` → exit 2; nothing submitted |
+  | `drew-council/code-review-sandbox#1`, the PR URL, a link while at the head | PASS: `feature/template-filters` at `3f22f1b`, one tab reused, no prompt, exit 0 |
+
+  Not verified live: two waiters with a split clone (V6.11; GPUI test), `--wait` + a submitted pull
+  request review (V6.18, left to the final validation: posting), Wayland window activation, a
+  symlinked repository path (the CLI canonicalizes; a lookup miss would open a second workspace).
+
 **Known issues / notes for the next slices:**
 
-- **Notes for M8 (CLI)**:
-  - `--wait` outcomes: `ReviewSession::wait_for_outcome()` (crate-visible) resolves with
-    `ReviewOutcome::Submitted { url }` after a pull request review is posted, or `Finished { markdown }`
-    after `; s` in a local review (`None` without comments); a canceled receiver means every tab of
-    the review closed (`Closed`, exit 2). `finish_local_review` already sends the Markdown to a waiter
-    instead of the clipboard. Move waiters to the new session when a tab's key changes
-    (`ReviewView::update_session`), or a branch review whose base changes reports Closed.
-  - The modal never opens from a link (`zed://review` only opens and reads): posting needs `; s` and
-    Enter.
-  - Sandbox for the final validation: PR A #1 (read-only), PR C **#6** (own, clean), PR B **#7**
-    (bot, clean), PR D #4 (API probes).
+- **Notes for the final validation (V6)**:
+  - Build with `-p zed -p cli` before `zh start` (the harness finds `target/release-fast/cli` at
+    start). Run the CLI only through `zh cli` (default open behaviour, `-C DIR` for the cwd) or `zh
+    open` (adds `--existing`); never the fork's `cli` directly. Close review tabs with `: q Return`.
+  - `pkill -f 'release-fast/cli.*--wait'` also matches the shell running it (its command line has
+    the pattern): anchor it, e.g. `pkill -INT -f '^/home/drew/personal/zed/target/release-fast/cli '`.
+  - Change Base's picker preselects `origin/main` when typing `main`: press Down for the local `main`.
+  - `--review` lands in the *active* window among those with the repository open (GPUI's active
+    window, which `-n` doesn't always change without a window manager).
+  - Sandbox: PR A #1 (read-only), PR C **#6** (own, clean), PR B **#7** (bot, clean), PR D #4 (API
+    probes); the harness clone is back on `feature/template-filters`.
+- CLI nits: a link error's toast is logged as "pull request: …" (`forge::show_error_toast`'s
+  prefix). `--foreground --review` ignores the exit status (upstream path). A new CLI with an
+  upstream Zed: the link is "unhandled", exit 0.
 - **Comment editors, known gaps**: every `:w` form leaves the comment keeping its text (see "Hardening
   2"); none writes a file. `:qa`, `:qa!`, `:wqa`, `:xa` close the review tab(s); open comment text is
   saved even by `:qa!`. Two tabs editing one saved comment: last writer wins. Two windows whose buffers
@@ -1204,8 +1315,9 @@ new dependency (keymaps: `; s` in `code_review_vim.json`, the modal's arrows in 
   `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
   in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 152 tests
-  + 1 ignored live GitHub test (after M7 slice d; 136 after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`), `cargo test -p cli` (see M8). `cargo
+  test -p code_review`: 166 tests + 1 ignored live GitHub test (after M8; 152 after M7 slice d, 136
+  after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
   `ITERATIONS=5`; the hardening-2 comment tests under `ITERATIONS=10`).
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
@@ -1254,6 +1366,10 @@ new dependency (keymaps: `; s` in `code_review_vim.json`, the modal's arrows in 
   in the review tab (plus the palette).
 - M7 slice (d) (agent, from M8's plan D3, can be vetoed): `; s` in a local review finishes it, its
   Markdown to the clipboard or to a `--wait` waiter.
+- M8 (agent, from the plan): only the CLI's own request (the link plus the repository's path) checks
+  a pull request out without asking; `--review` usage errors exit 1; `--review` lands in the active
+  window among those with the repository; a repository needs a `.git` file or a `.git` directory with
+  a HEAD.
 
 **Before writing code, the next agent should:**
 
@@ -1272,12 +1388,14 @@ new dependency (keymaps: `; s` in `code_review_vim.json`, the modal's arrows in 
   of `crates/` (`nix/modules/devshells.nix`, `nix/build.nix` `mkIncludeFilter`), so after any edit
   Nix would rebuild it, uncapped (and all of Zed's deps if a `Cargo.toml`/`Cargo.lock` changed).
   The same happens once via direnv when a rebase changes `flake.lock`.
-- **Build & run** (the warm-cache profile):
+- **Build & run** (the warm-cache profile; since M8 always `-p zed -p cli`, never `-p cli` alone,
+  so `target/release-fast/cli` matches `zed`: the first build added only the CLI's own crates, 19 s;
+  an edit in `code_review` then takes ~30 s):
 
   ```sh
   direnv exec /home/drew/personal/zed env CARGO_PROFILE_RELEASE_FAST_DEBUG=limited \
-    nice -n 10 cargo build -j8 --profile release-fast -p zed
-  ./target/release-fast/zed
+    nice -n 10 cargo build -j8 --profile release-fast -p zed -p cli
+  ./target/release-fast/zed   # agents: only through script/live-harness/zh
   ```
 
 - **Type-check a crate:** run the same `-p zed` build. Every crate we touch is in `zed`'s graph,
@@ -1532,7 +1650,7 @@ covers it), tuicr's `tuicr review` CLI protocol.
 
 ## 3. Architecture
 
-### 3.1 Crate layout (proposed; as of M7 `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,remote,view}.rs`, `export.rs`, `forge.rs`, `github.rs` + `github/queries.graphql`, `pull_request.rs`, `checkout.rs`, `submit.rs` exist too; `cli.rs` doesn't yet)
+### 3.1 Crate layout (proposed; as of M8 `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,remote,view}.rs`, `export.rs`, `forge.rs`, `github.rs` + `github/queries.graphql`, `pull_request.rs`, `checkout.rs`, `submit.rs`, `cli.rs` exist too)
 
 ```
 crates/code_review/
@@ -1560,7 +1678,7 @@ crates/code_review/
   src/export.rs         # markdown export
   src/persistence.rs    # Zed DB domain (sqlez) for drafts & reviewed marks
   src/gitattributes.rs  # linguist-generated/vendored detection
-  src/cli.rs            # target from zed://review URLs; called from crates/zed glue
+  src/cli.rs            # zed://review links and `zed --review` requests (open, --wait); called from crates/zed glue
 ```
 
 ### 3.2 Showing the diff
@@ -1733,6 +1851,10 @@ change, so mismatched CLI/app versions don't break).
    (`project.rs:2261`); call `code_review::open_review(..) -> (view, oneshot<ReviewOutcome>)`; `--wait`
    ping loop (copy `open_listener.rs:1061-1083`); `CliResponse::Stdout` + `Exit{status}`.
 - Security: zed:// links can come from browsers — handler only reads/opens; never auto-posts.
+- **As built (M8)**: step 4 lives in `code_review::cli` (`handle_cli_review`, `open_review_link`),
+  not `crates/zed/src/zed/review_cli.rs`, so it is tested with the crate and `zed.rs` is untouched;
+  `--review` also sends the repository's path (the trust signal), and step 3's arm calls
+  `open_review_link`. Details: §0 "Milestone 8".
 
 ### 3.10 Glue footprint in upstream files (keep it this small)
 
@@ -1740,10 +1862,11 @@ change, so mismatched CLI/app versions don't break).
 |---|---|
 | `Cargo.toml` | workspace member + `[workspace.dependencies]` entry |
 | `crates/zed/Cargo.toml` | dep on `code_review` |
-| `crates/zed/src/main.rs` | `code_review::init(cx)` after `git_ui::init` (:776); `handle_open_request` arm |
-| `crates/zed/src/zed.rs` | panel registration in `initialize_panels`; keymap loading in `load_default_keymap`; `mod review_cli`; test namespace list |
-| `crates/zed/src/zed/open_listener.rs` | review URL kind + routing |
-| `crates/cli/src/main.rs` | `--review` flag |
+| `crates/zed/src/main.rs` | `code_review::init(cx)` after `git_ui::init` (:776); `handle_open_request` arm (M8, +11) |
+| `crates/zed/src/zed.rs` | panel registration in `initialize_panels`; keymap loading in `load_default_keymap`; test namespace list |
+| `crates/zed/src/zed/open_listener.rs` | review URL kind + routing (M8, +27: `OpenRequestKind::Review` + Debug arm, `parse`, the CLI request → `code_review::cli::handle_cli_review`) |
+| `crates/cli/src/main.rs` | `--review` flag (M8, +53/−3: `mod review`, help example, the flag and its help, `try_parse` (usage errors exit 1), link + path, "Zed exited before the review finished") |
+| `crates/cli/src/review.rs` | new file (M8): the `--review` request (73 lines + tests) |
 | `crates/editor/src/config.rs` | `set_number_deleted_lines` → `pub` (core patch #1) |
 | `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs` | `Editor::set_forbid_horizontal_autoscroll` (core patch #2): a `ScrollManager` flag checked first in `autoscroll_horizontally`, so the review tab's `h`/`l` scroll survives `j`/`k` |
 | `assets/keymaps/code_review*.json` | new files |
