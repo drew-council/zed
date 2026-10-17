@@ -74,6 +74,8 @@ Output:
 
 Misc:
   zh open PATH[:LINE[:COL]]   open a file in the running Zed via its CLI (if available)
+  zh cli [-C DIR] ARGS...     run the CLI against the running instance as typed (no --existing;
+                              cwd DIR, default the workdir); exit status = the CLI's
   zh mkrepo DIR               create a scratch git repo with uncommitted changes
   zh env                      print shell exports for the private display/isolated env
   zh path [run|home|config|data|log|shots]   print an isolated path
@@ -743,6 +745,21 @@ cmd_open() {
     )
 }
 
+# Like `open`, but with the CLI's default open behaviour and a chosen working directory, so
+# `zed --review` runs exactly as a user would type it (only ever against the isolated instance).
+cmd_cli() {
+    require_running
+    [[ -n "${ZED_CLI-}" ]] || die "no CLI binary next to $ZED_BINARY (build -p zed -p cli, then zh restart --fork)"
+    local dir="$WORKDIR"
+    if [[ "${1-}" == -C ]]; then
+        dir="${2:?cli -C DIR}"
+        shift 2
+    fi
+    [[ -d "$dir" ]] || dir="$(dirname "$WORKDIR")"
+    isolated_env
+    (cd "$dir" && exec "${ENV_ARGS[@]}" "$ZED_CLI" --zed "$ZED_BINARY" "$@" </dev/null)
+}
+
 cmd_mkrepo() {
     local dir="${1:?mkrepo DIR}"
     [[ -e "$dir/.git" ]] && die "$dir is already a git repo"
@@ -878,6 +895,7 @@ main() {
     logs | log) cmd_logs "$@" ;;
     wait-log) cmd_wait_log "$@" ;;
     open) cmd_open "$@" ;;
+    cli) cmd_cli "$@" ;;
     mkrepo) cmd_mkrepo "$@" ;;
     env) cmd_env ;;
     path) cmd_path "$@" ;;

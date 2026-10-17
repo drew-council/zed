@@ -8,6 +8,7 @@
 )]
 
 mod completions;
+mod review;
 
 use crate::completions::Shell;
 
@@ -61,7 +62,9 @@ Examples:
     `zed path-to-your-project`
           Open your project in Zed
     `zed -n path-to-file `
-          Open file/folder in a new window",
+          Open file/folder in a new window
+    `zed --review pr:123`
+          Review pull request 123 of the repository in the current directory",
     after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
 )]
 struct Args {
@@ -138,6 +141,35 @@ struct Args {
     /// When directories are provided, recurses into them and shows all changed files in a single multi-diff view.
     #[arg(long, action = clap::ArgAction::Append, num_args = 2, value_names = ["OLD_PATH", "NEW_PATH"], value_hint = clap::ValueHint::AnyPath)]
     diff: Vec<String>,
+    /// Open a code review of TARGET in the git repository at PATH (default: current directory).
+    ///
+    /// TARGET is one of:
+    ///   uncommitted     staged and unstaged changes (HEAD to the working tree)
+    ///   branch          the current branch since its merge base with the default branch,
+    ///                   uncommitted changes included
+    ///   branch:BASE     the same against BASE, e.g. branch:origin/main
+    ///   commit:REV      one commit, e.g. commit:HEAD~1
+    ///   commits:A..B    the commits after A up to and including B
+    ///   pr:N            pull request N of the repository's GitHub remote (checked out)
+    ///   OWNER/REPO#N    pull request N of OWNER/REPO (quote it: # starts a shell comment)
+    ///   URL             a pull request URL, e.g. https://github.com/OWNER/REPO/pull/N
+    ///
+    /// --review must come before PATH. The review opens in the window that has the repository
+    /// open (-n: a new window). Without --wait, returns once the review is open.
+    /// With --wait, waits until the review is submitted, finished or closed. Exit status:
+    ///   0  submitted: prints the posted review's URL; or a local review finished with
+    ///      "code_review: submit review" (; s): prints the review as Markdown
+    ///   2  closed without submitting, or Zed quit
+    ///   1  an error
+    /// Links zed://review?repo=PATH&target=TARGET (percent-encoded) open the same review and
+    /// ask before checking out a pull request.
+    #[arg(
+        long,
+        value_name = "TARGET",
+        conflicts_with = "diff",
+        verbatim_doc_comment
+    )]
+    review: Option<String>,
     /// Generate shell completions for Zed
     #[arg(long, value_names = ["SHELL"])]
     completions: Option<Shell>,
@@ -510,7 +542,15 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        // Clap exits with 2 on usage errors, which `--wait --review` uses for "closed".
+        Err(error) if error.use_stderr() && review::requested() => {
+            error.print()?;
+            std::process::exit(1)
+        }
+        Err(error) => error.exit(),
+    };
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     if let Some(socket) = &args.askpass {
@@ -671,7 +711,14 @@ fn run() -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     let wsl = None;
 
-    for path in args.paths_with_position.iter() {
+    let review = review::request(args.review.as_deref(), &args.paths_with_position)?;
+    if let Some(review) = &review {
+        urls.push(review.url.clone());
+        // Tells Zed the link comes from the command line, not from a browser.
+        paths.push(review.repo_dir.clone());
+    }
+
+    for path in args.paths_with_position.iter().filter(|_| review.is_none()) {
         if URL_PREFIX.iter().any(|&prefix| path.starts_with(prefix)) {
             urls.push(path.to_string());
         } else if path == "-" && args.paths_with_position.len() == 1 {
@@ -703,6 +750,7 @@ fn run() -> Result<()> {
         .build_global()
         .unwrap();
 
+    let is_review = review.is_some();
     let sender: JoinHandle<anyhow::Result<()>> = thread::Builder::new()
         .name("CliReceiver".to_string())
         .spawn({
@@ -750,6 +798,8 @@ fn run() -> Result<()> {
                     }
                 }
 
+                // Without an exit status a crash would look like a submitted review.
+                anyhow::ensure!(!is_review, "Zed exited before the review finished");
                 Ok(())
             }
         })
