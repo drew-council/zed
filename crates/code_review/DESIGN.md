@@ -15,12 +15,15 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: milestone 2 (line cursor + navigation) done.** The long-lived fork branch `code-review`
+**Status: milestone 3 (review targets) done.** The long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
-untouched and equals upstream `main`. `code_review::ReviewUncommitted` opens a read-only review tab of
-HEAD → working tree over real project buffers, with a tuicr-style line cursor and file navigation
-(§2.5 minus comments/reviewed marks/export); the review panel in the left dock only shows the active
-review's title so far. Next: milestone 3 (§6).
+untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
+(changeable in place), and one commit or a contiguous range (live when it ends at HEAD, a read-only
+historic snapshot otherwise), opened from the `code_review::StartReview` picker or the direct actions
+`ReviewUncommitted` / `ReviewBranch { base }` / `ReviewCommits { commits }`. Each tab has a
+tuicr-style line cursor and file navigation (§2.5 minus comments/reviewed marks/export) and a fixed top
+block (branch base, or the commit messages). The review panel in the left dock only shows the active
+review's title so far. Next: milestone 4 (§6).
 
 What exists:
 
@@ -28,13 +31,16 @@ What exists:
 |---|---|
 | branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
-| `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions, keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers) |
-| `crates/code_review/src/target.rs` | `ReviewTarget` (only `Uncommitted` so far): title, empty-state label |
-| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by `DiffBufferList`; `ReviewTarget` → `DiffBase` mapping (`diff_base`); file order, `path_at_cursor`, `move_to_path`, single-file mode |
+| `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
+| `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base }, Commits(CommitRange)}`, `is_same_review`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI) |
+| `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `validate_ref`) |
+| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode |
+| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, or the commit messages (collapsible); commit tab titles |
+| `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select); `CommitSelection` |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll |
-| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `ReviewView::deploy`, handlers for the review keys, `FocusDiff`, GPUI tests |
+| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`, GPUI tests |
 | `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab and shows its title; `FocusPanel` / `TogglePanel` / `ToggleFocus` |
-| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (the non-vim one is empty; everything is in the command palette) |
+| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: only `tab` → `picker::MultiSelectNext` in the Start Review picker; the rest is in the command palette) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
 | `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks |
@@ -47,7 +53,8 @@ Upstream glue so far (all append-style, §3.10): root `Cargo.toml` (member + wor
 `crates/zed/src/zed.rs` (`ReviewPanel::load` in `initialize_panels`; `code_review::key_bindings`
 after the base keymap and `code_review::vim_key_bindings` right after `vim.json` in
 `load_default_keymap`; `"code_review"` in `test_action_namespaces`). Core patches #1 and #2 are
-applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10).
+applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10). M3 added no
+upstream glue.
 
 **Implementation decisions (milestone 1)** — implementation details, not user questions:
 
@@ -127,6 +134,70 @@ applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3
 - Tests: `vim` is a dev-dependency (the keymap only loads when its actions are registered);
   `test_support::init_vim_test` binds `default-linux.json`, `vim.json` and ours in `zed`'s order.
 
+**Implementation decisions (milestone 3)** — the M3 plan's defaults unless noted. No upstream file
+changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picker), `picker`,
+`fuzzy`, `markdown`, `menu`, `time`, `time_format`, `serde`, `schemars`, `log`.
+
+- **Branch**: the base is a ref *name* (`Repository::default_branch(true)`, e.g. `origin/main`), passed
+  to `DiffBase::Merge`, so the review follows fetches; title "‹branch› vs ‹base›" ("HEAD" when
+  detached, updated on `RepositoryEvent::HeadChanged`). `ReviewBranch { base: Some(..) }` checks the
+  ref first (`revparse_batch`, no leading `-`/whitespace), so a typo is an error toast instead of an
+  empty review. No default branch → the branch picker opens. Until the first merge-base tree diff has
+  started the review shows the spinner, not the empty label (`ReviewDiff::awaiting_tree_diff`).
+- **Change Base** works in place (Zed's Branch Diff precedent) through Zed's own branch picker
+  (`git_ui::branch_picker::select_modal`); if another tab already reviews the branch against the
+  chosen base, that tab is activated instead. Deviation: `ChangeBase` and `ToggleHeader` are
+  view-level actions on the `CodeReview` div (in the palette only while a review is focused;
+  `ChangeBase` only in branch reviews) rather than workspace actions that propagate; the top block's
+  base button calls the view directly.
+- **Commits**: git's `A..B` semantics (A excluded) in `ReviewCommits { commits }` and
+  `parse_commit_spec`; a single commit is reviewed against its first parent (merges too, like
+  CommitView's `--first-parent`); full 40/64-hex shas are used as is, anything else resolves through
+  `rev^{commit}`. Root commits diff against git's empty tree. **Live vs snapshot is decided once**, when
+  the review opens (range head == HEAD): a live review keeps showing working-tree buffers even if HEAD
+  moves later. Live reviews list only the range's files (`diff-tree base head`) over project buffers
+  (`GitStore::open_diff_since`), so uncommitted edits to those files show, files changed only in the
+  worktree don't.
+- **Snapshots**: `Capability::ReadOnly` buffers whose file is a `GitBlob` (`DiskState::Historic`, not
+  local → no language server), syntax highlighted. Deviation: both sides load through one
+  `git cat-file --batch` (`load_revisions` with `head:path` / `base:path` specs) instead of a
+  `load_blob_content` call per old blob. Binary files show a "(binary file not shown)" line as an
+  addition or deletion so they stay listed; entries git lists without a blob on one side (submodules)
+  are skipped with a warning. All snapshot buffers are built before the first excerpt appears. `e` on
+  a snapshot row opens the working-tree file at the same row (clamped), like CommitView's "open file
+  at HEAD". The checkout, index and HEAD are never touched.
+- **Start Review picker**: Local section = "Uncommitted changes", "Branch vs ‹base›" (secondary
+  confirm or no default branch → base picker), then the first-parent chain from HEAD (50 commits).
+  Range selection follows tuicr (`CommitSelection`: outside extends and fills gaps, ends shrink,
+  middle cuts back to the newer commits), so non-contiguous selections are impossible; only commit
+  rows get checkboxes. Multi-select via `tab` (bound in `StartReview > Picker > Editor`),
+  `ctrl-shift-s`, ctrl-click; a selection wins over the highlighted row on Enter. Deviation: a query
+  filters fuzzily but keeps history order (no score sort). `ReviewCommits` without `commits` opens the
+  picker with the newest commit selected. No default key for `StartReview` (palette).
+- **Top block**: a fixed header above the editor (CommitView precedent; an editor block can't sit
+  above the first file header and is lost when the split LHS is recreated). Branch: one line
+  "Changes on ‹branch› since its merge base with [‹base› ▾]". Commits: collapsed by default (summary =
+  tab title, plus "Read-only snapshot"), expanded = up to 100 commits newest first with sha, subject,
+  author, date and the markdown body (16 lines, then it scrolls; "…and more commits" past the limit).
+  Commit messages can't be commented on. `ToggleHeader` has no default key.
+- **Titles**: "Review: Uncommitted changes", "Review: ‹branch› vs ‹base›", "Review: ‹sha7› ‹subject (20
+  chars)›", "Review: ‹n› commits ‹oldest7›–‹newest7›" ("‹n›+ commits up to ‹newest7›" when truncated;
+  before the commits load, the head's short sha). Snapshot tabs add "Read-only snapshot (no language
+  server)" to the tooltip. The panel shows the same title and follows changes.
+- **Reuse**: same target (`ReviewTarget::is_same_review`) and same repository → activate the open tab;
+  anything else opens another tab. Persistence keys for M5 (§2.6): branch = repo + current branch name
+  + base; commits = repo + `base..head`.
+- File header statuses come from `ReviewAddon::override_status_for_buffer_id` (status against the merge
+  base / range base, like `BranchDiffAddon`/`CommitDiffAddon`). M4's header controls must go into the
+  same addon (only the first addon renders them).
+- Everything git-side runs on the repository's job queue with the Local backend (`send_job`); remote
+  repositories get "Code review only supports local repositories".
+- Tests: `askpass` (fake historic commits through `Repository::commit`) and `remote_connection` with
+  `test-support` (feature unification: `project`'s test support enables `remote`'s extra variant,
+  which `remote_connection`, pulled in by `git_ui`, only matches with its own) are dev-dependencies.
+  The fake `diff_tree` ignores refs and lists files by comparing merge-base blobs with HEAD's
+  contents, so tests can't check which base/head reach git — the live check covers that.
+
 **Known issues / notes for the next slices:**
 
 - Saving: for an active item whose `capability` isn't editable, the workspace doesn't register
@@ -151,7 +222,25 @@ applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3
   `ToggleSoftWrap` capture will also catch the action inside M5 comment editors — scope it then.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - Not run: `zed`'s own tests (incl. `test_action_namespaces`), clippy. `cargo test -p code_review`:
-  18 tests, stable under `ITERATIONS=10`.
+  27 tests, stable under `ITERATIONS=10`.
+- M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
+  snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
+  `]f`/`]c`/line cursor/`e` in branch, live and snapshot reviews.
+- M3 notes: a range `A..B` where A isn't on B's first-parent chain diffs tree(A) → tree(B) and the top
+  block walks back to the root or the limit ("N+ commits"). `DiffBufferList` only logs tree-diff
+  errors, so a base that disappears after the review opened shows "No changes against ‹base›". Huge
+  snapshot ranges load every blob before the first excerpt (switch to per-file `load` futures if that
+  is slow). Hover/go-to-definition in snapshots couldn't be checked live (the harness disables
+  language servers); snapshot buffers aren't local, so no server attaches by construction.
+- M5: drafts keyed per §2.6 must be re-keyed in `ReviewView::change_base` (the only place a target
+  changes) and must handle a branch switch while a branch review is open (the branch name is part of
+  the key; `RepositoryEvent::HeadChanged` is already subscribed). Review-level comments go into
+  `ReviewTopBlock` (an entity rendered above the diff; add content after the commit/branch part).
+- M7 slots: `Section` in `picker.rs` (add the pull request section after Local in
+  `StartReviewDelegate::set_matches`, where a comment marks it), `StartReviewFocus` (add
+  `PullRequests` for `OpenPullRequest { number: None }`), `ReviewTarget` (add `PullRequest`; override
+  `is_same_review` so `base_oid` is ignored), `DiffSource::new` (map it to
+  `BufferList(DiffBase::Merge { base_ref: base_oid })`), `TopBlockContent` (add the PR description).
 - DESIGN's file:line pointers checked on `v1.25.0-pre` for this slice (`diff_buffer_list.rs`,
   `diff_multibuffer.rs`, `split.rs:1192`, `git_store.rs`, `zed.rs`, `main.rs`) match within a line or
   two. `git_ui` on the tag also has `staged_diff.rs` — a read-only `DiffMultibuffer` item, the
@@ -393,7 +482,9 @@ move line by line; there is no column.
   submit (tuicr: `src/forge/submit.rs:568` `build_review_body` joins them with `[TYPE]` prefixes).
 - **Persistence:** drafts + reviewed marks saved locally in **Zed's DB**, keyed by review target
   (PR: repo+number; branch: repo+branch+base; uncommitted: repo+worktree; commits: repo+range) — not
-  by head SHA, so new pushes don't start a new review. Reviewed marks clear when that file's/hunk's
+  by head SHA, so new pushes don't start a new review. (M3: "branch" is the checked-out branch's name
+  and "base" the base ref name as in `ReviewTarget::Branch`; "range" is `CommitRange`'s `base..head`
+  shas. Change Base and branch switches change a branch review's key.) Reviewed marks clear when that file's/hunk's
   diff content changes (tuicr: FNV-1a over hunk lines, `src/model/review.rs:164-189`). Drafts follow
   code via Zed anchors while running; after reload a draft whose line text no longer matches is
   flagged **outdated** (not dropped).
@@ -433,7 +524,7 @@ covers it), tuicr's `tuicr review` CLI protocol.
 
 ## 3. Architecture
 
-### 3.1 Crate layout (proposed)
+### 3.1 Crate layout (proposed; files up to `picker.rs` exist as of M3)
 
 ```
 crates/code_review/
@@ -443,12 +534,14 @@ crates/code_review/
   src/code_review.rs    # init(cx): actions, observe_new::<Workspace>, item/panel registration
   src/target.rs         # ReviewTarget (Pr/Branch/Uncommitted/Commits), parsing (CLI + picker)
   src/session.rs        # ReviewSession entity: target, file list, diffs, comments, reviewed state
-  src/diff.rs           # building the multibuffer: DiffBufferList / open_diff_since / historic buffers
+  src/diff.rs           # building the multibuffer: DiffSource (DiffBufferList / CommitDiffList)
+  src/commits.rs        # commit ranges: live (open_diff_since) or historic snapshot buffers; git helpers
   src/view.rs           # ReviewView: workspace Item wrapping a SplittableEditor (+ top block)
-  src/line_cursor.rs    # row highlight, column pinning, companion mirroring
+  src/top_block.rs      # fixed header above the diff: branch base / commit messages (M5/M7 extend it)
+  src/line_cursor.rs    # row highlight, companion mirroring, horizontal scroll
   src/comments/         # model, blocks, CommentEditor (vim child editor), focus/keys
   src/panel.rs          # ReviewPanel (dock): file tree, filters, comment list
-  src/picker.rs         # StartReview picker
+  src/picker.rs         # StartReview picker (Local section; PR section in M7)
   src/github/           # provider trait + GitHub impl (GraphQL/REST via HttpClient), auth
   src/checkout.rs       # PR checkout (change_branch / refs/pull fetch / worktree)
   src/submit.rs         # submit modal + payload mapping
