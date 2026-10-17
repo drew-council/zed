@@ -551,6 +551,7 @@ change, so mismatched CLI/app versions don't break).
 | `crates/zed/src/zed/open_listener.rs` | review URL kind + routing |
 | `crates/cli/src/main.rs` | `--review` flag |
 | `crates/editor/src/config.rs` | `set_number_deleted_lines` → `pub` (core patch #1) |
+| `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs` | `Editor::set_forbid_horizontal_autoscroll` (core patch #2): a `ScrollManager` flag checked first in `autoscroll_horizontally`, so the review tab's `h`/`l` scroll survives `j`/`k` |
 | `assets/keymaps/code_review*.json` | new files |
 | (later) `crates/settings_content` + `assets/settings/default.json` | settings block |
 

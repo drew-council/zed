@@ -164,6 +164,7 @@ pub struct ScrollManager {
     forbid_vertical_scroll: bool,
     minimap_thumb_state: Option<ScrollbarThumbState>,
     _save_scroll_position_task: Task<()>,
+    forbid_horizontal_autoscroll: bool,
 }
 
 impl ScrollManager {
@@ -187,6 +188,7 @@ impl ScrollManager {
             forbid_vertical_scroll: false,
             minimap_thumb_state: None,
             _save_scroll_position_task: Task::ready(()),
+            forbid_horizontal_autoscroll: false,
         }
     }
 
@@ -583,6 +585,12 @@ impl Editor {
 
     pub fn set_forbid_vertical_scroll(&mut self, forbid: bool) {
         self.scroll_manager.set_forbid_vertical_scroll(forbid);
+    }
+
+    /// Keeps autoscroll requests from changing the horizontal scroll position, so it only moves
+    /// when scrolled explicitly.
+    pub fn set_forbid_horizontal_autoscroll(&mut self, forbid: bool) {
+        self.scroll_manager.forbid_horizontal_autoscroll = forbid;
     }
 
     pub fn scroll_top_display_point(&self, snapshot: &DisplaySnapshot, cx: &App) -> DisplayPoint {

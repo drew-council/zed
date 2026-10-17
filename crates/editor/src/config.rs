@@ -370,7 +370,7 @@ impl Editor {
         self.set_relative_line_number(Some(!is_relative.enabled()), cx)
     }
 
-    pub(super) fn set_number_deleted_lines(&mut self, number: bool, cx: &mut Context<Self>) {
+    pub fn set_number_deleted_lines(&mut self, number: bool, cx: &mut Context<Self>) {
         self.number_deleted_lines = number;
         cx.notify();
     }
