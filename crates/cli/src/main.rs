@@ -71,6 +71,8 @@ struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
     ///
     /// When opening a directory, waits until the created window is closed.
+    ///
+    /// With --review, waits until the review is submitted, finished or closed (see --review).
     #[arg(short, long)]
     wait: bool,
     /// Add files to the currently open workspace
