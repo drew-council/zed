@@ -72,7 +72,10 @@ impl ReviewTarget {
 pub(crate) enum CommitSpec {
     Single(String),
     /// git's two-dot form `from..to`: the commits reachable from `to` but not from `from`.
-    Range { from: String, to: String },
+    Range {
+        from: String,
+        to: String,
+    },
 }
 
 /// Parses "abc1234", "HEAD~2" or "A..B". Revisions end up in line-based `git cat-file --batch`
@@ -136,7 +139,9 @@ mod tests {
                 to: "B".into()
             }
         );
-        for invalid in ["", "  ", "-x", "A..-x", "A...B", "a b", "a\nb", "..B", "A..", ".."] {
+        for invalid in [
+            "", "  ", "-x", "A..-x", "A...B", "a b", "a\nb", "..B", "A..", "..",
+        ] {
             assert!(
                 parse_commit_spec(invalid).is_err(),
                 "{invalid:?} should be rejected"

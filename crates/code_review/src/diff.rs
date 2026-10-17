@@ -62,9 +62,7 @@ impl DiffSource {
             },
             ReviewTarget::Commits(range) => {
                 let range = *range;
-                return Self::Commits(
-                    cx.new(|cx| CommitDiffList::new(range, repo, project, cx)),
-                );
+                return Self::Commits(cx.new(|cx| CommitDiffList::new(range, repo, project, cx)));
             }
         };
         let git_store = project.read(cx).git_store().clone();
@@ -649,7 +647,8 @@ impl ReviewDiff {
     pub(crate) fn path_at_cursor(&self, cx: &App) -> Option<PathKey> {
         let editor = self.editor.read(cx).focused_editor().read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let (anchor, _) = snapshot.anchor_to_buffer_anchor(editor.selections.newest_anchor().head())?;
+        let (anchor, _) =
+            snapshot.anchor_to_buffer_anchor(editor.selections.newest_anchor().head())?;
         snapshot.path_for_buffer(anchor.buffer_id).cloned()
     }
 
@@ -668,7 +667,12 @@ impl ReviewDiff {
 
     /// Moves the cursor to the first row of the file (showing only that file in single-file
     /// mode).
-    pub(crate) fn move_to_path(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn move_to_path(
+        &mut self,
+        path_key: PathKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.single_file.is_some() {
             self.set_single_file(Some(path_key), window, cx);
         } else {
@@ -993,17 +997,15 @@ impl Render for ReviewDiff {
                 el.child(
                     v_flex()
                         .gap_1()
-                        .child(
-                            h_flex()
-                                .justify_around()
-                                .child(Label::new(empty_label)),
-                        )
+                        .child(h_flex().justify_around().child(Label::new(empty_label)))
                         .when(self.all_hidden_label.is_some(), |el| {
                             el.child(
                                 h_flex().justify_around().child(
-                                    Label::new("Change the filters in the review panel to see them")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    Label::new(
+                                        "Change the filters in the review panel to see them",
+                                    )
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
                                 ),
                             )
                         })

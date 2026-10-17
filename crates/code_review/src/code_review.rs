@@ -205,8 +205,8 @@ pub(crate) mod test_support {
     use editor::{Editor, SelectionEffects, SplittableEditor};
     use git::repository::{CommitData, CommitOptions};
     use gpui::{
-        Action, AppContext as _, BorrowAppContext as _, Entity, TestAppContext,
-        VisualContext as _, VisualTestContext,
+        Action, AppContext as _, BorrowAppContext as _, Entity, TestAppContext, VisualContext as _,
+        VisualTestContext,
     };
     use language::Point;
     use multi_buffer::MultiBufferRow;
@@ -256,15 +256,24 @@ pub(crate) mod test_support {
         })
     }
 
-    pub(crate) fn splittable(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<SplittableEditor> {
+    pub(crate) fn splittable(
+        review: &Entity<ReviewView>,
+        cx: &VisualTestContext,
+    ) -> Entity<SplittableEditor> {
         review.read_with(cx, |review, cx| review.diff().read(cx).editor().clone())
     }
 
-    pub(crate) fn rhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
+    pub(crate) fn rhs_editor(
+        review: &Entity<ReviewView>,
+        cx: &VisualTestContext,
+    ) -> Entity<Editor> {
         splittable(review, cx).read_with(cx, |editor, _| editor.rhs_editor().clone())
     }
 
-    pub(crate) fn lhs_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Entity<Editor> {
+    pub(crate) fn lhs_editor(
+        review: &Entity<ReviewView>,
+        cx: &VisualTestContext,
+    ) -> Entity<Editor> {
         splittable(review, cx).read_with(cx, |editor, _| editor.lhs_editor().unwrap().clone())
     }
 
@@ -275,7 +284,11 @@ pub(crate) mod test_support {
         })
     }
 
-    pub(crate) fn row_text(editor: &Entity<Editor>, row: u32, cx: &mut VisualTestContext) -> String {
+    pub(crate) fn row_text(
+        editor: &Entity<Editor>,
+        row: u32,
+        cx: &mut VisualTestContext,
+    ) -> String {
         editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
@@ -283,7 +296,11 @@ pub(crate) mod test_support {
         })
     }
 
-    pub(crate) fn move_to_row_with_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestContext) -> u32 {
+    pub(crate) fn move_to_row_with_text(
+        editor: &Entity<Editor>,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) -> u32 {
         let row = editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             (0..=snapshot.max_row().0)
@@ -323,7 +340,11 @@ pub(crate) mod test_support {
     }
 
     /// Whether the file's buffer is folded on the right side of the diff.
-    pub(crate) fn is_folded(review: &Entity<ReviewView>, path: &str, cx: &mut VisualTestContext) -> bool {
+    pub(crate) fn is_folded(
+        review: &Entity<ReviewView>,
+        path: &str,
+        cx: &mut VisualTestContext,
+    ) -> bool {
         review.read_with(cx, |review, cx| {
             let diff = review.diff().read(cx);
             let repo_path = git::repository::RepoPath::new(path).unwrap();
@@ -338,7 +359,11 @@ pub(crate) mod test_support {
         })
     }
 
-    pub(crate) fn is_reviewed(review: &Entity<ReviewView>, path: &str, cx: &mut VisualTestContext) -> bool {
+    pub(crate) fn is_reviewed(
+        review: &Entity<ReviewView>,
+        path: &str,
+        cx: &mut VisualTestContext,
+    ) -> bool {
         review.read_with(cx, |review, cx| {
             let repo_path = git::repository::RepoPath::new(path).unwrap();
             review.session().read(cx).is_file_reviewed(&repo_path)
@@ -368,7 +393,12 @@ pub(crate) mod test_support {
             author_name: "Ada".into(),
             author_email: "ada@example.com".into(),
             commit_timestamp: 1_700_000_000,
-            subject: message.lines().next().unwrap_or_default().to_string().into(),
+            subject: message
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+                .into(),
             message: message.to_string().into(),
         }
     }
@@ -449,8 +479,13 @@ pub(crate) mod test_support {
         review.read_with(cx, |review, cx| review.tab_content_text(0, cx).to_string())
     }
 
-    pub(crate) fn excerpt_paths(review: &Entity<ReviewView>, cx: &mut VisualTestContext) -> Vec<String> {
-        review.read_with(cx, |review, cx| review.diff().read(cx).excerpt_file_paths(cx))
+    pub(crate) fn excerpt_paths(
+        review: &Entity<ReviewView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<String> {
+        review.read_with(cx, |review, cx| {
+            review.diff().read(cx).excerpt_file_paths(cx)
+        })
     }
 
     /// A repository whose uncommitted changes are, in review order: `a.rs` (two hunks far apart),
@@ -576,8 +611,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use gpui::{
-        AppContext as _, Focusable as _, TestAppContext, VisualContext as _,
-        VisualTestContext,
+        AppContext as _, Focusable as _, TestAppContext, VisualContext as _, VisualTestContext,
     };
     use project::{FakeFs, Project};
     use workspace::MultiWorkspace;
@@ -623,7 +657,13 @@ mod tests {
         let (_fs, workspace, review, cx) = test_support::open_review_fixture(cx).await;
         let panel = test_support::add_review_panel(&workspace, cx);
         let editor = review.read_with(cx, |review, cx| {
-            review.diff().read(cx).editor().read(cx).rhs_editor().clone()
+            review
+                .diff()
+                .read(cx)
+                .editor()
+                .read(cx)
+                .rhs_editor()
+                .clone()
         });
         let panel_focused = |cx: &mut VisualTestContext| {
             cx.update(|window, cx| panel.read(cx).focus_handle(cx).contains_focused(window, cx))
@@ -636,7 +676,9 @@ mod tests {
         };
 
         // The panel follows the review tab.
-        panel.read_with(cx, |panel, _| assert_eq!(panel.active_review(), Some(review.clone())));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_review(), Some(review.clone()))
+        });
 
         cx.simulate_keystrokes("; e");
         assert!(dock_open(cx));

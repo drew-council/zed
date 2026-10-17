@@ -28,7 +28,11 @@ pub(crate) struct FileAttributes {
 
 const GENERATED_ATTRIBUTES: &[&str] = &["linguist-generated", "gitlab-generated"];
 const VENDORED_ATTRIBUTES: &[&str] = &["linguist-vendored"];
-const ATTRIBUTES: &[&str] = &["linguist-generated", "gitlab-generated", "linguist-vendored"];
+const ATTRIBUTES: &[&str] = &[
+    "linguist-generated",
+    "gitlab-generated",
+    "linguist-vendored",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttributeState {
@@ -333,7 +337,10 @@ mod tests {
             Some("local.txt linguist-generated\nsrc/kept.rs -linguist-vendored\n"),
             [
                 ("", "*.txt linguist-vendored\nsrc/** linguist-vendored\n"),
-                ("src", "gen.rs linguist-generated\n*.txt -linguist-vendored\n"),
+                (
+                    "src",
+                    "gen.rs linguist-generated\n*.txt -linguist-vendored\n",
+                ),
                 ("src/inner", "gen.rs -linguist-generated\n"),
             ],
         );
@@ -375,8 +382,14 @@ mod tests {
             }),
         )
         .await;
-        let paths = ["Cargo.lock", "src/generated/api.rs", "src/main.rs", "third_party/lib.c", "local.rs"]
-            .map(|path| RepoPath::new(path).unwrap());
+        let paths = [
+            "Cargo.lock",
+            "src/generated/api.rs",
+            "src/main.rs",
+            "third_party/lib.c",
+            "local.rs",
+        ]
+        .map(|path| RepoPath::new(path).unwrap());
         let loaded = GitAttributes::load(
             fs.as_ref(),
             Path::new(path!("/project")),

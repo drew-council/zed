@@ -1,8 +1,6 @@
 use anyhow::{Context as _, Result};
 use db::{
-    sqlez::{
-        connection::Connection, domain::Domain, thread_safe_connection::ThreadSafeConnection,
-    },
+    sqlez::{connection::Connection, domain::Domain, thread_safe_connection::ThreadSafeConnection},
     sqlez_macros::sql,
 };
 use futures::channel::oneshot;
@@ -70,7 +68,10 @@ impl CodeReviewDb {
     }
 
     /// Records that the review was opened and reads its marks.
-    pub(crate) fn open_review(&self, review_key: String) -> impl Future<Output = Result<StoredMarks>> + use<> {
+    pub(crate) fn open_review(
+        &self,
+        review_key: String,
+    ) -> impl Future<Output = Result<StoredMarks>> + use<> {
         self.queue(move |connection| {
             connection.exec_bound::<&str>(sql!(
                 INSERT INTO code_review_sessions(review_key) VALUES (?)

@@ -14,25 +14,25 @@ use crate::{
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
 use collections::{HashMap, HashSet};
-use git::{repository::RepoPath, status::FileStatus};
-use regex::{Regex, RegexBuilder};
+use editor::ToPoint as _;
 use editor::{
     Editor, EditorEvent, PathKey, SelectionEffects, SplittableEditor,
     actions::{OpenExcerpts, ToggleSoftWrap},
     scroll::Autoscroll,
 };
+use git::{repository::RepoPath, status::FileStatus};
 use git_ui::branch_picker::{self, SelectBranchCallback};
 use gpui::{
     Action as _, AnyEntity, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Subscription,
     Task, WeakEntity,
 };
-use editor::ToPoint as _;
 use language::{Capability, Point, language_settings::SoftWrap};
 use multi_buffer::MultiBufferRow;
 use project::{
     Project, ProjectPath,
     git_store::{Repository, RepositoryEvent},
 };
+use regex::{Regex, RegexBuilder};
 use std::{
     any::{Any, TypeId},
     sync::Arc,
@@ -219,7 +219,11 @@ pub(crate) fn current_review(workspace: &Workspace, cx: &App) -> Option<Entity<R
 }
 
 /// Focuses the active review tab, else the review the panel shows, else any open review.
-pub(crate) fn focus_diff(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+pub(crate) fn focus_diff(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     if let Some(review) = current_review(workspace, cx) {
         workspace.activate_item(&review, true, true, window, cx);
     }
@@ -278,8 +282,13 @@ pub(crate) struct ReviewFilters {
 impl ReviewFilters {
     fn passes_patterns(&self, repo_path: &RepoPath) -> bool {
         let path = repo_path.as_unix_str();
-        self.include.as_ref().is_none_or(|include| include.is_match(path))
-            && self.exclude.as_ref().is_none_or(|exclude| !exclude.is_match(path))
+        self.include
+            .as_ref()
+            .is_none_or(|include| include.is_match(path))
+            && self
+                .exclude
+                .as_ref()
+                .is_none_or(|exclude| !exclude.is_match(path))
     }
 
     fn hides_attributes(&self, attributes: FileAttributes) -> bool {
@@ -293,7 +302,9 @@ pub(crate) fn filter_regex(pattern: &str) -> anyhow::Result<Option<Regex>> {
     if pattern.is_empty() {
         return Ok(None);
     }
-    Ok(Some(RegexBuilder::new(pattern).case_insensitive(true).build()?))
+    Ok(Some(
+        RegexBuilder::new(pattern).case_insensitive(true).build()?,
+    ))
 }
 
 /// What the review panel says about the review's files.
@@ -435,33 +446,44 @@ impl ReviewView {
         };
 
         let mut subscriptions = vec![
-            cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| cx.emit(event.clone())),
+            cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
+                cx.emit(event.clone())
+            }),
             cx.subscribe_in(&diff, window, Self::handle_diff_event),
             // The review panel shows the diff's loading state.
             cx.observe(&diff, |_, _, cx| cx.notify()),
             // A branch review is titled and keyed after the checked-out branch.
-            cx.subscribe_in(&repo, window, |this, repo, event: &RepositoryEvent, window, cx| {
-                if let (RepositoryEvent::HeadChanged, ReviewTarget::Branch { base }) =
-                    (event, &this.target)
-                {
-                    let branch = branch_name(repo, cx);
-                    let base = base.clone();
-                    this.top_block
-                        .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
-                    this.update_session(window, cx);
-                    cx.emit(EditorEvent::TitleChanged);
-                    cx.notify();
-                }
-            }),
+            cx.subscribe_in(
+                &repo,
+                window,
+                |this, repo, event: &RepositoryEvent, window, cx| {
+                    if let (RepositoryEvent::HeadChanged, ReviewTarget::Branch { base }) =
+                        (event, &this.target)
+                    {
+                        let branch = branch_name(repo, cx);
+                        let base = base.clone();
+                        this.top_block
+                            .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
+                        this.update_session(window, cx);
+                        cx.emit(EditorEvent::TitleChanged);
+                        cx.notify();
+                    }
+                },
+            ),
         ];
         let splittable = diff.read(cx).editor().clone();
         subscriptions.extend([
-            cx.subscribe(&splittable, |this, _, event: &EditorEvent, cx| match event {
-                EditorEvent::BufferRangesUpdated { .. }
-                | EditorEvent::BuffersRemoved { .. }
-                | EditorEvent::BufferFoldToggled { .. } => this.repaint_reviewed_hunks(cx),
-                _ => {}
-            }),
+            cx.subscribe_in(
+                &splittable,
+                window,
+                |this, _, event: &EditorEvent, window, cx| match event {
+                    EditorEvent::BufferRangesUpdated { .. }
+                    | EditorEvent::BuffersRemoved { .. }
+                    | EditorEvent::BufferFoldToggled { .. } => this.repaint_reviewed_hunks(cx),
+                    EditorEvent::Focused => this.stay_in_normal_mode_on_folded_header(window, cx),
+                    _ => {}
+                },
+            ),
             cx.observe(&splittable, |this, splittable, cx| {
                 let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
                 if lhs_editor_id != this.lhs_editor_id {
@@ -519,8 +541,9 @@ impl ReviewView {
         let files = self.diff.read(cx).files(cx);
         for file in &files {
             if let Some(digest) = self.diff.read(cx).digest(&file.path_key).cloned() {
-                self.session
-                    .update(cx, |session, cx| session.reconcile(&file.repo_path, &digest, cx));
+                self.session.update(cx, |session, cx| {
+                    session.reconcile(&file.repo_path, &digest, cx)
+                });
             }
             self.sync_fold(&file.path_key, cx);
         }
@@ -808,14 +831,15 @@ impl ReviewView {
         if !self.session.read(cx).is_loaded() {
             return;
         }
-        let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
-        let cursor = editor.update(cx, |editor, cx| {
-            let display_snapshot = editor.display_snapshot(cx);
-            let head = editor.selections.newest::<Point>(&display_snapshot).head();
-            display_snapshot
-                .buffer_snapshot()
-                .anchor_before(Point::new(head.row, 0))
-        });
+        let editor = self
+            .diff
+            .read(cx)
+            .editor()
+            .read(cx)
+            .focused_editor()
+            .clone();
+        // The anchor, not the resolved selection: on a folded header the latter spans the file.
+        let cursor = editor.read(cx).selections.newest_anchor().head();
         match self.hunk_key_at(&editor, cursor, cx) {
             Some((repo_path, hunk_key)) => self.toggle_hunk(&repo_path, hunk_key, cx),
             None => {
@@ -835,9 +859,15 @@ impl ReviewView {
         }
     }
 
-    pub(crate) fn toggle_hunk(&mut self, repo_path: &RepoPath, hunk_key: SharedString, cx: &mut Context<Self>) {
-        self.session
-            .update(cx, |session, cx| session.toggle_hunk(repo_path, hunk_key, cx));
+    pub(crate) fn toggle_hunk(
+        &mut self,
+        repo_path: &RepoPath,
+        hunk_key: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.update(cx, |session, cx| {
+            session.toggle_hunk(repo_path, hunk_key, cx)
+        });
     }
 
     /// The file and key of the hunk whose rows contain `position` in `editor` (either side).
@@ -850,9 +880,12 @@ impl ReviewView {
         let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
         let row = position.to_point(&snapshot).row;
         let line_end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+        let editor = editor.read(cx);
+        // Hunks of folded files can't be seen, so they aren't marked from their header.
         let hunk = snapshot
             .diff_hunks_in_range(Point::new(row, 0)..line_end)
-            .find(|hunk| hunk.row_range.start.0 <= row && row < hunk.row_range.end.0)?;
+            .find(|hunk| hunk.row_range.start.0 <= row && row < hunk.row_range.end.0)
+            .filter(|hunk| !editor.is_buffer_folded(hunk.buffer_id, cx))?;
         let path_key = snapshot.path_for_buffer(hunk.buffer_id)?;
         let diff = self.diff.read(cx);
         let repo_path = diff.repo_path_for(path_key)?;
@@ -913,7 +946,13 @@ impl ReviewView {
     /// Zed's `GoToHunk` (wrapping, centered), except that the hunks of folded files are skipped:
     /// the cursor would be stuck on their header.
     fn go_to_hunk(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
-        let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
+        let editor = self
+            .diff
+            .read(cx)
+            .editor()
+            .read(cx)
+            .focused_editor()
+            .clone();
         editor.update(cx, |editor, cx| {
             let display_snapshot = editor.display_snapshot(cx);
             let head = editor.selections.newest::<Point>(&display_snapshot).head();
@@ -1008,7 +1047,12 @@ impl ReviewView {
     }
 
     /// Moves the diff to the first row of the file (showing only that file in single-file mode).
-    pub(crate) fn reveal_file(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn reveal_file(
+        &mut self,
+        path_key: PathKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.diff
             .update(cx, |diff, cx| diff.move_to_path(path_key, window, cx));
     }
@@ -1237,8 +1281,16 @@ impl ReviewView {
         if self.diff.read(cx).is_snapshot(cx) {
             self.open_working_tree_file_at_cursor(window, cx);
         } else {
-            let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
-            editor.update(cx, |editor, cx| editor.open_excerpts(&OpenExcerpts, window, cx));
+            let editor = self
+                .diff
+                .read(cx)
+                .editor()
+                .read(cx)
+                .focused_editor()
+                .clone();
+            editor.update(cx, |editor, cx| {
+                editor.open_excerpts(&OpenExcerpts, window, cx)
+            });
         }
         discard_vim_count(window, cx);
     }
@@ -1306,7 +1358,11 @@ impl ReviewView {
     }
 
     /// Says that only one file is shown, which one, and how to see the others again.
-    fn render_single_file_bar(&self, path_key: &PathKey, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_single_file_bar(
+        &self,
+        path_key: &PathKey,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let diff = self.diff.read(cx);
         let order = diff.file_order();
         let position = order
@@ -1353,15 +1409,47 @@ impl ReviewView {
             )
     }
 
-    fn has_visual_selection(&self, cx: &mut App) -> bool {
-        let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
-        editor.update(cx, |editor, cx| {
+    /// Compares anchors: a cursor on a folded file's header resolves to the whole folded file.
+    fn has_visual_selection(&self, cx: &App) -> bool {
+        let editor = self
+            .diff
+            .read(cx)
+            .editor()
+            .read(cx)
+            .focused_editor()
+            .read(cx);
+        let selection = editor.selections.newest_anchor();
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor.selections.line_mode() || selection.start.cmp(&selection.end, &snapshot).is_ne()
+    }
+
+    /// Vim enters visual mode when its editor gains focus with a non-empty selection, and a
+    /// cursor on a folded (reviewed) file's header resolves to the whole folded file. That
+    /// cursor is a single position, so vim goes back to normal mode.
+    fn stay_in_normal_mode_on_folded_header(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_visual_selection(cx) {
+            return;
+        }
+        let editor = self
+            .diff
+            .read(cx)
+            .editor()
+            .read(cx)
+            .focused_editor()
+            .clone();
+        let on_folded_header = editor.update(cx, |editor, cx| {
             let snapshot = editor.display_snapshot(cx);
-            !editor
-                .selections
-                .newest::<Point>(&snapshot)
-                .is_empty()
-        })
+            !editor.selections.newest::<Point>(&snapshot).is_empty()
+        });
+        if on_folded_header
+            && let Some(action) = cx.build_action("vim::SwitchToNormalMode", None).log_err()
+        {
+            window.dispatch_action(action, cx);
+        }
     }
 
     fn reviews(&self, target: &ReviewTarget, repo: &Entity<Repository>) -> bool {
@@ -1859,7 +1947,13 @@ mod tests {
                 ["both.txt", "committed.txt", "deleted.txt", "untracked.txt"]
             );
             let editor = review.read_with(cx, |review, cx| {
-                review.diff().read(cx).editor().read(cx).rhs_editor().clone()
+                review
+                    .diff()
+                    .read(cx)
+                    .editor()
+                    .read(cx)
+                    .rhs_editor()
+                    .clone()
             });
             assert_state_with_diff(
                 &editor,
@@ -1949,7 +2043,9 @@ mod tests {
             cx.run_until_parked();
             assert_eq!(
                 review.read_with(cx, |review, _| review.target().clone()),
-                ReviewTarget::Branch { base: "main".into() }
+                ReviewTarget::Branch {
+                    base: "main".into()
+                }
             );
             assert_eq!(tab_title(&review, cx), "Review: feature vs main");
             assert_eq!(
@@ -1980,19 +2076,15 @@ mod tests {
             assert_ne!(other, review);
             workspace.update_in(cx, |workspace, window, cx| {
                 workspace.activate_item(&review, true, true, window, cx);
-                ReviewView::select_base(
-                    review.clone(),
-                    "origin/main".into(),
-                    workspace,
-                    window,
-                    cx,
-                )
+                ReviewView::select_base(review.clone(), "origin/main".into(), workspace, window, cx)
             });
             cx.run_until_parked();
             assert_eq!(active_review(&workspace, cx), other);
             assert_eq!(
                 review.read_with(cx, |review, _| review.target().clone()),
-                ReviewTarget::Branch { base: "main".into() }
+                ReviewTarget::Branch {
+                    base: "main".into()
+                }
             );
             assert_eq!(review_count(&workspace, cx), 2);
         }
@@ -2001,11 +2093,8 @@ mod tests {
         async fn test_commit_review_reuse_titles_and_top_block(cx: &mut TestAppContext) {
             crate::init_test(cx);
             let fs = FakeFs::new(cx.executor());
-            fs.insert_tree(
-                path!("/project"),
-                json!({ ".git": {}, "a.txt": "three\n" }),
-            )
-            .await;
+            fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "three\n" }))
+                .await;
             fs.set_merge_base_content_for_repo(dot_git(), &[("a.txt", "one\n".into())]);
             fs.set_head_and_index_for_repo(dot_git(), &[("a.txt", "three\n".into())]);
             fs.with_git_state(dot_git(), true, |state| {
@@ -2016,7 +2105,10 @@ mod tests {
                 dot_git(),
                 [
                     (commit_data(C1, None, "Start"), false),
-                    (commit_data(C2, Some(C1), "Write two\n\nThe second line."), false),
+                    (
+                        commit_data(C2, Some(C1), "Write two\n\nThe second line."),
+                        false,
+                    ),
                     (
                         commit_data(C3, Some(C2), "Write three, which is a long subject"),
                         false,
@@ -2093,7 +2185,10 @@ mod tests {
                     head: oid(C3)
                 })
             );
-            assert_eq!(tab_title(&single, cx), "Review: 3333333 Write three, which i…");
+            assert_eq!(
+                tab_title(&single, cx),
+                "Review: 3333333 Write three, which i…"
+            );
 
             // Typos are errors.
             assert_eq!(take_notifications(&workspace, cx), 0);
@@ -2120,7 +2215,9 @@ mod tests {
         use gpui::VisualTestContext;
 
         fn excerpt_paths(review: &Entity<ReviewView>, cx: &mut VisualTestContext) -> Vec<String> {
-            review.read_with(cx, |review, cx| review.diff().read(cx).excerpt_file_paths(cx))
+            review.read_with(cx, |review, cx| {
+                review.diff().read(cx).excerpt_file_paths(cx)
+            })
         }
 
         #[gpui::test]
@@ -2174,7 +2271,9 @@ mod tests {
             let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
             let lhs = lhs_editor(&review, cx);
             cx.simulate_keystrokes("ctrl-w h");
-            assert!(splittable(&review, cx).read_with(cx, |editor, _| editor.focused_editor() == &lhs));
+            assert!(
+                splittable(&review, cx).read_with(cx, |editor, _| editor.focused_editor() == &lhs)
+            );
 
             cx.simulate_keystrokes("] f");
             assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("added.txt"));
@@ -2204,7 +2303,13 @@ mod tests {
             init_vim_test(cx, DiffViewStyle::Unified);
             let (fs, _workspace, review, cx) = open_review_fixture(cx).await;
             let editor = rhs_editor(&review, cx);
-            let all_files = ["a.rs", "added.txt", "deleted.txt", "long.txt", "modified.txt"];
+            let all_files = [
+                "a.rs",
+                "added.txt",
+                "deleted.txt",
+                "long.txt",
+                "modified.txt",
+            ];
 
             cx.simulate_keystrokes("] f j");
             cx.simulate_keystrokes("; f");
@@ -2242,7 +2347,13 @@ mod tests {
             cx.run_until_parked();
             assert_eq!(
                 excerpt_paths(&review, cx),
-                ["a.rs", "deleted.txt", "later.txt", "long.txt", "modified.txt"]
+                [
+                    "a.rs",
+                    "deleted.txt",
+                    "later.txt",
+                    "long.txt",
+                    "modified.txt"
+                ]
             );
             cx.update(|window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
         }

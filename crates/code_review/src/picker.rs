@@ -169,10 +169,17 @@ pub(crate) enum Section {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
     Header(Section),
-    Uncommitted { positions: Vec<usize> },
-    Branch { positions: Vec<usize> },
+    Uncommitted {
+        positions: Vec<usize>,
+    },
+    Branch {
+        positions: Vec<usize>,
+    },
     /// `index` is into the recent commits.
-    Commit { index: usize, positions: Vec<usize> },
+    Commit {
+        index: usize,
+        positions: Vec<usize>,
+    },
     Status(SharedString),
 }
 
@@ -356,12 +363,13 @@ impl StartReviewDelegate {
         // Milestone 7 appends the pull request section here.
         self.entries = entries;
 
-        let wanted_key = if self.select_first_commit && matches!(self.commits, RecentCommits::Loaded(_)) {
-            self.select_first_commit = false;
-            Some(EntryKey::Commit(0))
-        } else {
-            previous_key
-        };
+        let wanted_key =
+            if self.select_first_commit && matches!(self.commits, RecentCommits::Loaded(_)) {
+                self.select_first_commit = false;
+                Some(EntryKey::Commit(0))
+            } else {
+                previous_key
+            };
         self.selected_index = wanted_key
             .and_then(|key| {
                 self.entries
@@ -463,8 +471,11 @@ impl StartReviewDelegate {
                                         .flex_none(),
                                 )
                                 .child(
-                                    HighlightedLabel::new(commit.subject.clone(), subject_positions)
-                                        .truncate(),
+                                    HighlightedLabel::new(
+                                        commit.subject.clone(),
+                                        subject_positions,
+                                    )
+                                    .truncate(),
                                 ),
                         )
                         .child(
@@ -479,11 +490,7 @@ impl StartReviewDelegate {
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                                 )
-                                .child(
-                                    Label::new(time)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
+                                .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
                         ),
                 )
                 .into_any_element(),
@@ -520,7 +527,9 @@ impl PickerDelegate for StartReviewDelegate {
     }
 
     fn can_select(&self, ix: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) -> bool {
-        self.entries.get(ix).is_some_and(|entry| entry.key().is_some())
+        self.entries
+            .get(ix)
+            .is_some_and(|entry| entry.key().is_some())
     }
 
     fn update_matches(
@@ -855,12 +864,11 @@ mod tests {
             "Branch vs origin/main"
         );
 
-        picker.update_in(cx, |picker, window, cx| picker.set_query("tweak", window, cx));
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("tweak", window, cx)
+        });
         cx.run_until_parked();
-        assert_eq!(
-            entry_keys(&picker, cx),
-            [None, Some(EntryKey::Commit(0))]
-        );
+        assert_eq!(entry_keys(&picker, cx), [None, Some(EntryKey::Commit(0))]);
         assert_eq!(selected_key(&picker, cx), Some(EntryKey::Commit(0)));
         picker.update_in(cx, |picker, window, cx| picker.set_query("", window, cx));
         cx.run_until_parked();

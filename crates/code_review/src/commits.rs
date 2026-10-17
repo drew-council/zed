@@ -323,8 +323,7 @@ impl CommitDiffList {
             .update(|cx| load_snapshot_texts(&repo, range, &entries, cx))
             .await?;
         let files =
-            build_snapshot_files(entries, texts, range.base.is_some(), &repo, &project, cx)
-                .await?;
+            build_snapshot_files(entries, texts, range.base.is_some(), &repo, &project, cx).await?;
         this.update(cx, |this, cx| {
             this.snapshot_statuses = files
                 .iter()
@@ -398,8 +397,10 @@ impl CommitDiffList {
                 entries
                     .iter()
                     .filter_map(|(repo_path, status)| {
-                        let project_path =
-                            self.repo.read(cx).repo_path_to_project_path(repo_path, cx)?;
+                        let project_path = self
+                            .repo
+                            .read(cx)
+                            .repo_path_to_project_path(repo_path, cx)?;
                         let old_oid = match status {
                             TreeDiffStatus::Added => None,
                             TreeDiffStatus::Modified { old } | TreeDiffStatus::Deleted { old } => {
@@ -412,7 +413,9 @@ impl CommitDiffList {
                         let mut cx = cx.to_async();
                         let load = async move {
                             let buffer = project
-                                .update(&mut cx, |project, cx| project.open_buffer(project_path, cx))
+                                .update(&mut cx, |project, cx| {
+                                    project.open_buffer(project_path, cx)
+                                })
                                 .await?;
                             let diff = git_store
                                 .update(&mut cx, |git_store, cx| {
@@ -513,9 +516,7 @@ async fn build_snapshot_files(
             continue;
         }
         let worktree_id = cx
-            .update(|cx| {
-                worktree_id_for_repo_path(repo.read(cx), project.read(cx), &repo_path, cx)
-            })
+            .update(|cx| worktree_id_for_repo_path(repo.read(cx), project.read(cx), &repo_path, cx))
             .context("the project has no worktrees")?;
         let is_deleted = texts.new.is_none();
         let is_binary = texts.old.as_deref().is_some_and(is_binary_content)
@@ -775,7 +776,11 @@ mod tests {
     /// `b` and `x.txt`, C3 changes `b`.
     async fn history_fixture(
         cx: &mut TestAppContext,
-    ) -> (std::sync::Arc<FakeFs>, Entity<Workspace>, &mut VisualTestContext) {
+    ) -> (
+        std::sync::Arc<FakeFs>,
+        Entity<Workspace>,
+        &mut VisualTestContext,
+    ) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/project"),
@@ -845,7 +850,11 @@ mod tests {
             assert!(editor.read_only(cx));
             for buffer in editor.buffer().read(cx).all_buffers() {
                 let file = buffer.read(cx).file().unwrap().clone();
-                assert!(file.as_local().is_some(), "{:?} isn't a project file", file.path());
+                assert!(
+                    file.as_local().is_some(),
+                    "{:?} isn't a project file",
+                    file.path()
+                );
                 assert_eq!(buffer.read(cx).capability(), Capability::ReadWrite);
             }
         });

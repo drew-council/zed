@@ -2,7 +2,9 @@ use crate::persistence::{CodeReviewDb, StoredMarks};
 use buffer_diff::BufferDiffSnapshot;
 use collections::{HashMap, HashSet};
 use git::repository::RepoPath;
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task, WeakEntity};
+use gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task, WeakEntity,
+};
 use language::{Anchor, BufferSnapshot};
 use std::{future::Future, ops::Range};
 use util::ResultExt as _;
@@ -161,7 +163,10 @@ impl ReviewSession {
             self.reviewed_files.remove(path);
             persist(self.db.unset_file_reviewed(key, unix_path), cx);
         }
-        cx.emit(ReviewSessionEvent::FilesChanged(vec![(path.clone(), reviewed)]));
+        cx.emit(ReviewSessionEvent::FilesChanged(vec![(
+            path.clone(),
+            reviewed,
+        )]));
         cx.notify();
     }
 
@@ -201,7 +206,12 @@ impl ReviewSession {
 
     /// Brings the marks of a file in line with its current diff (tuicr's rules): a reviewed file
     /// whose diff changed is no longer reviewed, and marks of hunks that no longer exist go.
-    pub(crate) fn reconcile(&mut self, path: &RepoPath, digest: &FileDigest, cx: &mut Context<Self>) {
+    pub(crate) fn reconcile(
+        &mut self,
+        path: &RepoPath,
+        digest: &FileDigest,
+        cx: &mut Context<Self>,
+    ) {
         if !self.loaded {
             return;
         }
@@ -210,8 +220,14 @@ impl ReviewSession {
         match self.reviewed_files.get(path).copied() {
             Some(Some(content_hash)) if content_hash != digest.content_hash => {
                 self.reviewed_files.remove(path);
-                persist(self.db.unset_file_reviewed(key.clone(), unix_path.clone()), cx);
-                cx.emit(ReviewSessionEvent::FilesChanged(vec![(path.clone(), false)]));
+                persist(
+                    self.db.unset_file_reviewed(key.clone(), unix_path.clone()),
+                    cx,
+                );
+                cx.emit(ReviewSessionEvent::FilesChanged(vec![(
+                    path.clone(),
+                    false,
+                )]));
                 cx.notify();
             }
             Some(None) => {
@@ -309,7 +325,9 @@ impl Fnv {
 pub(crate) fn file_digest(diff: &BufferDiffSnapshot, buffer: &BufferSnapshot) -> FileDigest {
     let base_text = diff.base_text();
     let mut hunks = Vec::new();
-    for hunk in diff.hunks_intersecting_range(Anchor::min_max_range_for_buffer(buffer.remote_id()), buffer) {
+    for hunk in
+        diff.hunks_intersecting_range(Anchor::min_max_range_for_buffer(buffer.remote_id()), buffer)
+    {
         let mut hash = Fnv::new();
         hash.write(b"-");
         for chunk in base_text.text_for_range(hunk.diff_base_byte_range.clone()) {
@@ -324,11 +342,20 @@ pub(crate) fn file_digest(diff: &BufferDiffSnapshot, buffer: &BufferSnapshot) ->
         let old_start = base_text.offset_to_point(hunk.diff_base_byte_range.start);
         let old_end = base_text.offset_to_point(hunk.diff_base_byte_range.end);
         let old_count = line_count(old_start.row, old_end.row, old_end.column);
-        let new_count = line_count(hunk.range.start.row, hunk.range.end.row, hunk.range.end.column);
+        let new_count = line_count(
+            hunk.range.start.row,
+            hunk.range.end.row,
+            hunk.range.end.column,
+        );
         hunks.push((
             hash.0,
             hunk.diff_base_byte_range.clone(),
-            [old_start.row + 1, old_count, hunk.range.start.row + 1, new_count],
+            [
+                old_start.row + 1,
+                old_count,
+                hunk.range.start.row + 1,
+                new_count,
+            ],
         ));
     }
 
@@ -398,7 +425,11 @@ mod tests {
             .replace("line 15\n", "LINE 15\n");
         let original = digest(&base, &edited, cx);
         assert_eq!(original.hunks.len(), 2);
-        assert!(keys(&original).iter().all(|key| key.starts_with("hunk-content-v1:")));
+        assert!(
+            keys(&original)
+                .iter()
+                .all(|key| key.starts_with("hunk-content-v1:"))
+        );
 
         // Rows inserted above move the hunks but keep their keys; the file hash changes.
         let shifted = digest(&base, &format!("new\n{edited}"), cx);
@@ -491,9 +522,12 @@ mod tests {
             assert!(!session.is_hunk_reviewed(&path, &second_hunk));
         });
         // Other reviews have their own marks.
-        let other = cx.update(|cx| ReviewSession::for_key(ReviewKey("uncommitted:/other".into()), cx));
+        let other =
+            cx.update(|cx| ReviewSession::for_key(ReviewKey("uncommitted:/other".into()), cx));
         cx.run_until_parked();
-        other.read_with(cx, |other, _| assert!(!other.is_hunk_reviewed(&path, &first_hunk)));
+        other.read_with(cx, |other, _| {
+            assert!(!other.is_hunk_reviewed(&path, &first_hunk))
+        });
     }
 
     /// `digest` with the hunk at `index` changed.

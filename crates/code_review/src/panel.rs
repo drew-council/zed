@@ -1,8 +1,8 @@
 use crate::{
     ClearExcludeFilter, ClearFilters, ClearIncludeFilter, CollapseSelectedEntry, CopyBranchName,
     EditExcludeFilter, EditIncludeFilter, ExpandSelectedEntry, FocusPanel, ReviewUncommitted,
-    ReviewView, SearchPaths, SelectNextMatch, SelectPreviousMatch, ToggleFileReviewed,
-    ToggleFocus, ToggleHideReviewed, TogglePanel, ToggleSelectedDirectory, ToggleShowGenerated,
+    ReviewView, SearchPaths, SelectNextMatch, SelectPreviousMatch, ToggleFileReviewed, ToggleFocus,
+    ToggleHideReviewed, TogglePanel, ToggleSelectedDirectory, ToggleShowGenerated,
     ToggleShowVendored,
     view::{PanelFile, ReviewFilters, ReviewSummary, current_review, filter_regex, focus_diff},
 };
@@ -77,7 +77,11 @@ pub(crate) fn register(workspace: &mut Workspace) {
         match review.read(cx).branch_name(cx) {
             Some(branch) => cx.write_to_clipboard(ClipboardItem::new_string(branch.to_string())),
             None => workspace.show_toast(
-                Toast::new(NotificationId::unique::<CopyBranchName>(), "HEAD is detached").autohide(),
+                Toast::new(
+                    NotificationId::unique::<CopyBranchName>(),
+                    "HEAD is detached",
+                )
+                .autohide(),
                 cx,
             ),
         }
@@ -269,13 +273,17 @@ impl ReviewPanel {
             .map(|review| {
                 vec![
                     cx.observe(review, |this, _, cx| this.rebuild(cx)),
-                    cx.subscribe_in(review, window, |this, _, event: &EditorEvent, window, cx| {
-                        if let EditorEvent::SelectionsChanged { .. } = event
-                            && !this.focus_handle.contains_focused(window, cx)
-                        {
-                            this.select_cursor_file(cx);
-                        }
-                    }),
+                    cx.subscribe_in(
+                        review,
+                        window,
+                        |this, _, event: &EditorEvent, window, cx| {
+                            if let EditorEvent::SelectionsChanged { .. } = event
+                                && !this.focus_handle.contains_focused(window, cx)
+                            {
+                                this.select_cursor_file(cx);
+                            }
+                        },
+                    ),
                 ]
             })
             .unwrap_or_default();
@@ -346,11 +354,14 @@ impl ReviewPanel {
                 directory.push_str(component);
                 let name = SharedString::from(component.to_string());
                 let path = RepoPath::new(&directory).ok();
-                node = node.children.entry(name.clone()).or_insert_with(|| TreeNode {
-                    name,
-                    path,
-                    ..TreeNode::default()
-                });
+                node = node
+                    .children
+                    .entry(name.clone())
+                    .or_insert_with(|| TreeNode {
+                        name,
+                        path,
+                        ..TreeNode::default()
+                    });
             }
             node.files.push(file);
         }
@@ -455,7 +466,11 @@ impl ReviewPanel {
         );
         // A file inside a collapsed directory selects that directory.
         let index = index.or_else(|| {
-            let repo_path = self.files(cx).into_iter().find(|file| file.path_key == path_key)?.repo_path;
+            let repo_path = self
+                .files(cx)
+                .into_iter()
+                .find(|file| file.path_key == path_key)?
+                .repo_path;
             self.entries.iter().position(|entry| {
                 matches!(entry, TreeEntry::Directory { path, expanded: false, .. }
                     if repo_path.starts_with(path))
@@ -487,10 +502,17 @@ impl ReviewPanel {
         self.select(index, cx);
     }
 
-    fn select_previous(&mut self, _: &menu::SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let index = self
             .selected
-            .map_or(self.entries.len().saturating_sub(1), |index| index.saturating_sub(1));
+            .map_or(self.entries.len().saturating_sub(1), |index| {
+                index.saturating_sub(1)
+            });
         self.select(index, cx);
     }
 
@@ -524,7 +546,13 @@ impl ReviewPanel {
     }
 
     /// Moves the diff to the file; `focus` also moves focus to the diff.
-    fn open_file(&mut self, path_key: PathKey, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_file(
+        &mut self,
+        path_key: PathKey,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(review) = self.active_review() else {
             return;
         };
@@ -564,9 +592,7 @@ impl ReviewPanel {
                     self.select(index + 1, cx);
                 }
             }
-            Some(TreeEntry::File { file, .. }) => {
-                self.open_file(file.path_key, false, window, cx)
-            }
+            Some(TreeEntry::File { file, .. }) => self.open_file(file.path_key, false, window, cx),
             None => {}
         }
     }
@@ -594,9 +620,11 @@ impl ReviewPanel {
         if depth == 0 {
             return;
         }
-        let parent = self.entries[..index]
-            .iter()
-            .rposition(|entry| matches!(entry, TreeEntry::Directory { .. }) && entry.depth() < depth);
+        let parent = self.entries.get(..index).and_then(|entries| {
+            entries.iter().rposition(|entry| {
+                matches!(entry, TreeEntry::Directory { .. }) && entry.depth() < depth
+            })
+        });
         if let Some(parent) = parent {
             self.select(parent, cx);
         }
@@ -608,8 +636,14 @@ impl ReviewPanel {
         };
         let filters = review.read(cx).filters();
         let text = match kind {
-            PromptKind::Include => filters.include.as_ref().map(|regex| regex.as_str().to_string()),
-            PromptKind::Exclude => filters.exclude.as_ref().map(|regex| regex.as_str().to_string()),
+            PromptKind::Include => filters
+                .include
+                .as_ref()
+                .map(|regex| regex.as_str().to_string()),
+            PromptKind::Exclude => filters
+                .exclude
+                .as_ref()
+                .map(|regex| regex.as_str().to_string()),
             PromptKind::Search => self.search.clone(),
         }
         .unwrap_or_default();
@@ -690,7 +724,12 @@ impl ReviewPanel {
         let files = self.files(cx);
         let matches = files
             .iter()
-            .filter(|file| file.repo_path.as_unix_str().to_lowercase().contains(&search))
+            .filter(|file| {
+                file.repo_path
+                    .as_unix_str()
+                    .to_lowercase()
+                    .contains(&search)
+            })
             .collect::<Vec<_>>();
         let current = match self.selected_entry() {
             Some(TreeEntry::File { file, .. }) => Some(file.path_key.clone()),
@@ -699,13 +738,21 @@ impl ReviewPanel {
         let target = if forward {
             matches
                 .iter()
-                .find(|file| current.as_ref().is_none_or(|current| &file.path_key > current))
+                .find(|file| {
+                    current
+                        .as_ref()
+                        .is_none_or(|current| &file.path_key > current)
+                })
                 .or_else(|| matches.first())
         } else {
             matches
                 .iter()
                 .rev()
-                .find(|file| current.as_ref().is_none_or(|current| &file.path_key < current))
+                .find(|file| {
+                    current
+                        .as_ref()
+                        .is_none_or(|current| &file.path_key < current)
+                })
                 .or_else(|| matches.last())
         };
         let Some(target) = target.map(|file| (*file).clone()) else {
@@ -737,7 +784,12 @@ impl ReviewPanel {
         self.select_match(false, cx);
     }
 
-    fn cancel_editor(&mut self, _: &editor::actions::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+    fn cancel_editor(
+        &mut self,
+        _: &editor::actions::Cancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.prompt.is_some() {
             self.close_prompt(window, cx);
         } else {
@@ -853,7 +905,11 @@ impl ReviewPanel {
                 ClearFilters.boxed_clone(),
             )
             .separator()
-            .action_disabled_when(!has_branch, "Copy Branch Name", CopyBranchName.boxed_clone())
+            .action_disabled_when(
+                !has_branch,
+                "Copy Branch Name",
+                CopyBranchName.boxed_clone(),
+            )
         })
     }
 
@@ -867,13 +923,14 @@ impl ReviewPanel {
         let menu = self.build_menu(file, window, cx);
         let menu_focus = menu.focus_handle(cx);
         window.defer(cx, move |window, cx| window.focus(&menu_focus, cx));
-        let subscription = cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
-            if menu.focus_handle(cx).contains_focused(window, cx) {
-                window.focus(&this.focus_handle, cx);
-            }
-            this.context_menu = None;
-            cx.notify();
-        });
+        let subscription =
+            cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
+                if menu.focus_handle(cx).contains_focused(window, cx) {
+                    window.focus(&this.focus_handle, cx);
+                }
+                this.context_menu = None;
+                cx.notify();
+            });
         self.context_menu = Some((menu, position, subscription));
         cx.notify();
     }
@@ -915,7 +972,9 @@ impl ReviewPanel {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.selected = Some(index);
-                        if let Some(TreeEntry::Directory { path, .. }) = this.entries.get(index).cloned() {
+                        if let Some(TreeEntry::Directory { path, .. }) =
+                            this.entries.get(index).cloned()
+                        {
                             this.toggle_directory(path, cx);
                         }
                     }))
@@ -957,17 +1016,20 @@ impl ReviewPanel {
                             )
                             .child(Label::new(letter).size(LabelSize::Small).color(color)),
                     )
-                    .when(file.attributes.generated || file.attributes.vendored, |item| {
-                        item.child(
-                            Label::new(if file.attributes.generated {
-                                "(generated)"
-                            } else {
-                                "(vendored)"
-                            })
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                        )
-                    })
+                    .when(
+                        file.attributes.generated || file.attributes.vendored,
+                        |item| {
+                            item.child(
+                                Label::new(if file.attributes.generated {
+                                    "(generated)"
+                                } else {
+                                    "(vendored)"
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            )
+                        },
+                    )
                     .tooltip({
                         let path = SharedString::from(file.repo_path.as_unix_str().to_string());
                         move |_, cx| Tooltip::simple(path.clone(), cx)
@@ -986,7 +1048,8 @@ impl ReviewPanel {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.selected = Some(index);
-                        if let Some(TreeEntry::File { file, .. }) = this.entries.get(index).cloned() {
+                        if let Some(TreeEntry::File { file, .. }) = this.entries.get(index).cloned()
+                        {
                             this.open_file(file.path_key, false, window, cx);
                         }
                         cx.notify();
@@ -1006,7 +1069,11 @@ impl ReviewPanel {
         let review = review.read(cx);
         let title = review.title(cx);
         let summary = review.summary(cx);
-        let status = status_line(review.filters(), &summary, review.diff().read(cx).single_file().is_some());
+        let status = status_line(
+            review.filters(),
+            &summary,
+            review.diff().read(cx).single_file().is_some(),
+        );
         let panel = cx.weak_entity();
         v_flex()
             .px_2()
@@ -1048,7 +1115,11 @@ impl ReviewPanel {
             })
     }
 
-    fn render_empty_state(&self, review: Option<&Entity<ReviewView>>, cx: &Context<Self>) -> AnyElement {
+    fn render_empty_state(
+        &self,
+        review: Option<&Entity<ReviewView>>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let content = match review {
             None => v_flex()
                 .gap_2()
@@ -1068,18 +1139,23 @@ impl ReviewPanel {
                     .gap_2()
                     .items_center()
                     .child(Label::new(review.diff().read(cx).empty_label(cx)).color(Color::Muted))
-                    .when(filters.include.is_some() || filters.exclude.is_some(), |el| {
-                        el.child(Button::new("review-panel-clear-filters", "Clear Filters").on_click(
-                            |_, window, cx| window.dispatch_action(ClearFilters.boxed_clone(), cx),
-                        ))
-                    })
+                    .when(
+                        filters.include.is_some() || filters.exclude.is_some(),
+                        |el| {
+                            el.child(
+                                Button::new("review-panel-clear-filters", "Clear Filters")
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(ClearFilters.boxed_clone(), cx)
+                                    }),
+                            )
+                        },
+                    )
                     .when(summary.reviewed_hidden > 0, |el| {
                         el.child(
-                            Button::new("review-panel-show-reviewed", "Show Reviewed Files").on_click(
-                                |_, window, cx| {
+                            Button::new("review-panel-show-reviewed", "Show Reviewed Files")
+                                .on_click(|_, window, cx| {
                                     window.dispatch_action(ToggleHideReviewed.boxed_clone(), cx)
-                                },
-                            ),
+                                }),
                         )
                     })
                     .when(summary.generated_hidden > 0, |el| {
@@ -1134,7 +1210,11 @@ impl ReviewPanel {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                let marker = if self.selected == Some(index) { ">" } else { "" };
+                let marker = if self.selected == Some(index) {
+                    ">"
+                } else {
+                    ""
+                };
                 let indent = "  ".repeat(entry.depth());
                 match entry {
                     TreeEntry::Directory { name, expanded, .. } => {
@@ -1160,7 +1240,11 @@ impl ReviewPanel {
 }
 
 /// Describes the active filters and what they hide, when anything applies.
-fn status_line(filters: &ReviewFilters, summary: &ReviewSummary, single_file: bool) -> Option<String> {
+fn status_line(
+    filters: &ReviewFilters,
+    summary: &ReviewSummary,
+    single_file: bool,
+) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(include) = &filters.include {
         parts.push(format!("include {}", include.as_str()));
@@ -1393,7 +1477,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn prompt(panel: &Entity<ReviewPanel>, cx: &mut VisualTestContext) -> Option<(String, Option<SharedString>)> {
+    fn prompt(
+        panel: &Entity<ReviewPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(String, Option<SharedString>)> {
         panel.read_with(cx, |panel, cx| {
             let prompt = panel.prompt.as_ref()?;
             Some((prompt.editor.read(cx).text(cx), prompt.error.clone()))
@@ -1648,13 +1735,19 @@ mod tests {
         init_vim_test(cx, DiffViewStyle::Unified);
         let (_fs, workspace, review, cx) = open_tree_fixture(cx).await;
         let panel = add_review_panel(&workspace, cx);
-        assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), Some(review.clone()));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.active_review()),
+            Some(review.clone())
+        );
 
         // A split shares the reviewed marks but has its own filters.
         dispatch(workspace::SplitRight::default(), cx);
         let other = crate::test_support::active_review(&workspace, cx);
         assert_ne!(other, review);
-        assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), Some(other.clone()));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.active_review()),
+            Some(other.clone())
+        );
         cx.focus(&other);
         cx.simulate_keystrokes("r");
         assert!(is_reviewed(&review, "docs/old.md", cx));
@@ -1670,7 +1763,10 @@ mod tests {
             workspace.activate_item(&review, true, true, window, cx)
         });
         cx.run_until_parked();
-        assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), Some(review.clone()));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.active_review()),
+            Some(review.clone())
+        );
         assert_eq!(names(&panel, cx)[1], "old.md D ✓");
 
         // Closing every review empties the panel.
@@ -1747,7 +1843,9 @@ mod tests {
 
         dispatch(crate::CopyBranchName, cx);
         assert_eq!(
-            cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
             Some("feature/review")
         );
 
@@ -1757,7 +1855,9 @@ mod tests {
             panel.deploy_context_menu(Point::default(), file, window, cx);
         });
         cx.run_until_parked();
-        let menu = panel.read_with(cx, |panel, _| panel.context_menu.as_ref().map(|(menu, _, _)| menu.clone()));
+        let menu = panel.read_with(cx, |panel, _| {
+            panel.context_menu.as_ref().map(|(menu, _, _)| menu.clone())
+        });
         let menu = menu.unwrap();
         cx.update(|window, cx| assert!(menu.focus_handle(cx).contains_focused(window, cx)));
         dispatch(menu::Cancel, cx);

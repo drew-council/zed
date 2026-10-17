@@ -309,7 +309,10 @@ mod tests {
     }
 
     /// The highlighted cursor rows of `editor`, with the kind of row they were painted as.
-    fn cursor_rows(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Vec<(u32, &'static str)> {
+    fn cursor_rows(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(u32, &'static str)> {
         editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let mut rows = Vec::new();
@@ -385,8 +388,21 @@ mod tests {
 
         let row = move_to_row_with_text(&editor, "line 4", cx);
         for keystrokes in [
-            "w", "b", "shift-w", "shift-e", "$", "^", "space", "backspace", "(", ")", "%", "f", "t",
-            "; ,", "end",
+            "w",
+            "b",
+            "shift-w",
+            "shift-e",
+            "$",
+            "^",
+            "space",
+            "backspace",
+            "(",
+            ")",
+            "%",
+            "f",
+            "t",
+            "; ,",
+            "end",
         ] {
             cx.simulate_keystrokes(keystrokes);
             assert_eq!(
@@ -435,7 +451,11 @@ mod tests {
             cx.simulate_keystrokes(keystrokes);
             // Still in normal mode: `j` moves the cursor instead of typing.
             cx.simulate_keystrokes("j");
-            assert_eq!(cursor_point(&editor, cx).row, row + 1, "after {keystrokes:?}");
+            assert_eq!(
+                cursor_point(&editor, cx).row,
+                row + 1,
+                "after {keystrokes:?}"
+            );
         }
         editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), text));
     }

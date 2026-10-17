@@ -95,7 +95,11 @@ impl DiffHunkRenderer for ReviewHunkRenderer {
             .child(
                 Button::new(
                     ("review-hunk", row as u64),
-                    if reviewed { "Reviewed" } else { "Mark Reviewed" },
+                    if reviewed {
+                        "Reviewed"
+                    } else {
+                        "Mark Reviewed"
+                    },
                 )
                 .when(reviewed, |button| {
                     button.start_icon(
@@ -104,12 +108,18 @@ impl DiffHunkRenderer for ReviewHunkRenderer {
                             .color(Color::Success),
                     )
                 })
-                .key_binding(KeyBinding::for_action_in(&ToggleHunkReviewed, &focus_handle, cx))
+                .key_binding(KeyBinding::for_action_in(
+                    &ToggleHunkReviewed,
+                    &focus_handle,
+                    cx,
+                ))
                 .on_click({
                     let view = view.downgrade();
                     move |_, _, cx| {
-                        view.update(cx, |view, cx| view.toggle_hunk(&repo_path, hunk_key.clone(), cx))
-                            .ok();
+                        view.update(cx, |view, cx| {
+                            view.toggle_hunk(&repo_path, hunk_key.clone(), cx)
+                        })
+                        .ok();
                     }
                 }),
             )
@@ -134,7 +144,10 @@ pub(crate) fn paint_reviewed_hunks(
     let buffer = editor.buffer().read(cx).snapshot(cx);
     for rows in rows {
         let mut run: Option<(u32, bool)> = None;
-        for (row, row_info) in rows.clone().zip(buffer.row_infos(MultiBufferRow(rows.start))) {
+        for (row, row_info) in rows
+            .clone()
+            .zip(buffer.row_infos(MultiBufferRow(rows.start)))
+        {
             let is_deleted = row_info
                 .diff_status
                 .is_some_and(|status| status.kind == DiffHunkStatusKind::Deleted);
@@ -173,7 +186,12 @@ fn highlight_run(
         include_gutter: false,
     };
     if is_deleted {
-        editor.highlight_rows::<ReviewedHunkDeleted>(start..end, reviewed_deleted_color, options, cx);
+        editor.highlight_rows::<ReviewedHunkDeleted>(
+            start..end,
+            reviewed_deleted_color,
+            options,
+            cx,
+        );
     } else {
         editor.highlight_rows::<ReviewedHunkAdded>(start..end, reviewed_added_color, options, cx);
     }
@@ -194,7 +212,10 @@ fn reviewed_deleted_color(cx: &App) -> Hsla {
 }
 
 #[cfg(test)]
-pub(crate) fn reviewed_rows_for_test(editor: &Entity<Editor>, cx: &mut gpui::VisualTestContext) -> Vec<u32> {
+pub(crate) fn reviewed_rows_for_test(
+    editor: &Entity<Editor>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<u32> {
     use editor::ToPoint as _;
     editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -204,7 +225,11 @@ pub(crate) fn reviewed_rows_for_test(editor: &Entity<Editor>, cx: &mut gpui::Vis
             .flat_map(|(range, _)| {
                 let start = range.start.to_point(&snapshot).row;
                 let end = range.end.to_point(&snapshot);
-                let end = if range.end.is_max() { end.row + 1 } else { end.row };
+                let end = if range.end.is_max() {
+                    end.row + 1
+                } else {
+                    end.row
+                };
                 start..end
             })
             .collect::<Vec<_>>();
@@ -227,8 +252,8 @@ mod tests {
     };
     use fs::Fs as _;
     use gpui::{TestAppContext, VisualTestContext};
-    use std::any::TypeId;
     use settings::DiffViewStyle;
+    use std::any::TypeId;
     use util::path;
 
     #[gpui::test]
@@ -327,8 +352,11 @@ mod tests {
         // A change to a reviewed file's diff clears its mark and unfolds it; other files keep
         // theirs.
         let a = fs.load(path!("/project/a.rs").as_ref()).await.unwrap();
-        fs.insert_file(path!("/project/a.rs"), a.replace("line 20\n", "LINE 20\n").into_bytes())
-            .await;
+        fs.insert_file(
+            path!("/project/a.rs"),
+            a.replace("line 20\n", "LINE 20\n").into_bytes(),
+        )
+        .await;
         cx.run_until_parked();
         assert!(!is_reviewed(&review, "a.rs", cx));
         assert!(!is_folded(&review, "a.rs", cx));
@@ -361,7 +389,14 @@ mod tests {
         }
         assert_eq!(
             visited,
-            ["added.txt", "long.txt", "modified.txt", "modified.txt", "added.txt", "long.txt"]
+            [
+                "added.txt",
+                "long.txt",
+                "modified.txt",
+                "modified.txt",
+                "added.txt",
+                "long.txt"
+            ]
         );
         cx.simulate_keystrokes("[ c [ c");
         assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("modified.txt"));
@@ -445,20 +480,32 @@ mod tests {
         move_to_row_with_text(&editor, "line 3", cx);
         cx.simulate_keystrokes("shift-r");
         assert_eq!(row_texts(&editor, cx), ["line 2", "LINE 2"]);
-        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.notification_ids().len(), 1));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.notification_ids().len(), 1)
+        });
 
         move_to_row_with_text(&editor, "LINE 35", cx);
         cx.simulate_keystrokes("shift-r");
-        assert_eq!(row_texts(&editor, cx), ["line 2", "LINE 2", "line 35", "LINE 35"]);
+        assert_eq!(
+            row_texts(&editor, cx),
+            ["line 2", "LINE 2", "line 35", "LINE 35"]
+        );
 
         // A new hunk elsewhere keeps both marks; a changed hunk loses its own.
         let a = fs.load(path!("/project/a.rs").as_ref()).await.unwrap();
         let a = a.replace("line 20\n", "LINE 20\n");
-        fs.insert_file(path!("/project/a.rs"), a.clone().into_bytes()).await;
-        cx.run_until_parked();
-        assert_eq!(row_texts(&editor, cx), ["line 2", "LINE 2", "line 35", "LINE 35"]);
-        fs.insert_file(path!("/project/a.rs"), a.replace("LINE 35", "Line 35").into_bytes())
+        fs.insert_file(path!("/project/a.rs"), a.clone().into_bytes())
             .await;
+        cx.run_until_parked();
+        assert_eq!(
+            row_texts(&editor, cx),
+            ["line 2", "LINE 2", "line 35", "LINE 35"]
+        );
+        fs.insert_file(
+            path!("/project/a.rs"),
+            a.replace("LINE 35", "Line 35").into_bytes(),
+        )
+        .await;
         cx.run_until_parked();
         assert_eq!(row_texts(&editor, cx), ["line 2", "LINE 2"]);
 
@@ -504,5 +551,34 @@ mod tests {
         assert_ne!(new_lhs, lhs);
         assert_eq!(row_texts(&new_lhs, cx), ["line 2", "gone 1", "gone 2"]);
         assert_eq!(row_texts(&rhs, cx), ["LINE 2"]);
+    }
+
+    #[gpui::test]
+    async fn test_folded_header_keeps_normal_mode_when_refocused(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Split);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        add_review_panel(&workspace, cx);
+        let editor = rhs_editor(&review, cx);
+        // The cursor stays on the last file's folded header.
+        cx.simulate_keystrokes("] f ] f ] f ] f r");
+        assert!(is_folded(&review, "modified.txt", cx));
+
+        // Vim would enter visual mode here: the folded file is one big "character".
+        cx.simulate_keystrokes("; h ; l");
+        cx.update(|window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
+        editor.read_with(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let selection = editor.selections.newest_anchor();
+            assert!(selection.start.cmp(&selection.end, &snapshot).is_eq());
+        });
+        // A folded file's hunks aren't marked from its header.
+        cx.simulate_keystrokes("shift-r");
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.notification_ids().len(), 1)
+        });
+        cx.simulate_keystrokes("r");
+        assert!(!is_reviewed(&review, "modified.txt", cx));
+        assert_eq!(cursor_line(&editor, cx), "ONE");
+        assert!(row_texts(&editor, cx).is_empty());
     }
 }

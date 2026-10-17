@@ -115,7 +115,12 @@ impl ReviewTopBlock {
                     .map(|data| {
                         let body = commit_body(&data.message).map(|body| {
                             cx.new(|cx| {
-                                Markdown::new(body.into(), Some(language_registry.clone()), None, cx)
+                                Markdown::new(
+                                    body.into(),
+                                    Some(language_registry.clone()),
+                                    None,
+                                    cx,
+                                )
                             })
                         });
                         TopBlockCommit { data, body }
