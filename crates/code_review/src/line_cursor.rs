@@ -184,7 +184,7 @@ fn companion_rows(
         .map(DisplayRow)
         .filter(|row| *row <= max_row && !snapshot.is_block_line(*row));
     let first = real_rows.next()?;
-    let last = real_rows.last().unwrap_or(first);
+    let last = real_rows.next_back().unwrap_or(first);
     let start = snapshot.display_point_to_point(DisplayPoint::new(first, 0), Bias::Left);
     let end = snapshot.display_point_to_point(DisplayPoint::new(last, 0), Bias::Left);
     Some(start.row..=end.row)

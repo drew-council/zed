@@ -114,21 +114,21 @@ fn parse_line(line: &str) -> Option<(String, Vec<(String, AttributeState)>)> {
     }
     let assignments = rest
         .split_whitespace()
-        .filter_map(|token| {
+        .map(|token| {
             if let Some(name) = token.strip_prefix('-') {
-                Some((name.to_string(), AttributeState::Unset))
+                (name.to_string(), AttributeState::Unset)
             } else if let Some(name) = token.strip_prefix('!') {
                 // "Unspecified" overrides lower-precedence lines like an unset does.
-                Some((name.to_string(), AttributeState::Unset))
+                (name.to_string(), AttributeState::Unset)
             } else if let Some((name, value)) = token.split_once('=') {
                 let state = if value.eq_ignore_ascii_case("false") {
                     AttributeState::Unset
                 } else {
                     AttributeState::Set
                 };
-                Some((name.to_string(), state))
+                (name.to_string(), state)
             } else {
-                Some((token.to_string(), AttributeState::Set))
+                (token.to_string(), AttributeState::Set)
             }
         })
         .collect();

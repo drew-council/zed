@@ -15,9 +15,10 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: milestone 4 (panel, reviewed marks, filters) done, plus a hardening pass over the M1–M4
-code reviews (see "Hardening" below), and milestone 5 part 1 (comments core, see "Milestone 5, part
-1" below).** The long-lived fork branch `code-review`
+**Status: milestones 1–6 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
+code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
+persistence, panel list" with the M5 part 1 review fixes) and M6 (export, see "Milestone 6").** The
+long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
 (changeable in place), and one commit or a contiguous range (live when it ends at HEAD, a read-only
@@ -28,10 +29,13 @@ per-file and per-hunk reviewed marks persisted in Zed's DB (reviewed files fold 
 reviewed hunks are dimmed, marks stop counting while the diff content differs), and per-tab filters (include /
 exclude regexes, hide reviewed, generated/vendored files from `.gitattributes` hidden by default). The
 review panel shows the active review's file tree with progress, filters, path search and a context
-menu. Comments on new-side lines and ranges (`c`), files (`C`) and the whole review (`;c`) open vim
-editors in insert mode, render as markdown, have types, and are edited, deleted and navigated with
-`i`/`Enter`, `dd` and `]t`/`[t`/`m`/`M`; they live in memory only. Next: milestone 5 part 2
-(persistence, old-side comments, left-side hosting, the panel's comment list), then M6 (export).
+menu, and below the tree the review's comments. Comments on lines and ranges of either side (`c`;
+old lines on the left side of a split diff or the removed rows of a unified one), files (`C`) and the
+whole review (`;c`) open vim editors in insert mode, render as markdown, have types, and are edited,
+deleted and navigated with `i`/`Enter`, `dd` and `]t`/`[t`/`m`/`M`; they are stored in Zed's DB per
+review, follow the code while the review is open and are flagged outdated when their lines changed
+while it was closed. `y` copies the review as Markdown in tuicr's format, `Y` the comment at the
+cursor, visual `y` the selected lines. Next: M7 (GitHub), then M8 (CLI).
 
 What exists:
 
@@ -43,11 +47,12 @@ What exists:
 | `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI) |
 | `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `check_branch_base`, `resolve_commits`) |
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
-| `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks loaded from/saved to the DB), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
-| `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment`, `CommentStore`, `CommentEvent`; unit test |
-| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment blocks in the right side of the diff (`reconcile`, `placement`, `block_below_row`), comment editors (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor; comment GPUI tests |
-| `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type badge, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
-| `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (`code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`), queued writes |
+| `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
+| `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
+| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment blocks on both sides of the diff (`reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), anchors for stored comments + the outdated check (`resolve_anchors`), live line numbers (`sync_positions`), comment editors (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
+| `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
+| `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
+| `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header checkbox, `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
 | `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, or the commit messages (collapsible); then the review-level comments; commit tab titles |
@@ -223,12 +228,10 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
 - **Persistence** (D1): own domain `CodeReviewDb` (`db::static_connection!(CodeReviewDb, [])`, no
   `WorkspaceDb` dependency: state is keyed by review, not workspace). Schema in §3.8. Every query goes
   through `ThreadSafeConnection::write`'s queue at call time (its future borrows the connection, so
-  results come back through a oneshot), so toggles land in order and loads see earlier writes. No
-  pruning yet. **M5 appends** a migration (never edit the first) for drafts, e.g.
-  `code_review_comments(review_key TEXT NOT NULL REFERENCES code_review_sessions(review_key) ON DELETE
-  CASCADE ON UPDATE CASCADE, comment_id INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(review_key,
-  comment_id)) STRICT` (`ON UPDATE CASCADE` lets a re-key move a review's rows). Tests set
-  `db::AppDatabase::test_new()` in `init_test`.
+  results come back through a oneshot), so toggles land in order and loads see earlier writes. M5
+  part 2 appended migration 1 (`code_review_comments`, §3.8) and prunes reviews unopened for 90 days;
+  migrations are append-only (migration 0 has shipped). Tests set `db::AppDatabase::test_new()` in
+  `init_test`.
 - **`ReviewKey`** (D4, `ReviewTarget::review_key(&RepositorySnapshot)`): `uncommitted:{work_dir}`,
   `branch:{base}:{branch}:{common_dir}` (`branch:{base}:HEAD:{work_dir}` when detached: any number of
   worktrees can be detached; earlier detached keys are orphaned), `commits:{base}..{head}:{common_dir}`
@@ -249,7 +252,8 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   change that is undone, a `git stash`/`pop`, or a branch switch and back (marks of the other key are
   never touched) brings the marks back. Digests of files without hunks aren't observed: a file whose
   changes vanish keeps its state. Marking needs the file's digest; without one (unsaved edits since
-  the review opened) a toast says to save it. Stale hunk keys accumulate until pruning exists. Legacy
+  the review opened) a toast says to save it. Stale hunk keys accumulate within a review (whole reviews
+  are forgotten after 90 days unopened, M5 part 2). Legacy
   rows without a hash still adopt the next digest.
 - **Folding** (D7): fold when a file becomes reviewed or its excerpts reappear; unfold when unreviewed
   or invalidated; single-file mode shows its file unfolded and leaving re-folds. A session load or
@@ -371,7 +375,8 @@ state dir):**
   numbers when made), `CommentState::{Draft, Outdated, Submitted { review_id }}` (the last two are
   unused yet), `body` (trimmed), `line_text` (the lines' text when made, for part 2's outdated check),
   `anchor` (runtime buffer anchors: `anchor_after` the first line's start, `anchor_before` the last
-  line's end). In memory only: closing every tab of a review loses its comments.
+  line's end, so text typed before the first line or after the last stays outside). Stored in the DB
+  since part 2.
 - **Hosting** (`CommentBlocks`, one per tab; `CommentView` per comment): right side only, one
   `BlockStyle::Sticky` block per comment (not moved by `h`/`l`), priority = id, opaque card and
   wrapper (covers the empty-row bleed). File comments sit `Above` the file's first row (below its
@@ -433,25 +438,138 @@ state dir):**
   blocks. Found and fixed there: split rows misaligned below comments on unchanged rows, a stale `]t`
   selection targeting a comment in another file, file comments scrolled under the sticky header.
 
+**Milestone 5, part 2 (old side, persistence, panel list) and the M5 part 1 review fixes** —
+`plans/M5-comments.md` §7 unless noted:
+
+- **Old side**: `c` on removed rows of a unified diff, and on any row of the left side of a split diff
+  (context rows too: left = old numbering; M7 maps them at submit), makes `Side::Old` comments
+  anchored in the file diff's base-text buffer (`BufferDiff::base_text_buffer`, which the left
+  multibuffer excerpts; a new base is applied to it as edits, so anchors follow). A unified selection
+  over removed and added rows still comments on the added ones. Card labels "Old line N" / "Old lines
+  a–b" (a single new line has none).
+- **Hosting**: `CommentBlocks::hosted` records each block's side (`Host::{Rhs, Lhs}`) and editor.
+  Old-side comments sit on the left side when split; unified, below their removed row (the
+  multibuffer anchor of the hunk start in the file's buffer `.with_diff_base_anchor(..)`, as the
+  multibuffer anchors removed rows) or below the unchanged row they face. File and new-side comments
+  stay on the right. An observer of the `SplittableEditor` reconciles when the left editor is recreated
+  or dropped (`split()`, unsplit, `minimum_split_diff_width`); the dropped side's blocks go with it, the
+  `CommentView`s and open editors stay, and an open editor keeps the focus (live: insert mode survived
+  three toggles and a window shrink/grow). Leaving a comment whose opening side is gone focuses the side
+  showing it, on its row.
+- **Cursor and navigation**: "comment at the cursor" compares the cursor's row on each side (the other
+  side's row facing it); comments on the focused side win. `]t` orders by the new file's row (old rows at
+  the new row they face, `base_text_point_to_buffer_point`), old before new at the same place; a
+  left-side row facing a spacer positions by its own base row.
+- **Positions**: on every reconcile and buffer edit, line comments' `lines` and `line_text` follow their
+  anchors (in memory; an outdated comment keeps the text it was about), and so does the card's label. A
+  range whose start passed its end (typing on an empty commented line) collapses onto its end, where the
+  block is. Saved with the comment's next change, when its tabs close (`on_release`) and on quit
+  (`on_app_quit`, awaiting a DB barrier; live: an editor open at quit came back).
+- **Persistence**: migration 1 `code_review_comments(review_key FK → sessions ON DELETE/UPDATE CASCADE,
+  comment_id, data TEXT, PRIMARY KEY(review_key, comment_id)) STRICT`; `data` is JSON `{target: {kind:
+  review|file|lines, path, side, start, end}, comment_type, body, line_text, state: draft|outdated|
+  {submitted: {review_id}}}` with serde defaults, so fields can be added without a migration. Loaded with
+  the marks (`open_review`); nothing can be added until then (toast). A comment is stored once it has
+  text: a new one starts empty, and a type set before that stays in memory until the text comes. Ids
+  continue after the stored maximum (a deleted id may be reused after a restart; rows are per id).
+- **Outdated**: a stored line comment gets its anchors once its file's buffer (old side: the diff base,
+  which must exist) is loaded in the review: the rows of `lines` must exist and their text equal
+  `line_text`, else the comment becomes `Outdated` (stored; sticky until `dd`) on the clamped rows: an
+  OUTDATED badge with a tooltip, "outdated" in the panel, ` (outdated)` in the export, still navigable.
+  An anchor into a buffer that was replaced (the file left the review and came back, a snapshot rebuilt)
+  is resolved again the same way; anchors are never resolved against another buffer. Comments on files
+  not in the review stay unanchored (panel and export only).
+- **Pruning**: once per run, when the first review opens, reviews not opened for **90 days** are deleted
+  with their marks and comments (`ON DELETE CASCADE`). Hunk keys inside a live review aren't pruned
+  (that would need a per-key timestamp).
+- **Panel list**: below the tree in the same `uniform_list`: a "Comments (N)" heading (skipped by the
+  selection), then per comment the type, `path:line` (`~` = old side) or "Review", the body's first line
+  and the outdated/submitted state. Enter/click: a line or file comment lands like `]t` (activating the
+  tab and focusing the diff; toast when its lines aren't in the diff), a review comment opens for
+  editing. Order: review comments, then files in review order, file comments first, then by last line.
+  Comments without text (being written) aren't listed.
+- **M5 part 1 review fixes** (`reviews/M5a.md`): H1 a review-key switch (Change Base, checkout, detached
+  HEAD) saves open editors and positions into the old session, and the tab keeps its previous sessions
+  (`ReviewView::previous_sessions`), so switching back finds them as they were (and the DB has them after
+  a restart); M1 above; M2 `dd`'s prompt deletes from the session it was asked in; L2 an edited comment
+  whose block goes away (fold, filter, single-file switch, reverted hunk) is left keeping its text; L3
+  another tab doesn't show a comment until it has text (`CommentBlocks::is_listed`), and reconciles on
+  every comment change; L4 `:bd`/`:bd!` (`CloseItemInAllPanes`) leave like `:q`/`:q!`; L6, L7 above;
+  nits: "No comments in the diff", `i` on an open editor updates where focus returns, one snapshot per
+  side per reconcile, `c` on the left side's folded header comments on the file.
+- **Enter** in a comment editor (insert mode, and without vim) types a new line (`editor::Newline` in
+  `ReviewComment > Editor`, `code_review.json`): auto-height editors don't bind it.
+- Clippy (`./script/clippy -p code_review`) is clean; it flagged two older spots (`gitattributes.rs`
+  `filter_map` → `map`, `line_cursor.rs` `last` → `next_back`), fixed.
+- Tests: 15 new (89 total).
+- **Live check** (harness; scratch repo with removed, changed and added lines and a deleted file;
+  screenshots in the orchestrator's `validation/M5b/`): old-side comments in split and unified, three
+  split toggles and a window shrink/grow with an editor open in insert mode (text and focus kept), a
+  restart without `--fresh` (all comments and types back), a quit with an open editor (back), a
+  commented line edited from the shell (OUTDATED badge, panel, export marker), panel jumps (file, old
+  line, review comment), `y` byte-identical with the expected text, `Y`, visual `y` on both sides.
+
+**Milestone 6 (export)**:
+
+- `export.rs` `review_markdown(&ExportPreamble, &[Comment]) -> Option<String>` (`None` without
+  comments) reproduces tuicr's `generate_markdown` with its default `[export]` settings **minus the
+  session header** (`## Session: <slug>` serves tuicr's `review add --session` protocol, dropped in §2.9):
+  intro line, banner, "Comment types: …" (the used types in the order Issue, Suggestion, Note, Praise,
+  defined as "problems to fix", "improvements", "observations", "positive feedback"; omitted when nothing
+  is typed), the heading `## Local tuicr Comments` (**kept literally**: agents prompted with tuicr's
+  format look for it), each followed by a blank line, then ``N. **[TYPE]** `location` - first line`` with
+  continuation lines indented by `len("N.") + 1`, `\r` trimmed, every line `\n`-terminated. Locations
+  `path:L`, `path:S-E`, `path:~L`, `path:~S-~E` (old side), `path`, and `Review Comment (scope: …)`.
+  Order as tuicr's: review comments, files by path string, file comments, then line comments by last
+  line (sides interleaved), creation order. Submitted (M7) and empty comments are left out; outdated ones
+  get ` (outdated)` after the location (where tuicr writes ` (commit sha)`).
+- Banners/scopes: uncommitted "Reviewing staged + unstaged changes" / "staged + unstaged changes"
+  (tuicr's staged + unstaged source); commits "Reviewing commit: abc1234" or "Reviewing commits: a, b"
+  (oldest first, from the top block's commits; "Reviewing commits: base..head" while they load or past
+  100) / "selected commit range"; branch, which tuicr doesn't have: "Reviewing branch ‹branch› against
+  ‹base› (its commits since the merge base + staged + unstaged changes)" / "branch ‹branch› vs ‹base›".
+- Keys: `y` = `CopyReviewAsMarkdown` (a workspace action: the active review, else the panel's, so the
+  palette works anywhere), toast "Review copied to clipboard" / "No comments to copy". `Y` =
+  `CopyCommentAtCursor` (the raw body). Visual `y`/`Y` = `CopySelectedLines`: the lines of the side `c`
+  would comment on (left side = old; a unified selection over removed and added rows = the new and
+  unchanged rows), raw and joined by `\n` without a trailing newline (decision, as tuicr's visual copy),
+  leaving visual mode; toast "Copied N lines". They replace vim's yank in the review tab (§2.5 table).
+- `ReviewView::review_markdown(&self, cx) -> Option<String>` (pub) is the text M8's `--wait` finish
+  prints.
+
 **Known issues / notes for the next slices:**
 
-- **M5 part 2** (persistence, old side, left-side hosting, panel list; then M6 export):
-  - Persistence: append migration 1 to `CodeReviewDb` (never edit migration 0). Write points are
-    `ReviewSession::{add_comment, set_comment_body, set_comment_type, delete_comment}`; gate creation
-    on `loaded`, don't persist the empty body a new comment starts with, refresh `lines`/`line_text`
-    from `anchor` before writing (the card's "Lines a–b" label shows creation-time numbers until then),
-    commit open editors on app quit (tab close already saves into the session).
-  - Old side: `selected_lines` already returns `Side::Old` with the base-text buffer and its rows (left
-    side: the left multibuffer's buffer; unified: the removed rows' `RowInfo` buffer); `placement()`
-    returns `None` for it and `add_line_comment` shows the toast. `CommentBlocks::hosted` needs a side;
-    the left editor is recreated on every split (catch it like `LineCursor::sync_split_state`).
-  - Panel list: subscribe to `ReviewSessionEvent::Comment`; `CommentBlocks::land_on` jumps (like
-    `]t`), `CommentBlocks::edit` opens review-level comments. M7's "can comment here" gate fits in
-    `CommentBlocks::add_comment` (the only place comments are made).
-  - Split view: a block below a *changed* row is still mirrored below the start of its hunk, so rows
-    inside a multi-row hunk don't face each other until the hunk ends; a block below the last
-    unchanged row of an excerpt is mirrored above the facing row (no next row to anchor to). Both are
-    upstream `balancing_block` behaviour.
+- **M7 hooks** (`plans/M7-github-v2.md` §6):
+  - Gate: `CommentBlocks::add_comment` is the only place comments are made; check a `CommentGate` there,
+    before `session.add_comment` (keep the gate on `ReviewSession` so every tab of the review shares it).
+    The target (`path`, `side`, `lines`, 1-based) is in `NewComment.target`.
+  - Placement: `placement()` / `line_row_anchor()` take a `Comment` with an anchor. For remote threads
+    (line numbers, no anchors), make anchors like `resolve_anchors` does (`side_buffer` +
+    `line_anchor_and_text`), then reuse them. Generalize `hosted: HashMap<CommentId, HostedBlock>` to a
+    key enum (`Comment(id) | Remote(thread_id)`) carrying an `AnyView`; `reconcile`, `comment_order`
+    and `ReviewView::panel_comments` then include remote items.
+  - Submitted: `CommentState::Submitted` is stored; add `ReviewSession::mark_submitted(ids, review_id)`
+    (set the state + `save_comment`). The export already skips submitted comments, the panel marks
+    them, `begin_edit`/`confirm_delete` refuse them; hiding them inline is M7's call (`placement` →
+    `None`).
+  - Live lines for submit: `CommentTarget::Lines.lines` are kept current from the anchors (every
+    reconcile and buffer edit), so they are the live numbers; `Side::Old` = LEFT with the base's
+    numbering (left-side context rows are Old too).
+  - Export: add the PR arm in `ReviewView::export_preamble` ("Reviewing pull request o/r#N: title",
+    "URL: …", "Head: sha7", scope "pull request o/r#N").
+- **Comment editors, known gaps**: `:w!` and visual `:'<,'>w` don't leave the comment (vim's private
+  `VimSave` can't be intercepted, and `:w!`'s Overwrite intent skips a non-dirty item); use `:w`, `Esc`
+  or `ctrl-enter`. `:%w file` / `:'<,'>w file` panic upstream (`vim/src/command.rs:424` unwraps the
+  editor's project; comment editors have none, like the git panel's commit editor), a core patch
+  candidate (`let Some(project) = … else { return }`). `:qa`, `:qa!`, `:wqa`, `:xa` close the review
+  tab(s); open comment text is saved even by `:qa!`. Two tabs editing one saved comment: last writer
+  wins. Old-side lines removed from a branch review's base while it is open collapse onto a neighbour
+  and are only flagged outdated after a reopen.
+- Split view: a block below a *changed* row is still mirrored below the start of its hunk, so rows inside
+  a multi-row hunk don't face each other until the hunk ends; a block below the last unchanged row of an
+  excerpt is mirrored above the facing row (no next row to anchor to). Both are upstream
+  `balancing_block` behaviour.
+- Harness: `zh type` turns newlines into a key that isn't Enter for Zed; use `zh keys Return`.
 - **Empty-row bleed** (visible in the live check): on an empty row directly followed by a spacer — the
   last empty line of a file before an added/deleted file, or a blank context line before a pure
   addition — the cursor highlight also covers the spacer rows. `highlight_rows` excludes an end at
@@ -465,13 +583,11 @@ state dir):**
   split view the LHS is mis-laid-out until the next frame.
 - M4 cosmetics: the line cursor's colors blend the full diff color, also on dimmed rows; the file row
   tooltip can overlap the panel's context menu; regex errors show the regex crate's multi-line message;
-  `e` on a folded header opens the file at its last row. M5 should prune `code_review_sessions` by
-  `last_opened_at`.
-- M5 part 2: the panel's comment list goes below the tree (same `uniform_list` so `j`/`k` walk
-  both); add header controls only through `ReviewAddon` in `diff.rs`; `R`/`r` stay bound.
+  `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
+  in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`), clippy. `cargo test -p code_review`:
-  74 tests (after M5 part 1), stable under `ITERATIONS=5` (comment tests under 10).
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 89 tests
+  (after M6), stable under `ITERATIONS=5`.
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
   snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
   `]f`/`]c`/line cursor/`e` in branch, live and snapshot reviews.
@@ -773,7 +889,7 @@ covers it), tuicr's `tuicr review` CLI protocol.
 
 ## 3. Architecture
 
-### 3.1 Crate layout (proposed; as of M5 part 1 `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs` and `comments.rs` + `comments/{blocks,view}.rs` exist too; `github/`, `checkout.rs`, `submit.rs`, `export.rs`, `cli.rs` don't yet)
+### 3.1 Crate layout (proposed; as of M6 `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,view}.rs` and `export.rs` exist too; `github/`, `checkout.rs`, `submit.rs`, `cli.rs` don't yet)
 
 ```
 crates/code_review/
@@ -945,7 +1061,8 @@ crates/code_review/
   /*NULL = adopt on next reconcile*/, PRIMARY KEY(review_key, path))`,
   `code_review_reviewed_hunks(review_key FK, path, hunk_key, PRIMARY KEY(review_key, path,
   hunk_key))`, all `STRICT`, FKs `ON DELETE CASCADE ON UPDATE CASCADE`. Writes `INSERT OR IGNORE` the
-  session row first. M5 appends its drafts table as migration 1.
+  session row first. Migration 1 (M5 part 2): `code_review_comments(review_key FK, comment_id INTEGER,
+  data TEXT /*JSON*/, PRIMARY KEY(review_key, comment_id))`.
 - Pickers: `picker::PickerDelegate` with multi-select (`picker/src/picker.rs:259-292`).
 - Notifications/toasts: `workspace/src/notifications.rs`.
 - Tests: `zed.rs::test_action_namespaces` (:5866-6005) must list `"code_review"`.
