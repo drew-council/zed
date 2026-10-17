@@ -24,7 +24,11 @@ the fixed build (R1, local reviews: 74/74; R2, pull requests and the CLI: 48/50,
 upstream-inherited FAIL and one known issue) and fix 3 (the sweeps' last cheap findings, see "Fix
 1", "Fix 2" and "Fix 3"; per-session counts in `research/final-validation/SUMMARY.md`). What is
 left of the observations is under "Known issues". After the user's own testing: opening a review
-shows the review panel (see "UX: opening a review shows the review panel").
+shows the review panel (see "UX: opening a review shows the review panel"), and the UX batch
+(`plans/UX-1.md`, the user's answers in its §7) is under way: slice A, the review's overview
+scrolling with the diff as one document, is done (see "UX-1 slice A"); slices B (mouse comments
+from the gutter, editor footer) and C (pane toolbar, review context menu, panel mouse controls)
+are next.
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -51,7 +55,8 @@ historic snapshot otherwise), and a GitHub pull request (checked out in place, Z
 `pr-N` worktree), opened from the `code_review::StartReview` picker or the direct actions
 `ReviewUncommitted` / `ReviewBranch { base }` / `ReviewCommits { commits }` / `OpenPullRequest {
 reference }`. Each tab has a
-tuicr-style line cursor and file navigation, a fixed top block (branch base, or the commit messages),
+tuicr-style line cursor and file navigation, an overview at the top that scrolls with the diff
+(branch base, or the commit messages; UX-1 slice A),
 per-file and per-hunk reviewed marks persisted in Zed's DB (reviewed files fold to their header,
 reviewed hunks are dimmed, marks stop counting while the diff content differs), and per-tab filters (include /
 exclude regexes, hide reviewed, generated/vendored files from `.gitattributes` hidden by default). The
@@ -105,7 +110,7 @@ What exists:
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header checkbox, `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
-| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
+| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: the review's overview, a block above the diff's first file that scrolls with it (UX-1 slice A; `block_properties`, `is_empty`) — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
 | `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll |
 | `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the single-file bar, the panel's read API (`panel_files`, `summary`); GPUI tests |
@@ -134,7 +139,8 @@ conflicts, help, `try_parse`, the link and path, the ping marker, "Zed exited be
 finished") and the new `crates/cli/src/review.rs`; M9:
 `nix/build.nix` (`releaseChannel`, §3.10). Core patches #2 and #3 are
 applied (`crates/editor/src/scroll.rs`, `scroll/autoscroll.rs`, `editor.rs`; §3.10); #1 was reverted
-in polish B. M3 and M4 added
+in polish B; UX-1 slice A added #5–#7 (`display_map/block_map.rs`, `split_editor_view.rs`,
+`element.rs`, `element/mouse.rs`, `editor.rs` and the new `gutter_row.rs`; §3.10). M3 and M4 added
 no upstream glue (M4: new deps `db`, `file_icons`, `fs`, `ignore`, `regex`, `smallvec`, all already in
 `zed`'s graph; dev-deps `db` and `buffer_diff` with `test-support`).
 
@@ -1598,7 +1604,8 @@ orchestrator's additions)** — upstream edits: one appended help paragraph in `
   images) (V4.O2). The bot badge of review summaries is "BOT" like threads' (V4.O3). Hints and
   toasts quote commands with "…" instead of Markdown backticks (V4.O4). The description and
   summaries scroll after 8 lines (decision: was 12, ~40% of a 1000-pixel window; collapsing long
-  bodies by default was the alternative).
+  bodies by default was the alternative). *Superseded by UX-1 slice A: nothing scrolls on its
+  own, the overview scrolls with the diff.*
 - **Picker**: the pull request a query names (`1`, `#1`, a URL) comes first among the pull
   requests, above rows that only fuzzy-match (V4.O6).
 - **Export**: a commit range of more than 10 commits says "Reviewing N commits: base..head" instead
@@ -1663,7 +1670,8 @@ orchestrator's additions)** — upstream edits: one appended help paragraph in `
   top when the cursor's new row fits with the scroll margin (`comments::stay_at_start`).
 - **The review just posted** (R2 O2): `PullRequestState` remembers the posted review's URL; once its
   summary is loaded each tab's top block scrolls its 8-line description block to it (once; tabs
-  opened afterwards start at the description). Decision: chosen over listing the newest summaries
+  opened afterwards start at the description). *Removed in UX-1 slice A (Q4): the description
+  doesn't scroll on its own any more, and the summary is in the document.* Decision: chosen over listing the newest summaries
   first, which would differ from GitHub's order.
 - Tests: 3 new (201 total + 1 ignored), each red without its fix: `]t` across sides with the panel
   (both directions), a repository added after a review opened, `g g r` at the top; extended:
@@ -1705,6 +1713,105 @@ opening review, the left panel doesn't default to opening the 'review' panel") �
   showing and `zh cli --review commit:HEAD` with the dock closed show the panel, `j` moves. Logs:
   only the usual noise.
 
+**UX-1 slice A (the review's overview scrolls with the diff)** — the user's report: "when i scroll,
+the PR description stays pinned to the top. that is wrong. it should be part of the scrollable
+body, as it is in tuicr. PR description is SEPARATELY SCROLLABLE which is wrong, should be part of
+the single scroll for the entire body". `plans/UX-1.md` part A with the user's §7 answers (Q1 `gg`
+tuicr-like, Q2 full width in split view, Q3 PR expanded / commits collapsed, never inner-scrolled,
+Q4 no automatic scroll after posting). Upstream glue: one `editor` commit with core patches #5–#7
+(§3.10), all opt-in; #6 is for slice B and unused so far.
+
+- **One document**: `ReviewTopBlock` (PR header, warnings, description, review summaries, thread
+  toggles, load errors; the commit messages; the branch's base line; then the review-level comments
+  with their vim editors) is a custom block at `Above(Anchor::Min)` in the right side's editor
+  (`ReviewTopBlock::block_properties`, hosted by `ReviewView::sync_top_block_host`, which tells
+  `CommentBlocks::set_overview_block`). Core patch #5 sorts it above the first file's header (and
+  a folded first file) on both sides. It exists while the overview has something to show
+  (`is_empty`: not in an uncommitted review without review-level comments, whose diff starts with
+  its first file). Every inner scroll is gone: the description's 8-line cap (fix 2), the commit
+  messages' and review comments' 16-line caps, and fix 3's scroll to a review just posted (with
+  `PullRequestState::posted_review_url`; Q4, the toast keeps the URL).
+- **Split view, full width** (Q2): core patch #7, `Editor::set_full_width_block`, on the right
+  side's editor: the split view's header overlay (`SplitBufferHeadersElement`, which already paints
+  file headers across both sides) draws and measures the block at the whole width, over the left
+  side's spacer for it; the right side skips it. It stays rendered (below the view) while it holds
+  the focus, as the editor does with focused blocks, so a review comment being written keeps the
+  focus when scrolled away. The block lives on the right side, which survives split toggles, so it
+  and its comment editors survive them (and a pane too narrow for two sides) with their text and
+  focus. Unified, the editor draws it as any `Sticky` block (the editor's whole width).
+- **Decisions** (implementation): the block holds the overview weakly (`AnyWeakView`): the overview
+  holds the diff, whose editor holds the block, and a strong handle leaked the tab's entities on
+  close (caught by `test_comments_come_back_after_reopening`: open comment text wasn't saved). While
+  the diff has no rows (loading, nothing to review, every file hidden) `ReviewDiff` draws a
+  placeholder instead of its editor: `ReviewView` then draws the overview above it in one scroll
+  container (`review-overview-without-diff`); the block stays hosted meanwhile. A collapsed
+  overview takes two rows (blocks are whole rows). Its height is measured on render, so it grows as
+  a review comment is typed.
+- **Scrolling**: opening a review shows the overview at the top (y = 0, `keep_scroll_at_start`
+  keeps it anchored there). `show_file_start` never moves a view at the very top any more (the top
+  shows the overview, or the first file's header already: nothing is under a sticky header), so
+  threads loading on open don't scroll the description away. `g g` (Q1, tuicr): the first file's
+  header at the top, the overview just above it (`show_file_start_at_cursor` treats the overview
+  like a file block of the first file); `ctrl-u`/`ctrl-y`/the wheel/the scrollbar reach it. `; c`
+  and editing a review comment (its edit button, the panel's row) scroll the overview into view
+  (`CommentBlocks::reveal_overview`: all of it when it fits, else its bottom, where the review
+  comments are, at the bottom of the view; once more after the next frame, when a new editor's
+  height is known; pending until the block exists when `; c` creates it). After leaving a review
+  comment the view stays on the overview; the diff's cursor stays where it was, and the next motion
+  scrolls back to it. Sticky file headers: none while the view's top is in the overview.
+- **Collapsing** (Q3): the existing disclosure / `ToggleHeader`; pull requests start expanded,
+  commit messages collapsed; collapsed keeps the header line and the warnings.
+- Tests: 4 new `code_review` tests (206 total + 1 ignored; stable under `ITERATIONS=5`): the PR
+  overview as the first block above the first header, the 21-line description taller than 8 lines,
+  scrolled away with the first header sticky, `G g g` → header at the top, collapse by a click and
+  expand, a tall overview's bottom shown for `; c`; split view: the left side's spacer of the same
+  height first, headers facing, drawn across both sides (red without patch #7), a review comment
+  keeping its text and focus through unsplit/split and a pane too narrow and wide again; an
+  uncommitted review: no overview, `; c` from the end brings it scrolled into view, an empty one
+  takes it away, editing it from the panel's path scrolls it into view; a branch review: `g g r`
+  keeps the overview above the folded first file, every file hidden draws it above the
+  placeholder. Changed: `test_submit_a_pull_request_review` (the posted summary is in the overview
+  instead of the description block scrolling to it). Core: `test_block_above_multibuffer_start`
+  (block_map: order, rows, sticky header, folded first buffer, resize, removal),
+  `test_block_above_start_leads_both_sides` and `test_full_width_block_in_split_view` (split: the
+  left spacer first, after a resplit too; drawn once at full width, measured there, kept while
+  focused out of view, unsplit as usual), `test_gutter_row_renderer_hover_and_drag` (patch #6).
+  `cargo test -p editor -- block_map split:: gutter display_map element::`: 176 passed. Clippy
+  (`-p editor -p code_review`) clean.
+- **Live check** (harness, `validation/ux-a/`; sandbox PR A #1, read-only, token via
+  `ZH_EXTRA_ENV`, leak grep clean; local fixture `validation/FINAL/fix2/mkfixture.sh` in
+  `/tmp/uxa/ws/fx` plus a `feature` branch 6 commits ahead of `main`), all PASS: PR #1 opens split
+  with the description at the top across both sides, no inner scrollbar; the wheel (over either
+  half) and `ctrl-d`/`ctrl-u` scroll it away with the diff and back, guide.md's header sticky once
+  it's gone; the disclosure click collapses it to its header line and expands it; `G g g` →
+  guide.md's header at the top; `; c` from the end → the overview in view, insert mode, typed,
+  then unsplit and split again (palette) while typing, text and focus kept, saved; the Bots toggle
+  shows the bot summary in the same scroll; a local uncommitted review starts with its first header
+  (no blank row), `; c` + split toggles while typing as above, every file excluded → the review
+  comment above "All 4 changed files are hidden", cleared → back in the diff; a branch review's
+  base line with its Change Base button (opens Zed's branch picker), `g g r` folds the first file
+  under it; a 12-commit review (`zh cli --review commits:HEAD~12..HEAD`) collapsed, expanded by a
+  click, the whole list in the document's scroll. Not live: a pane too narrow for two sides (the
+  harness window has the screen's size; GPUI test), a hovered link's destination (none found in
+  PR A's description and the visible summaries). Logs: only the usual noise.
+- **Notes for slice B** (core patch #6, `crates/editor/src/gutter_row.rs`): set the renderer on the
+  right side once and on each new left side (`Editor::set_gutter_row_renderer(Some(Rc::new(
+  |row: &GutterRow, window, cx| -> Option<AnyElement>)), cx)`; `Rc`, not `Arc`: it never leaves the
+  foreground). It's called in prepaint, outside any editor update (it may read the editor), for
+  every visible row with a buffer row (deleted rows and the left side included, soft-wrap
+  continuations and block rows not), with `GutterRow { row, info: &RowInfo, hovered, drag }`; the
+  element is laid out like breakpoints (`Gutter::prepaint_button`: x = git strip + 2 px, centered
+  in the row) and painted with the gutter indicators, under blocks. `hovered` is the row under the
+  pointer in the gutter or the text (none over blocks or spacers; the editor notifies when it
+  changes; `hovered_gutter_row()` reads it). A drag: the element's left mouse down calls
+  `editor.start_gutter_row_drag(row, Box::new(|rows: RangeInclusive<DisplayRow>, window, cx| …),
+  cx)` and must `window.prevent_default()` (ButtonLike does; then the gutter's own line selection
+  doesn't start); while the button is held every `GutterRow.drag` is the rows from `row` to the
+  nearest row under the pointer (the owner paints the range, e.g. with the line cursor's
+  highlight), and the release calls the callback (deferred, so it may update the editor) with the
+  rows, a plain click included (`row..=row`). Display rows are the side's own; map them through
+  `RowInfo`/the side's snapshot.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -1714,8 +1821,8 @@ opening review, the left panel doesn't default to opening the 'review' panel") �
   the sticky header after a split toggle (V7.O6); the status bar `line:col` goes stale after an
   external edit (V3.O4); the horizontal scrollbar thumb stays visible (V1.O5); `app_will_quit`
   timeouts on quit, also without review tabs (V3.O1/V7.O4); non-vim character selections are
-  invisible (V8.O3); a visual `y` across a file boundary copies the last file's rows (V3.O3); the
-  header strip peeks out under a tall top block (V3.O6); `[t` visits the file comment first
+  invisible (V8.O3); a visual `y` across a file boundary copies the last file's rows (V3.O3); `[t`
+  visits the file comment first
   (V3.O7); Review in Worktree replaces the workspace (V4.O8); two `zed://review` links in one
   request: only the last opens (V6.O2, upstream `OpenRequest` keeps one kind); `R` on a folded
   header gives the generic toast (V2.O3); a thread posted on a previous head shows as moved until
@@ -1783,8 +1890,8 @@ opening review, the left panel doesn't default to opening the 'review' panel") �
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 201 tests + 1 ignored live
-  GitHub test (after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 206 tests + 1 ignored live
+  GitHub test (after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
   A; 166 after M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
@@ -1835,7 +1942,8 @@ opening review, the left panel doesn't default to opening the 'review' panel") �
 - Polish B (orchestrator): core patch #3 (the empty-row highlight) only as an opt-in that leaves
   every existing caller unchanged; core patch #1 reverted (no caller).
 - Fix 2 (orchestrator): the "Mark Reviewed" hunk control stays where Zed's hunk controls go, over
-  the end of long rows; the pull request's description and summaries scroll after 8 lines; with
+  the end of long rows; the pull request's description and summaries scroll after 8 lines
+  (superseded by UX-1: the user wants one scroll for the whole document); with
   several repositories, review tabs and the panel header name the repository; the submit modal
   remembers its event per pull request until a review is posted.
 - M2 (orchestrator): `]f`/`[f` stop at the ends and `]u`/`[u` wrap, as in tuicr; `h` at the left edge of
@@ -2038,7 +2146,8 @@ over `git rev-parse HEAD`).
   exist; copy actions (PR URL, branch) in a context menu / palette.
 - **Center: Review tab** (a new kind of item) — **read-only** diff over real buffers (LSP hover,
   go-to-definition, references work), split or unified per the user's `diff_view_style`. At the top,
-  a collapsible block with the **PR description** rendered with Zed's markdown (or the commit
+  scrolling with the diff as one document (UX-1; full width in split view), a collapsible block with
+  the **PR description** rendered with Zed's markdown (or the commit
   message(s) for commit reviews — not commentable), followed by the **review-level comments**
   section. Reviewed files fold to their header. **Single-file focus mode** toggle (continuous view is
   default). Multiple review tabs may be open; the panel follows the active one.
@@ -2218,6 +2327,8 @@ crates/code_review/
   below `minimum_split_diff_width` (`split.rs:1391-1418`). Observe the SplittableEditor, re-host
   comment blocks (keep draft editors in the crate's model), re-apply highlights.
 - Blocks inserted on either side get automatic balancing spacers on the other side (`block_map.rs:1748-1958`).
+- UX-1: the review's overview is a block at `Above(Anchor::Min)` on the right side, drawn across
+  both sides by the split view (core patches #5 and #7, §3.10).
 
 ### 3.4 Line cursor (§2.5)
 
@@ -2361,6 +2472,9 @@ change, so mismatched CLI/app versions don't break).
 | `crates/cli/src/review.rs` | new file (M8): the `--review` request and `check_exit` (95 lines + tests) |
 | `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs` | `Editor::set_forbid_horizontal_autoscroll` (core patch #2): a `ScrollManager` flag checked first in `autoscroll_horizontally`, so the review tab's `h`/`l` scroll survives `j`/`k` |
 | `crates/editor/src/editor.rs` | `RowHighlightOptions::include_end_row` (core patch #3, polish B, +9/−1): an opt-in field (default `false`, every existing caller unchanged) that keeps the row a highlight ends in when the range ends at column 0, so the line cursor on an empty row doesn't paint the spacers below it. Core patch #1 (`set_number_deleted_lines` → `pub` in `config.rs`) was reverted in polish B: `git diff v1.25.0-pre -- crates/editor/src/config.rs` is empty |
+| `crates/editor/src/display_map/block_map.rs` | Core patch #5 (UX-1, +14/−1): `Block::is_above_start` (a custom block at `BlockPlacement::Above(Anchor::Min)`) sorts right after the start comparison in `sort_blocks`, so it comes before the first buffer's header and a folded first buffer (`dedup_by` keeps both), and `balancing_block` keeps `Anchor::Min` for its spacer on the other side (else an excerpt anchor after that side's header). Upstream places no block there (only a test on a headerless singleton). Tests +127 (`test_block_above_multibuffer_start`) |
+| `crates/editor/src/split_editor_view.rs`, `element.rs` (`render_blocks`), `editor.rs` | Core patch #7 (UX-1, +149 in `split_editor_view.rs`, +13 in `element.rs`, +3 in `editor.rs`): `Editor::set_full_width_block(Option<CustomBlockId>)`. When that editor is the right side of a split diff, its `EditorElement` skips the block (and hands a focused-block record for it on), and `SplitBufferHeadersElement::build_full_width_block` renders it with the block's own render callback across the overlay's width, measures it there (`resize_blocks`, which resizes the left spacer too), paints it under the file headers, and keeps it rendered below the view while it holds the focus. Unsplit, nothing changes. Tests in `split.rs` +217 with #5's (`test_block_above_start_leads_both_sides`, `test_full_width_block_in_split_view`) |
+| `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 113-line new file, +38 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. Tests +141 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`) |
 | `assets/keymaps/code_review*.json` | new files |
 | `nix/build.nix` | `releaseChannel ? "nightly"` argument (M9, +30/−7): a `channel` table (stable/preview/nightly), an assert that only Linux builds other channels than nightly, and the channel in `version`, `preBuild`'s `RELEASE_CHANNEL` and the Linux icons and desktop entry. The default derivation is unchanged (same `.drv`); `crates/code_review/INSTALL.md` uses `.override { releaseChannel = "stable"; }` |
 | (later) `crates/settings_content` + `assets/settings/default.json` | settings block |
