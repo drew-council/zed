@@ -9,7 +9,7 @@ use crate::{
     comments::{
         CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
         RemoteItem, RemoteKey, RemoteThreadContent, Side, keep_scroll_at_start, open_web_link,
-        thread_location,
+        stay_at_start, thread_location,
     },
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
@@ -1339,16 +1339,17 @@ impl ReviewView {
             return;
         };
         let next = diff.file_order().into_iter().find(|key| key > &path_key);
+        let focused = diff.editor().read(cx).focused_editor().clone();
         let reviewed = !self.session.read(cx).is_file_reviewed(&repo_path);
         let Some(content_hash) = self.content_hash_to_mark(&repo_path, reviewed, cx) else {
             return;
         };
+        let at_start = focused.update(cx, |editor, cx| editor.scroll_position(cx).y == 0.);
         // Move first, so folding the file doesn't drag the cursor onto its header. When reviewed
         // files are hidden, hiding it moves the cursor on (wrapping around).
-        if reviewed
-            && !self.filters.hide_reviewed
-            && let Some(next) = next
-        {
+        let move_to = next.filter(|_| reviewed && !self.filters.hide_reviewed);
+        let moved = move_to.is_some();
+        if let Some(next) = move_to {
             self.diff
                 .update(cx, |diff, cx| diff.move_to_path(next, window, cx));
         }
@@ -1357,6 +1358,9 @@ impl ReviewView {
             None => session.unmark_file(&repo_path, cx),
         });
         self.sync_fold(&path_key, cx);
+        if moved && at_start {
+            focused.update(cx, |editor, cx| stay_at_start(editor, cx));
+        }
         if !reviewed {
             self.diff
                 .update(cx, |diff, cx| diff.select_path_start(&path_key, window, cx));
@@ -3841,6 +3845,25 @@ mod tests {
             assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("a.rs"));
             let (scroll_top, header_row, _) = rows(cx);
             assert_eq!(scroll_top, f64::from(header_row));
+        }
+
+        /// `r` at the very top folds the first file and moves to the next one with the view
+        /// staying at the top, so the folded header stays in view (R1: following the cursor put
+        /// the next file's header at the top, above it).
+        #[gpui::test]
+        async fn test_reviewing_the_first_file_keeps_the_top(cx: &mut TestAppContext) {
+            use crate::test_support::is_folded;
+
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let editor = rhs_editor(&review, cx);
+            cx.simulate_keystrokes("g g r");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("added.txt"));
+            assert!(is_folded(&review, "a.rs", cx));
+            assert_eq!(
+                editor.update(cx, |editor, cx| editor.scroll_position(cx).y),
+                0.
+            );
         }
 
         #[gpui::test]

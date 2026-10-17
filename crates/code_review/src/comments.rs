@@ -4,6 +4,7 @@ mod view;
 
 pub(crate) use blocks::{
     CommentBlocks, CommentBlocksEvent, ItemKey, RemoteItem, RemoteKey, keep_scroll_at_start,
+    stay_at_start,
 };
 pub(crate) use remote::{
     HoveredLink, RemoteThreadContent, comment_markdown_style, github_markdown, open_web_link,

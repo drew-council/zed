@@ -2168,6 +2168,27 @@ pub(crate) fn keep_scroll_at_start(
     }
 }
 
+/// After `r` on a file at the very top of the review: the cursor moved on to the next file and
+/// the reviewed file folded to its header. Following the cursor would put the next file's header
+/// at the top and the folded header out of view, so a view whose cursor row still fits (with the
+/// scroll margin below it) stays at the top.
+pub(crate) fn stay_at_start(editor: &mut Editor, cx: &mut Context<Editor>) {
+    const ROWS_BELOW_CURSOR: u32 = 4;
+    let Some(visible_lines) = editor.visible_line_count() else {
+        return;
+    };
+    let snapshot = editor.display_snapshot(cx);
+    let cursor = editor
+        .selections
+        .newest_anchor()
+        .head()
+        .to_point(snapshot.buffer_snapshot());
+    let row = snapshot.point_to_display_point(cursor, Bias::Left).row();
+    if row.0 + ROWS_BELOW_CURSOR <= visible_lines as u32 {
+        editor.request_autoscroll(Autoscroll::top_relative(f64::from(row.0)), cx);
+    }
+}
+
 fn anchor_scroll_at_start(
     editor: &mut Editor,
     scroll_x: f64,
