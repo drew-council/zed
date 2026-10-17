@@ -557,7 +557,7 @@ impl ReviewView {
         for file in &files {
             if let Some(digest) = self.diff.read(cx).digest(&file.path_key).cloned() {
                 self.session.update(cx, |session, cx| {
-                    session.reconcile(&file.repo_path, &digest, cx)
+                    session.observe_digest(&file.repo_path, &digest, cx)
                 });
             }
             self.sync_fold(&file.path_key, cx);
@@ -585,8 +585,21 @@ impl ReviewView {
                 }
             }
             ReviewSessionEvent::HunksChanged => self.repaint_reviewed_hunks(cx),
+            ReviewSessionEvent::Failed(message) => self.show_toast(
+                Toast::new(
+                    NotificationId::unique::<ReviewSession>(),
+                    message.to_string(),
+                ),
+                cx,
+            ),
         }
         cx.notify();
+    }
+
+    fn show_toast(&self, toast: Toast, cx: &mut App) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
+            .log_err();
     }
 
     fn handle_diff_event(
@@ -609,11 +622,15 @@ impl ReviewView {
                 newly_shown,
             } => {
                 let diff = self.diff.read(cx);
+                // A file without changes isn't listed, so its mark keeps the last diff it had:
+                // `git stash pop` brings it back reviewed.
                 if let Some(repo_path) = diff.repo_path_for(path_key)
                     && let Some(digest) = diff.digest(path_key).cloned()
+                    && !digest.hunks.is_empty()
                 {
-                    self.session
-                        .update(cx, |session, cx| session.reconcile(&repo_path, &digest, cx));
+                    self.session.update(cx, |session, cx| {
+                        session.observe_digest(&repo_path, &digest, cx)
+                    });
                 }
                 // Reviewed files fold when they appear, but stay open once the user opens them.
                 if *newly_shown {
@@ -783,15 +800,44 @@ impl ReviewView {
     /// Toggles a file's reviewed mark without moving the cursor (header checkbox, panel `r`).
     pub(crate) fn toggle_file(&mut self, repo_path: &RepoPath, cx: &mut Context<Self>) {
         let path_key = review_path_key(repo_path);
-        let content_hash = self
-            .diff
-            .read(cx)
-            .digest(&path_key)
-            .map(|digest| digest.content_hash);
-        self.session.update(cx, |session, cx| {
-            session.toggle_file(repo_path, content_hash, cx);
+        let reviewed = !self.session.read(cx).is_file_reviewed(repo_path);
+        let Some(content_hash) = self.content_hash_to_mark(repo_path, reviewed, cx) else {
+            return;
+        };
+        self.session.update(cx, |session, cx| match content_hash {
+            Some(content_hash) => session.mark_file(repo_path, content_hash, cx),
+            None => session.unmark_file(repo_path, cx),
         });
         self.sync_fold(&path_key, cx);
+    }
+
+    /// `Some(Some(hash))` to mark a file with its diff's hash, `Some(None)` to unmark it, `None`
+    /// when it can't be marked: its diff is only known while it has no unsaved edits.
+    fn content_hash_to_mark(
+        &self,
+        repo_path: &RepoPath,
+        reviewed: bool,
+        cx: &mut App,
+    ) -> Option<Option<u64>> {
+        if !reviewed {
+            return Some(None);
+        }
+        let digest = self.diff.read(cx).digest(&review_path_key(repo_path));
+        if let Some(digest) = digest {
+            return Some(Some(digest.content_hash));
+        }
+        self.show_toast(
+            Toast::new(
+                NotificationId::unique::<ToggleFileReviewed>(),
+                format!(
+                    "{} has unsaved changes: save it to mark it reviewed",
+                    repo_path.as_unix_str()
+                ),
+            )
+            .autohide(),
+            cx,
+        );
+        None
     }
 
     /// `r`: marks the file at the cursor reviewed and moves to the next file, or unmarks it and
@@ -813,9 +859,11 @@ impl ReviewView {
         let Some(repo_path) = diff.repo_path_for(&path_key) else {
             return;
         };
-        let content_hash = diff.digest(&path_key).map(|digest| digest.content_hash);
         let next = diff.file_order().into_iter().find(|key| key > &path_key);
         let reviewed = !self.session.read(cx).is_file_reviewed(&repo_path);
+        let Some(content_hash) = self.content_hash_to_mark(&repo_path, reviewed, cx) else {
+            return;
+        };
         // Move first, so folding the file doesn't drag the cursor onto its header. When reviewed
         // files are hidden, hiding it moves the cursor on (wrapping around).
         if reviewed
@@ -825,8 +873,9 @@ impl ReviewView {
             self.diff
                 .update(cx, |diff, cx| diff.move_to_path(next, window, cx));
         }
-        self.session.update(cx, |session, cx| {
-            session.set_file_reviewed(&repo_path, reviewed, content_hash, cx)
+        self.session.update(cx, |session, cx| match content_hash {
+            Some(content_hash) => session.mark_file(&repo_path, content_hash, cx),
+            None => session.unmark_file(&repo_path, cx),
         });
         self.sync_fold(&path_key, cx);
         if !reviewed {
@@ -857,20 +906,14 @@ impl ReviewView {
         let cursor = editor.read(cx).selections.newest_anchor().head();
         match self.hunk_key_at(&editor, cursor, cx) {
             Some((repo_path, hunk_key)) => self.toggle_hunk(&repo_path, hunk_key, cx),
-            None => {
-                self.workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<ToggleHunkReviewed>(),
-                                "Move the cursor onto a changed line to mark its hunk reviewed",
-                            )
-                            .autohide(),
-                            cx,
-                        )
-                    })
-                    .log_err();
-            }
+            None => self.show_toast(
+                Toast::new(
+                    NotificationId::unique::<ToggleHunkReviewed>(),
+                    "Move the cursor onto a changed line to mark its hunk reviewed",
+                )
+                .autohide(),
+                cx,
+            ),
         }
     }
 
@@ -2050,6 +2093,21 @@ mod tests {
             assert_eq!(review_count(&workspace, cx), 2);
             let main_review = active_review(&workspace, cx);
             assert_eq!(tab_title(&main_review, cx), "Review: feature vs main");
+        }
+
+        #[gpui::test]
+        async fn test_detached_head_reviews_are_kept_per_worktree(cx: &mut TestAppContext) {
+            crate::init_test(cx);
+            let (fs, workspace, cx) = branch_fixture(cx).await;
+            fs.set_branch_name(dot_git(), None::<&str>);
+            cx.run_until_parked();
+            dispatch(ReviewBranch::default(), cx);
+            let review = active_review(&workspace, cx);
+            assert_eq!(tab_title(&review, cx), "Review: HEAD vs origin/main");
+            assert_eq!(
+                review.read_with(cx, |review, cx| review.session().read(cx).key().clone()),
+                crate::ReviewKey(format!("branch:origin/main:HEAD:{}", path!("/project")).into())
+            );
         }
 
         #[gpui::test]

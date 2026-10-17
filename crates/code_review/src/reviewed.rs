@@ -244,15 +244,19 @@ pub(crate) fn reviewed_rows_for_test(
 mod tests {
     use super::*;
     use crate::{
-        ReviewUncommitted,
+        ReviewBranch, ReviewUncommitted,
         test_support::{
-            active_review, add_review_panel, cursor_line, dispatch, init_vim_test, is_folded,
-            is_reviewed, lhs_editor, move_to_row_with_text, open_review_fixture, path_at_cursor,
-            rhs_editor, row_text,
+            C1, active_review, add_review_panel, cursor_line, dispatch, dot_git, excerpt_paths,
+            init_vim_test, insert_commit_ref, is_folded, is_reviewed, lhs_editor,
+            move_to_row_with_text, open_review_fixture, open_workspace, path_at_cursor, rhs_editor,
+            row_text, tab_title,
         },
     };
     use fs::Fs as _;
+    use git::repository::RepoPath;
     use gpui::{TestAppContext, VisualTestContext};
+    use project::FakeFs;
+    use serde_json::json;
     use settings::DiffViewStyle;
     use std::any::TypeId;
     use util::path;
@@ -363,6 +367,197 @@ mod tests {
         assert!(!is_folded(&review, "a.rs", cx));
         assert!(is_reviewed(&review, "modified.txt", cx));
         assert!(is_folded(&review, "modified.txt", cx));
+    }
+
+    #[gpui::test]
+    async fn test_marks_survive_changes_that_are_undone(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let editor = rhs_editor(&review, cx);
+        move_to_row_with_text(&editor, "LINE 2", cx);
+        cx.simulate_keystrokes("R r");
+        assert!(is_reviewed(&review, "a.rs", cx));
+        let has_reviewed_hunks = |review: &Entity<ReviewView>, cx: &mut VisualTestContext| {
+            review.read_with(cx, |review, cx| {
+                review.session().read(cx).has_reviewed_hunks()
+            })
+        };
+        assert!(has_reviewed_hunks(&review, cx));
+        let a_rs = fs.load(path!("/project/a.rs").as_ref()).await.unwrap();
+
+        // `git stash`: the file has no changes and leaves the review; `git stash pop` brings the
+        // same changes back, still reviewed.
+        let head: String = (1..=40).map(crate::test_support::line).collect();
+        fs.insert_file(path!("/project/a.rs"), head.into_bytes())
+            .await;
+        cx.run_until_parked();
+        assert!(!excerpt_paths(&review, cx).contains(&"a.rs".to_string()));
+        fs.insert_file(path!("/project/a.rs"), a_rs.clone().into_bytes())
+            .await;
+        cx.run_until_parked();
+        assert!(is_reviewed(&review, "a.rs", cx));
+        assert!(is_folded(&review, "a.rs", cx));
+
+        // A change and its undo: the mark is gone meanwhile and back afterwards, also after a
+        // restart.
+        fs.insert_file(
+            path!("/project/a.rs"),
+            a_rs.replace("line 20\n", "LINE 20\n").into_bytes(),
+        )
+        .await;
+        cx.run_until_parked();
+        assert!(!is_reviewed(&review, "a.rs", cx));
+        fs.insert_file(path!("/project/a.rs"), a_rs.into_bytes())
+            .await;
+        cx.run_until_parked();
+        assert!(is_reviewed(&review, "a.rs", cx));
+        dispatch(workspace::CloseActiveItem::default(), cx);
+        drop(review);
+        cx.run_until_parked();
+        dispatch(ReviewUncommitted, cx);
+        let review = active_review(&workspace, cx);
+        cx.run_until_parked();
+        assert!(is_reviewed(&review, "a.rs", cx));
+        assert!(has_reviewed_hunks(&review, cx));
+    }
+
+    #[gpui::test]
+    async fn test_marks_survive_a_branch_switch(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let fs = FakeFs::new(cx.executor());
+        let feature_text = "one\nTWO\nthree\n";
+        let other_text = "one\nOTHER\nthree\n";
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "a.txt": feature_text, "b.txt": "b\n" }),
+        )
+        .await;
+        fs.set_merge_base_content_for_repo(
+            dot_git(),
+            &[
+                ("a.txt", "one\ntwo\nthree\n".into()),
+                ("b.txt", "B\n".into()),
+            ],
+        );
+        fs.set_head_and_index_for_repo(
+            dot_git(),
+            &[("a.txt", feature_text.into()), ("b.txt", "b\n".into())],
+        );
+        fs.set_branch_name(dot_git(), Some("feature"));
+        insert_commit_ref(&fs, "origin/main", C1);
+        let (workspace, cx) = open_workspace(fs.clone(), cx).await;
+        dispatch(ReviewBranch::default(), cx);
+        let review = active_review(&workspace, cx);
+        cx.focus(&review);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("r");
+        assert!(is_reviewed(&review, "a.txt", cx));
+
+        let check_out = |branch: &'static str, text: &'static str| {
+            let fs = fs.clone();
+            async move {
+                fs.set_branch_name(dot_git(), Some(branch));
+                fs.set_head_and_index_for_repo(
+                    dot_git(),
+                    &[("a.txt", text.into()), ("b.txt", "b\n".into())],
+                );
+                fs.insert_file(path!("/project/a.txt"), text.as_bytes().to_vec())
+                    .await;
+            }
+        };
+        check_out("other", other_text).await;
+        cx.run_until_parked();
+        assert_eq!(tab_title(&review, cx), "Review: other vs origin/main");
+        assert!(!is_reviewed(&review, "a.txt", cx));
+
+        check_out("feature", feature_text).await;
+        cx.run_until_parked();
+        assert_eq!(tab_title(&review, cx), "Review: feature vs origin/main");
+        assert!(is_reviewed(&review, "a.txt", cx));
+        assert!(is_folded(&review, "a.txt", cx));
+        assert!(!is_reviewed(&review, "b.txt", cx));
+    }
+
+    #[gpui::test]
+    async fn test_a_file_never_seen_saved_cant_be_marked(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/modified.txt"), cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        dispatch(workspace::CloseActiveItem::default(), cx);
+        drop(review);
+        cx.run_until_parked();
+
+        // The review opens while the file has unsaved edits, so it has no diff to mark it with.
+        dispatch(ReviewUncommitted, cx);
+        let review = active_review(&workspace, cx);
+        cx.focus(&review);
+        cx.run_until_parked();
+        let notifications = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids().len())
+        };
+        assert_eq!(notifications(cx), 0);
+        cx.simulate_keystrokes("] f ] f ] f ] f");
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("modified.txt"));
+        cx.simulate_keystrokes("r");
+        assert!(!is_reviewed(&review, "modified.txt", cx));
+        assert_eq!(notifications(cx), 1);
+
+        // Once saved, it can.
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes("r");
+        assert!(is_reviewed(&review, "modified.txt", cx));
+    }
+
+    #[gpui::test]
+    async fn test_refresh_keeps_files_as_they_were(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (fs, workspace, review, cx) = open_review_fixture(cx).await;
+        cx.simulate_keystrokes("r");
+        assert!(is_folded(&review, "a.rs", cx));
+        // The user opens the reviewed file again.
+        review.update(cx, |review, cx| {
+            let diff = review.diff().read(cx);
+            let path_key = crate::diff::review_path_key(&RepoPath::new("a.rs").unwrap());
+            let buffer_id = diff.buffer_id_for(&path_key, cx).unwrap();
+            diff.editor()
+                .read(cx)
+                .rhs_editor()
+                .clone()
+                .update(cx, |editor, cx| editor.unfold_buffer(buffer_id, cx));
+        });
+        // Unsaved edits elsewhere keep the file's digest.
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/modified.txt"), cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        cx.run_until_parked();
+
+        // Any status change refreshes the file list.
+        fs.insert_file(path!("/project/later.txt"), b"later\n".to_vec())
+            .await;
+        cx.run_until_parked();
+        assert!(excerpt_paths(&review, cx).contains(&"later.txt".to_string()));
+        assert!(is_reviewed(&review, "a.rs", cx));
+        assert!(!is_folded(&review, "a.rs", cx));
+        review.read_with(cx, |review, cx| {
+            let path_key = crate::diff::review_path_key(&RepoPath::new("modified.txt").unwrap());
+            assert!(review.diff().read(cx).digest(&path_key).is_some());
+        });
     }
 
     #[gpui::test]

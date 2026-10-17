@@ -79,13 +79,19 @@ impl ReviewTarget {
             ReviewTarget::Uncommitted => {
                 format!("uncommitted:{}", repo.work_directory_abs_path.display())
             }
-            ReviewTarget::Branch { base } => {
-                let branch = repo.branch.as_ref().map_or("HEAD", |branch| branch.name());
-                format!(
-                    "branch:{base}:{branch}:{}",
+            // A branch is checked out in one worktree at a time, but any number of worktrees can
+            // have a detached HEAD.
+            ReviewTarget::Branch { base } => match &repo.branch {
+                Some(branch) => format!(
+                    "branch:{base}:{}:{}",
+                    branch.name(),
                     repo.common_dir_abs_path.display()
-                )
-            }
+                ),
+                None => format!(
+                    "branch:{base}:HEAD:{}",
+                    repo.work_directory_abs_path.display()
+                ),
+            },
             ReviewTarget::Commits(range) => {
                 let base = range.base.map(|base| base.to_string()).unwrap_or_default();
                 format!(

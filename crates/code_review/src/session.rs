@@ -21,23 +21,32 @@ struct ReviewSessions(HashMap<ReviewKey, WeakEntity<ReviewSession>>);
 impl Global for ReviewSessions {}
 
 /// The reviewed marks of one review, loaded from and saved to [`CodeReviewDb`].
+///
+/// Marks are only deleted when the user unmarks them. A file is reviewed while its diff is the
+/// one it was marked with, and a hunk while its content is: a diff that changes can change back
+/// (a stash, a branch switch, an undo), and the review key may be switched before the diffs
+/// catch up.
 pub(crate) struct ReviewSession {
     key: ReviewKey,
     db: CodeReviewDb,
     loaded: bool,
-    /// Reviewed files, with their diff's content hash when they were marked (`None`: adopt the
-    /// hash the file has the next time it is seen).
+    /// Reviewed files, with their diff's content hash when they were marked (`None`, from older
+    /// versions: adopt the hash the file has the next time it is seen).
     reviewed_files: HashMap<RepoPath, Option<u64>>,
     reviewed_hunks: HashMap<RepoPath, HashSet<SharedString>>,
+    /// The content hash of each file's diff as last seen.
+    content_hashes: HashMap<RepoPath, u64>,
     _load_task: Task<()>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReviewSessionEvent {
     Loaded,
-    /// Files whose reviewed mark changed, with the new state.
+    /// Files whose reviewed state changed, with the new state.
     FilesChanged(Vec<(RepoPath, bool)>),
     HunksChanged,
+    /// Loading or saving the marks failed.
+    Failed(SharedString),
 }
 
 impl EventEmitter<ReviewSessionEvent> for ReviewSession {}
@@ -61,13 +70,18 @@ impl ReviewSession {
         let db = CodeReviewDb::global(cx);
         let load = db.open_review(key.0.to_string());
         let load_task = cx.spawn(async move |this, cx| {
-            let marks = load
-                .await
-                .map_err(|error| error.context("loading reviewed marks"))
-                .log_err()
-                .unwrap_or_default();
-            this.update(cx, |this, cx| this.apply_stored_marks(marks, cx))
-                .log_err();
+            let result = load.await;
+            this.update(cx, |this, cx| match result {
+                Ok(marks) => this.apply_stored_marks(marks, cx),
+                // Marks stay unchangeable, so that nothing overwrites the stored ones.
+                Err(error) => {
+                    log::error!("loading reviewed marks: {error:#}");
+                    cx.emit(ReviewSessionEvent::Failed(
+                        format!("Couldn't load the reviewed marks: {error:#}").into(),
+                    ));
+                }
+            })
+            .log_err();
         });
         Self {
             key,
@@ -75,6 +89,7 @@ impl ReviewSession {
             loaded: false,
             reviewed_files: HashMap::default(),
             reviewed_hunks: HashMap::default(),
+            content_hashes: HashMap::default(),
             _load_task: load_task,
         }
     }
@@ -115,7 +130,14 @@ impl ReviewSession {
     }
 
     pub(crate) fn is_file_reviewed(&self, path: &RepoPath) -> bool {
-        self.reviewed_files.contains_key(path)
+        match self.reviewed_files.get(path) {
+            None => false,
+            Some(None) => true,
+            Some(Some(content_hash)) => self
+                .content_hashes
+                .get(path)
+                .is_none_or(|current| current == content_hash),
+        }
     }
 
     pub(crate) fn has_reviewed_hunks(&self) -> bool {
@@ -128,44 +150,38 @@ impl ReviewSession {
             .is_some_and(|hunks| hunks.contains(hunk_key))
     }
 
-    /// Toggles the file's mark; `content_hash` is its diff's hash right now. Returns whether the
-    /// file is reviewed afterwards.
-    pub(crate) fn toggle_file(
-        &mut self,
-        path: &RepoPath,
-        content_hash: Option<u64>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.loaded {
-            return self.is_file_reviewed(path);
-        }
-        let reviewed = !self.is_file_reviewed(path);
-        self.set_file_reviewed(path, reviewed, content_hash, cx);
-        reviewed
-    }
-
-    pub(crate) fn set_file_reviewed(
-        &mut self,
-        path: &RepoPath,
-        reviewed: bool,
-        content_hash: Option<u64>,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.loaded || self.is_file_reviewed(path) == reviewed {
+    /// Marks the file reviewed with its diff's current hash, `content_hash`.
+    pub(crate) fn mark_file(&mut self, path: &RepoPath, content_hash: u64, cx: &mut Context<Self>) {
+        if !self.loaded || self.is_file_reviewed(path) {
             return;
         }
-        let key = self.key.0.to_string();
-        let unix_path = path.as_unix_str().to_string();
-        if reviewed {
-            self.reviewed_files.insert(path.clone(), content_hash);
-            persist(self.db.set_file_reviewed(key, unix_path, content_hash), cx);
-        } else {
-            self.reviewed_files.remove(path);
-            persist(self.db.unset_file_reviewed(key, unix_path), cx);
+        self.content_hashes.insert(path.clone(), content_hash);
+        self.reviewed_files.insert(path.clone(), Some(content_hash));
+        persist(
+            self.db.set_file_reviewed(
+                self.key.0.to_string(),
+                path.as_unix_str().to_string(),
+                Some(content_hash),
+            ),
+            cx,
+        );
+        cx.emit(ReviewSessionEvent::FilesChanged(vec![(path.clone(), true)]));
+        cx.notify();
+    }
+
+    pub(crate) fn unmark_file(&mut self, path: &RepoPath, cx: &mut Context<Self>) {
+        if !self.loaded || !self.is_file_reviewed(path) {
+            return;
         }
+        self.reviewed_files.remove(path);
+        persist(
+            self.db
+                .unset_file_reviewed(self.key.0.to_string(), path.as_unix_str().to_string()),
+            cx,
+        );
         cx.emit(ReviewSessionEvent::FilesChanged(vec![(
             path.clone(),
-            reviewed,
+            false,
         )]));
         cx.notify();
     }
@@ -204,78 +220,58 @@ impl ReviewSession {
         reviewed
     }
 
-    /// Brings the marks of a file in line with its current diff (tuicr's rules): a reviewed file
-    /// whose diff changed is no longer reviewed, and marks of hunks that no longer exist go.
-    pub(crate) fn reconcile(
+    /// Records the file's current diff, which decides whether its mark counts (see
+    /// [`ReviewSession`]).
+    pub(crate) fn observe_digest(
         &mut self,
         path: &RepoPath,
         digest: &FileDigest,
         cx: &mut Context<Self>,
     ) {
+        let was_reviewed = self.is_file_reviewed(path);
+        self.content_hashes
+            .insert(path.clone(), digest.content_hash);
         if !self.loaded {
             return;
         }
-        let key = self.key.0.to_string();
-        let unix_path = path.as_unix_str().to_string();
-        match self.reviewed_files.get(path).copied() {
-            Some(Some(content_hash)) if content_hash != digest.content_hash => {
-                self.reviewed_files.remove(path);
-                persist(
-                    self.db.unset_file_reviewed(key.clone(), unix_path.clone()),
-                    cx,
-                );
-                cx.emit(ReviewSessionEvent::FilesChanged(vec![(
-                    path.clone(),
-                    false,
-                )]));
-                cx.notify();
-            }
-            Some(None) => {
-                self.reviewed_files
-                    .insert(path.clone(), Some(digest.content_hash));
-                persist(
-                    self.db.set_file_reviewed(
-                        key.clone(),
-                        unix_path.clone(),
-                        Some(digest.content_hash),
-                    ),
-                    cx,
-                );
-            }
-            Some(Some(_)) | None => {}
-        }
-
-        let Some(hunks) = self.reviewed_hunks.get_mut(path) else {
-            return;
-        };
-        let stale = hunks
-            .iter()
-            .filter(|hunk_key| !digest.hunks.iter().any(|hunk| &hunk.key == *hunk_key))
-            .cloned()
-            .collect::<Vec<_>>();
-        if stale.is_empty() {
-            return;
-        }
-        for hunk_key in stale {
-            hunks.remove(&hunk_key);
+        if let Some(None) = self.reviewed_files.get(path) {
+            self.reviewed_files
+                .insert(path.clone(), Some(digest.content_hash));
             persist(
-                self.db
-                    .unset_hunk_reviewed(key.clone(), unix_path.clone(), hunk_key.to_string()),
+                self.db.set_file_reviewed(
+                    self.key.0.to_string(),
+                    path.as_unix_str().to_string(),
+                    Some(digest.content_hash),
+                ),
                 cx,
             );
         }
-        cx.emit(ReviewSessionEvent::HunksChanged);
-        cx.notify();
+        let reviewed = self.is_file_reviewed(path);
+        if reviewed != was_reviewed {
+            cx.emit(ReviewSessionEvent::FilesChanged(vec![(
+                path.clone(),
+                reviewed,
+            )]));
+            cx.notify();
+        }
     }
 }
 
 /// The write is already queued; this only reports its failure.
-fn persist(write: impl Future<Output = anyhow::Result<()>> + Send + 'static, cx: &App) {
-    cx.background_spawn(async move {
-        write
-            .await
-            .map_err(|error| error.context("saving reviewed marks"))
+fn persist(
+    write: impl Future<Output = anyhow::Result<()>> + 'static,
+    cx: &mut Context<ReviewSession>,
+) {
+    cx.spawn(async move |this, cx| {
+        if let Err(error) = write.await {
+            log::error!("saving reviewed marks: {error:#}");
+            this.update(cx, |_, cx| {
+                cx.emit(ReviewSessionEvent::Failed(
+                    format!("Couldn't save the reviewed marks: {error:#}").into(),
+                ))
+            })
             .log_err();
+        }
     })
     .detach();
 }
@@ -458,7 +454,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_marks_persist_and_reconcile(cx: &mut TestAppContext) {
+    async fn test_marks_persist_and_follow_the_diff(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
         let key = ReviewKey("uncommitted:/project".into());
         let path = RepoPath::new("src/lib.rs").unwrap();
@@ -474,7 +470,7 @@ mod tests {
         cx.run_until_parked();
         session.update(cx, |session, cx| {
             assert!(session.is_loaded());
-            session.toggle_file(&path, Some(original.content_hash), cx);
+            session.mark_file(&path, original.content_hash, cx);
             session.toggle_hunk(&path, first_hunk.clone(), cx);
             session.toggle_hunk(&path, second_hunk.clone(), cx);
         });
@@ -494,33 +490,45 @@ mod tests {
             assert!(session.is_hunk_reviewed(&path, &second_hunk));
 
             // The same diff keeps the marks.
-            session.reconcile(&path, &original, cx);
+            session.observe_digest(&path, &original, cx);
             assert!(session.is_file_reviewed(&path));
 
-            // A changed hunk clears the file's mark and the hunk's, not the other hunk's.
+            // A changed diff makes the file unreviewed until it changes back. Hunk marks belong
+            // to the hunks' content, which the digest's keys identify.
             let changed = file_digest_for_test(&original, 1);
-            session.reconcile(&path, &changed, cx);
+            session.observe_digest(&path, &changed, cx);
             assert!(!session.is_file_reviewed(&path));
-            assert!(session.is_hunk_reviewed(&path, &first_hunk));
-            assert!(!session.is_hunk_reviewed(&path, &second_hunk));
-
-            // A mark without a hash adopts the next one it sees.
-            session.set_file_reviewed(&path, true, None, cx);
-            session.reconcile(&path, &changed, cx);
+            session.observe_digest(&path, &original, cx);
             assert!(session.is_file_reviewed(&path));
-            session.reconcile(&path, &original, cx);
+            session.observe_digest(&path, &changed, cx);
+
+            // Marking the changed file stores its new hash.
+            session.mark_file(&path, changed.content_hash, cx);
+            assert!(session.is_file_reviewed(&path));
+            session.observe_digest(&path, &original, cx);
             assert!(!session.is_file_reviewed(&path));
         });
         drop(session);
         cx.run_until_parked();
 
+        // Nothing was deleted along the way.
         let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
         cx.run_until_parked();
-        session.read_with(cx, |session, _| {
-            assert!(!session.is_file_reviewed(&path));
+        session.update(cx, |session, cx| {
             assert!(session.is_hunk_reviewed(&path, &first_hunk));
-            assert!(!session.is_hunk_reviewed(&path, &second_hunk));
+            assert!(session.is_hunk_reviewed(&path, &second_hunk));
+            assert!(session.is_file_reviewed(&path));
+            session.observe_digest(&path, &file_digest_for_test(&original, 1), cx);
+            assert!(session.is_file_reviewed(&path));
+            // Unmarking deletes the mark.
+            session.unmark_file(&path, cx);
+            assert!(!session.is_file_reviewed(&path));
         });
+        drop(session);
+        cx.run_until_parked();
+        let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert!(!session.is_file_reviewed(&path)));
         // Other reviews have their own marks.
         let other =
             cx.update(|cx| ReviewSession::for_key(ReviewKey("uncommitted:/other".into()), cx));

@@ -465,6 +465,16 @@ impl ReviewDiff {
                 BufferDiffEvent::BaseTextChanged => {}
             }
         });
+        // Every refresh registers every file again. One that is still the same buffer and diff
+        // keeps its state: it isn't newly shown (which would fold it again), and a buffer with
+        // unsaved edits keeps the digest it had.
+        let (has_hunks, shown, digest) = self
+            .buffer_subscriptions
+            .get(&repo_path)
+            .filter(|entry| entry.display_buffer == display_buffer && entry.diff == diff)
+            .map_or((false, false, None), |entry| {
+                (entry.has_hunks, entry.shown, entry.digest.clone())
+            });
         self.buffer_subscriptions.insert(
             repo_path.clone(),
             BufferSubscriptions {
@@ -472,9 +482,9 @@ impl ReviewDiff {
                 display_buffer,
                 diff,
                 status,
-                has_hunks: false,
-                shown: false,
-                digest: None,
+                has_hunks,
+                shown,
+                digest,
                 _diff_subscription: diff_subscription,
             },
         );
