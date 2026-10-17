@@ -25,10 +25,12 @@ upstream-inherited FAIL and one known issue) and fix 3 (the sweeps' last cheap f
 1", "Fix 2" and "Fix 3"; per-session counts in `research/final-validation/SUMMARY.md`). What is
 left of the observations is under "Known issues". After the user's own testing: opening a review
 shows the review panel (see "UX: opening a review shows the review panel"), and the UX batch
-(`plans/UX-1.md`, the user's answers in its §7) is under way: slice A, the review's overview
-scrolling with the diff as one document, is done (see "UX-1 slice A"), and so is slice B, comments
-with the mouse: a GitHub-style "+" in the gutter, the comment editor's footer, file header buttons
-(see "UX-1 slice B"); slice C (pane toolbar, review context menu, panel mouse controls) is next.
+(`plans/UX-1.md`, the user's answers in its §7) is complete: slice A, the review's overview
+scrolling with the diff as one document (see "UX-1 slice A"), slice B, comments with the mouse: a
+GitHub-style "+" in the gutter, the comment editor's footer, file header buttons (see "UX-1 slice
+B"), and slice C, the review toolbar in the pane, the review's right-click menu, hover controls in
+the panel and line numbers that select rows (see "UX-1 slice C"), with a live pass over the whole
+batch.
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -95,7 +97,7 @@ What exists:
 | `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned; M7d: `mark_submitted`, `ReviewOutcome` + `wait_for_outcome`/`has_outcome_waiters`/`resolve_outcome` for `--wait`; polish A: `shown_by` + `show`/`hide` (waiters follow the tabs showing the review), submitted comments immutable), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
 | `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
 | `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch; polish B: each holds its buffer, and remembers where deleted lines were, `restored_lines`) with the outdated check (both ways since polish B), deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`; UX-1 B: `add_line_comment_on` a given side and rows, `add_file_comment_for`, `set_type`), comment at cursor, `Y`/visual `y` text; comment GPUI tests (UX-1 B: the mouse ones too) |
-| `crates/code_review/src/comments/blocks/gutter.rs` | UX-1 B: the gutter's "+" (`install` sets the editor's gutter row renderer on each side; visibility, the row's target and the gate's refusal, the click and the drag from it, `select_display_rows`) |
+| `crates/code_review/src/comments/blocks/gutter.rs` | UX-1 B: the gutter's "+" (`install` sets the editor's gutter row renderer on each side; visibility, the row's target and the gate's refusal, the click and the drag from it, `select_display_rows`); UX-1 C: the area over each row's line number (`render_row`, `line_number_column`, `select_from_line_number`): clicks on line numbers select rows instead of opening the file |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor; UX-1 B: the editor's footer with the type menu, Cancel, Save, Delete) and its `ReviewComment` key context with the leave/keep actions |
 | `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered); fix 2: `github_markdown` (GitHub's `<details>`/`<summary>` tags dropped) |
 | `crates/code_review/src/submit.rs` | M7d: `comment_body`/`review_body` (`[TYPE] ` prefixes), `needs_body` (LV §5.1), `plan_review` → `PlannedReview` (the payload mapping, counts, outdated and refused drafts), `SubmitReviewModal` (events, blockers, warnings, body prompt; polish A: re-plans on every change, starts `PullRequestState::submit`/`check_uncertain_submit` and shows their reply, can't be dismissed while its submit runs), `finish_local_review`; payload/flow/modal tests |
@@ -111,11 +113,13 @@ What exists:
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header controls (UX-1 B: "Comment" button, checkbox labelled "Reviewed"), `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
+| `crates/code_review/src/toolbar.rs` | UX-1 C: `ReviewToolbar` (`ToolbarItemView` added to every pane by `register`, from `init`, after Zed's own items): counts (`summary_text`), single-file info, previous/next file/hunk/comment, Review Comment, single-file toggle, Copy as Markdown, Submit/Finish Review; toolbar GPUI tests |
+| `crates/code_review/src/context_menu.rs` | UX-1 C: the review's right-click menu in both sides of the diff (`install` → `Editor::set_custom_context_menu`; entries filled right after the click: `menu_items` → `MenuItem`/`MenuEntry`, disabled entries with their reason); menu GPUI tests |
 | `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: the review's overview, a block above the diff's first file that scrolls with it (UX-1 slice A; `block_properties`, `is_empty`) — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
 | `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll; configures each side (UX-1 B: breakpoint/bookmark gutter hover off) |
-| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the single-file bar, the panel's read API (`panel_files`, `summary`); GPUI tests |
-| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); GPUI tests |
+| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the panel's and toolbar's read API (`panel_files`, `summary`, `single_file_position`, `draft_comment_count`, `shown_thread_count`), `submit_review`/`copy_review_as_markdown`; GPUI tests |
+| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); UX-1 C: hover controls (a file row's reviewed checkbox, a comment row's edit/delete); GPUI tests |
 | `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/github-api-live-verification.md` | M7's live GitHub API probes against the sandbox repository (payload shapes, line/side rules, error texts, pending reviews, the sandbox's PRs and its reset recipe), the source of §4's and `submit.rs`'s rules |
@@ -372,7 +376,8 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   Filter…, Search Paths…, Clear Filters, Copy Branch Name (`CopyBranchName`; disabled/toast when HEAD
   is detached). M7 adds "Copy Pull Request URL" next to it.
 - **Single-file indicator**: a bar under the top block ("Single file · i of N  path   Show All Files
-  ;f") plus "single file" in the panel's status line.
+  ;f") plus "single file" in the panel's status line. (UX-1 slice C moved it into the review
+  toolbar.)
 - Tests: `test_support::path_at_cursor` returns repo paths; `init_vim_test` also binds
   `code_review.json`; `open_tree_fixture` (nested dirs, `.gitattributes`, two-hunk file). 46 tests,
   stable under `ITERATIONS=10`.
@@ -1896,6 +1901,97 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   (it wins the click there); a review context menu (Q10) can reuse `add_line_comment_on` /
   `add_file_comment_for` / `set_type`; the toolbar's "Add Review Comment" is `AddReviewComment`.
 
+**UX-1 slice C (pane toolbar, review context menu, panel mouse controls, line numbers)** —
+`plans/UX-1.md` part B (toolbar, panel) with the user's §7 answers (Q8: a pane toolbar row, the
+single-file bar moved into it; Q10: a review context menu replacing Zed's editor menu in review
+editors). No upstream edits.
+
+- **Toolbar** (`toolbar.rs`): a `ToolbarItemView` added to every pane by `toolbar::register` (from
+  `init`'s `observe_new::<Workspace>`, for the panes there and on `PaneAdded`, deferred so that it
+  comes after Zed's own items): `zed.rs` doesn't change. It shows while the pane's active item acts
+  as a `ReviewView` (split clones have their own), after the search bar's collapse and
+  split/unified buttons: the split/unified toggle the plan lists is that shared
+  `DiffStyleControls`, so the review toolbar doesn't repeat it. Left: "x/y reviewed · N comments"
+  (drafts with text, not submitted) "· N threads" (pull request reviews: the threads the tab shows)
+  and, in single-file mode, "single file i of N: path" (the single-file bar is gone); cut short in
+  narrow panes. Right: File/Hunk/Comment ↑↓, "Review Comment", the single-file toggle, Copy Review
+  as Markdown, then "Submit Review" (pull requests) or "Finish Review" (local). Tooltips show the
+  (vim) keys. Navigation and Review Comment focus the review and dispatch the action (its
+  `CodeReview` div handles it); Submit and Copy call `view::submit_review` /
+  `copy_review_as_markdown` on the toolbar's own review (the workspace actions act on the active
+  item, which needn't be this pane's). It observes the review, which marks, comments, threads and
+  single-file mode notify.
+- Decision (found live): first at `PrimaryRight` like `ProjectDiffToolbar`, but that side of the
+  row never shrinks, so a split clone's narrow pane lost the search bar's buttons and the end of
+  "Finish Review". At `PrimaryLeft`, the counts take the remaining width (truncated) and the buttons
+  stay whole at the right end.
+- **Context menu** (`context_menu.rs`): `Editor::set_custom_context_menu` on the right side and on
+  every new left side (`ReviewView`'s left-side observer). Like Zed's menu, a right click outside
+  the selection first moves the cursor to the clicked row. The callback runs inside the clicked
+  editor's update, so the entries are added by a deferred fill right after (before the menu draws),
+  worked out for that side explicitly (`CommentBlocks::comment_at_cursor_of`/`item_at_cursor_of`,
+  `line_comment_target`, `refusal`): the split editor takes a side as focused only on the next
+  frame. Entries: Add Comment / Comment on Selected Lines and Comment on File (the gate), Edit /
+  Delete / Copy Comment on a comment (Edit and Delete disabled on GitHub threads and submitted
+  comments; Copy also takes a thread's first comment), Mark Hunk / Mark File as (Not) Reviewed (no
+  hunk at the row: disabled), Copy Line / Copy Selected Lines, Copy Review as Markdown, in pull
+  request reviews Copy Permalink to Line (right side) and Copy Pull Request URL, then Open File at
+  Line, Go to Definition and Find All References (disabled on the old side and in snapshots).
+  Disabled entries say why on hover (`documentation_aside`); keys come from the vim keymap.
+  Entries acting on a comment, file or hunk call the crate with what the click resolved, the others
+  dispatch from the clicked editor. Mark File from the menu toggles like the header checkbox (the
+  cursor doesn't move on to the next file, unlike `r`).
+- **Panel**: file rows swap their ✓ for a checkbox on hover (`end_slot_on_hover`); its mouse down
+  prevents the panel's focus transfer and stops propagation, its click stops the row's click, so it
+  marks without selecting the row or moving the focus. The review's own comment rows (not threads,
+  not submitted) get pencil/trash buttons on hover: edit (`CommentBlocks::land_and_edit`: the diff
+  moves to the comment, unfolding its file, then its editor opens; a review comment opens in the
+  overview) and delete (`dd`'s confirm).
+- **Line numbers** (`gutter.rs`): a multibuffer opens the file at a clicked line number
+  (`mouse_left_down`, no opt-out; `set_delegate_open_excerpts` would only cover the right side: the
+  split editor opens the left side's requests itself). The gutter row renderer (core patch #6) now
+  draws, on every row with a buffer row, an area over the line-number column (the "+" inside it when
+  shown) whose mouse down takes the clicks whose x is on the line numbers (`line_number_column`:
+  the editor's last bounds, `EditorSnapshot::gutter_dimensions` and `max_line_number_width`, all
+  public): it prevents the default (the editor's handler then returns), moves the line cursor to
+  the row and starts a gutter row drag that selects rows as it goes and doesn't comment; shift-click
+  extends the selection. Clicks elsewhere in the gutter (beside the digits, the fold area) keep
+  Zed's behaviour; blocks and sticky headers draw over the area. It is a fixed 6 rem wide, past the
+  gutter into the text, where it lets every click through.
+- Tests: 8 new (222 + 1 ignored): toolbar: counts follow `r` and comments, a split clone's toolbar
+  acts on the clone, hidden for a file editor; each button against its key (`]f [f ]c [c ]t [t`,
+  pressed while the panel has the focus), the single-file toggle and its info, Copy, Review
+  Comment, Finish → the `--wait` outcome; a pull request review's thread count, Submit opens the
+  modal. Menu: entries and disabled reasons on a hunk, a context row, the left side, a comment, a
+  reviewed hunk and file; a right click → Add Comment on the clicked row, Copy Comment, Mark File as
+  Reviewed, Comment on Selected Lines inside a visual selection; pull request: the gate's reason, a
+  thread's disabled Edit/Delete and its Copy, Copy Permalink/Pull Request URL. Panel: the hover
+  checkbox marks without moving the selection or the focus, edit and delete buttons. Line numbers
+  (red without the fix): a click on either side moves the cursor and opens nothing, a drag selects
+  (VISUAL), shift-click extends. Clippy (`-p code_review`) clean.
+- **Live check** (harness, `validation/ux-c/`: the whole UX-1 batch; local fixture
+  `validation/FINAL/fix2/mkfixture.sh` in `/tmp/uxc/ws/fx`; sandbox PR A #1 read-only and PR C #15,
+  token via `ZH_EXTRA_ENV`, leak grep clean), all PASS: a review opens with the panel; the toolbar's
+  counts update live (comments, marks, threads, a posted review → "0 comments · 1 thread"); its
+  File/Hunk/Comment buttons, the single-file toggle ("4 of 4 src/lib.rs" shown), Copy as Markdown
+  (clipboard), Review Comment (full-width editor in the overview), Finish Review (clipboard,
+  toast), `; s`; a split clone's narrow panes with both toolbars whole (after the fix above); the
+  menu on a context row (hunk entry disabled, its reason on hover), Add Comment → editor → the
+  footer's Save, Copy Comment, Edit Comment, Mark Hunk and Mark File as Reviewed, the left side's
+  menu (Go to Definition/Find All References disabled); the panel's hover checkbox (marked,
+  selection kept), a comment's edit (unfolds the reviewed file, insert mode) and the footer's
+  Cancel, delete with the confirm; line numbers: a click (no tab opens), a drag (VISUAL 4 lines), a
+  shift-click (7 lines) and the "+" at its end → "Lines 3–9", a left-side click; a "+" drag →
+  "Lines 28–30", Cancel; header Comment and Reviewed; keys `r j k [f ]c ]t c y ; s`. PR #1: the
+  overview scrolls away with the diff (no pinning, no inner scroll, full width), toolbar "0/8
+  reviewed · 0 comments · 4 threads", the menu's Copy Pull Request URL (clipboard) and Copy
+  Permalink entry, Add Comment disabled with GitHub's reason on an expanded row, a thread's
+  Edit/Delete disabled and its Copy Comment. PR C #15: a comment from the menu, the toolbar's Submit
+  Review → the modal → Comment → posted (`gh api`: one COMMENTED review with the line comment on
+  `src/util/strings.rs:26`, RIGHT), the draft then shows as its thread; a draft typed Issue with the
+  footer's type menu, deleted from the panel. PR C reset afterwards: #15 closed, **#16** opened.
+  Logs: only the usual noise.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -1917,7 +2013,8 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   review actions through the command palette, and its recency ranking is a trap there: once
   "code_review: add review comment" has been used, typing "add comment" ranks it above "code_review:
   add comment" and Return adds a review comment instead of a line comment. Read the highlighted row,
-  or bind the actions in the user keymap.
+  or bind the actions in the user keymap. Since UX-1, the toolbar, the gutter's "+", the right-click
+  menu and the panel's hover controls cover the main review actions with the mouse.
 - **Deleted file, stale buffer** (R2 N1, upstream-inherited): a file deleted on disk while a review
   holds its buffer (a checkout that deletes it, `rm`) keeps showing the buffer's old text as its new
   side ("+1 −0" instead of its rows removed) until every tab holding the buffer closes; Zed's own
@@ -1928,9 +2025,11 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   "Check out the pull request's head … to comment on its lines"), the text typed next runs as
   normal-mode commands (`e` opens the file, `s` substitutes; autosave then writes the edit). Inherent
   to modal editing; a blocking hint or swallowing keys until Escape would be safer.
-- **Line numbers open the file** (upstream, seen in UX-1 slice B): in a multibuffer a click on a
-  line number's digits opens the file at that line (a preview tab), so a native line-number drag
-  must start in the gutter beside the digits; the "+" drag is the GitHub-like way to select rows.
+- **Line numbers** (fixed in UX-1 slice C): a click on a line number selects the row instead of
+  opening the file (see "UX-1 slice C"); `e`, a header's Open File and the menu's Open File at Line
+  open it. Seen in slice C, cosmetic: the panel's hover checkbox keeps the tooltip of the state it
+  was hovered in until hovered again; the search bar's "Collapse All Files" button in the same
+  toolbar row folds every file without reviewing it (like a header click, R1 O6).
 - **Seen in the R1 sweep, upstream or by design**: `ctrl-u` back to the very top leaves the cursor
   three rows into the first file (vim's scroll clamps the cursor to the scroll margin below the
   header block; R1 O2); V3.O7 above reads like a dead key right after `r` (`r r M`: the first `M`
@@ -1948,8 +2047,8 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   - Change Base's picker preselects `origin/main` when typing `main`: press Down for the local `main`.
   - `--review` lands in the *active* window among those with the repository open (GPUI's active
     window, which `-n` doesn't always change without a window manager).
-  - Sandbox (after fix 3): PR A #1 (read-only), PR C **#15** (own, clean; #13 closed by fix 3), PR B
-    **#14** (bot, clean), PR D #4 (API probes).
+  - Sandbox (after UX-1 slice C): PR A #1 (read-only), PR C **#16** (own, clean; #15 closed by
+    UX-1 slice C, #13 by fix 3), PR B **#14** (bot, clean), PR D #4 (API probes).
   - `zh keys`/`click` always refocus the window `zh` started with: when a CLI request opens a second
     window, the keys still go to the first one (it typed a draft into the PR tab once). Close the
     first window (`ctrl+shift+w`) or drive the second with `zh xdo`.
@@ -1977,8 +2076,8 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 214 tests + 1 ignored live
-  GitHub test (after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 222 tests + 1 ignored live
+  GitHub test (after UX-1 slice C; 214 after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
   A; 166 after M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
@@ -2238,6 +2337,10 @@ over `git rev-parse HEAD`).
   message(s) for commit reviews — not commentable), followed by the **review-level comments**
   section. Reviewed files fold to their header. **Single-file focus mode** toggle (continuous view is
   default). Multiple review tabs may be open; the panel follows the active one.
+- **Pane toolbar** (UX-1): the review's counts, previous/next file/hunk/comment, Review Comment,
+  single-file toggle, Copy as Markdown and Submit Review / Finish Review, after Zed's own diff
+  buttons (collapse, split/unified). A right click in the diff opens the review's own menu instead
+  of Zed's editor menu.
 
 ### 2.5 Movement & keys (review tab)
 
@@ -2289,7 +2392,10 @@ move line by line; there is no column.
   selection's end (both sides, removed rows too) comments on the row or the selection it's in;
   pressing it and dragging over rows comments on them; disabled with the gate's reason where a pull
   request doesn't take comments. The editor's footer has a type menu, Cancel, Save and (saved
-  comments) Delete; file headers have "Comment" and the "Reviewed" checkbox.
+  comments) Delete; file headers have "Comment" and the "Reviewed" checkbox. Line numbers select
+  rows (click, drag, shift-click) instead of opening the file. The right-click menu comments on
+  the row or selection, or on the file, and edits, deletes or copies the comment there; the
+  panel's comment rows have edit/delete buttons on hover.
 - **Review-level comments** (`;c`) live in the top section and become the **GitHub review body** on
   submit (tuicr: `src/forge/submit.rs:568` `build_review_body` joins them with `[TYPE]` prefixes).
 - **Persistence:** drafts + reviewed marks saved locally in **Zed's DB**, keyed by review target
