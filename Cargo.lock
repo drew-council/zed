@@ -3246,6 +3246,7 @@ dependencies = [
  "askpass",
  "buffer_diff",
  "collections",
+ "command_palette",
  "ctor",
  "db",
  "editor",

@@ -1,4 +1,7 @@
-use crate::persistence::{CodeReviewDb, StoredMarks};
+use crate::{
+    comments::{CommentEvent, CommentId, CommentStore, CommentType, NewComment},
+    persistence::{CodeReviewDb, StoredMarks},
+};
 use buffer_diff::BufferDiffSnapshot;
 use collections::{HashMap, HashSet};
 use git::repository::RepoPath;
@@ -20,7 +23,8 @@ struct ReviewSessions(HashMap<ReviewKey, WeakEntity<ReviewSession>>);
 
 impl Global for ReviewSessions {}
 
-/// The reviewed marks of one review, loaded from and saved to [`CodeReviewDb`].
+/// The reviewed marks and comments of one review. Marks are loaded from and saved to
+/// [`CodeReviewDb`].
 ///
 /// Marks are only deleted when the user unmarks them. A file is reviewed while its diff is the
 /// one it was marked with, and a hunk while its content is: a diff that changes can change back
@@ -36,6 +40,7 @@ pub(crate) struct ReviewSession {
     reviewed_hunks: HashMap<RepoPath, HashSet<SharedString>>,
     /// The content hash of each file's diff as last seen.
     content_hashes: HashMap<RepoPath, u64>,
+    comments: CommentStore,
     _load_task: Task<()>,
 }
 
@@ -47,6 +52,7 @@ pub(crate) enum ReviewSessionEvent {
     HunksChanged,
     /// Loading or saving the marks failed.
     Failed(SharedString),
+    Comment(CommentEvent),
 }
 
 impl EventEmitter<ReviewSessionEvent> for ReviewSession {}
@@ -90,6 +96,7 @@ impl ReviewSession {
             reviewed_files: HashMap::default(),
             reviewed_hunks: HashMap::default(),
             content_hashes: HashMap::default(),
+            comments: CommentStore::default(),
             _load_task: load_task,
         }
     }
@@ -252,6 +259,61 @@ impl ReviewSession {
                 path.clone(),
                 reviewed,
             )]));
+            cx.notify();
+        }
+    }
+}
+
+impl ReviewSession {
+    pub(crate) fn comments(&self) -> &CommentStore {
+        &self.comments
+    }
+
+    pub(crate) fn add_comment(
+        &mut self,
+        new_comment: NewComment,
+        cx: &mut Context<Self>,
+    ) -> CommentId {
+        let id = self.comments.insert(new_comment);
+        cx.emit(ReviewSessionEvent::Comment(CommentEvent::Added(id)));
+        cx.notify();
+        id
+    }
+
+    /// Saves the comment's text, which is trimmed first.
+    pub(crate) fn set_comment_body(&mut self, id: CommentId, body: &str, cx: &mut Context<Self>) {
+        let Some(comment) = self.comments.get_mut(id) else {
+            return;
+        };
+        let body = body.trim();
+        if comment.body == body {
+            return;
+        }
+        comment.body = body.to_string();
+        cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
+        cx.notify();
+    }
+
+    pub(crate) fn set_comment_type(
+        &mut self,
+        id: CommentId,
+        comment_type: Option<CommentType>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(comment) = self.comments.get_mut(id) else {
+            return;
+        };
+        if comment.comment_type == comment_type {
+            return;
+        }
+        comment.comment_type = comment_type;
+        cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
+        cx.notify();
+    }
+
+    pub(crate) fn delete_comment(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        if self.comments.remove(id).is_some() {
+            cx.emit(ReviewSessionEvent::Comment(CommentEvent::Removed(id)));
             cx.notify();
         }
     }

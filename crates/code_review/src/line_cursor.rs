@@ -165,7 +165,7 @@ fn configure(editor: &Entity<Editor>, cx: &mut App) {
 }
 
 /// The multibuffer rows spanned by the newest selection (whole lines in line-wise visual mode).
-fn selected_rows(editor: &Editor, snapshot: &DisplaySnapshot) -> RangeInclusive<u32> {
+pub(crate) fn selected_rows(editor: &Editor, snapshot: &DisplaySnapshot) -> RangeInclusive<u32> {
     let selection = editor.selections.newest_adjusted(snapshot);
     let start = selection.start.row;
     let mut end = selection.end.row;
@@ -442,10 +442,10 @@ mod tests {
         let editor = rhs_editor(&review, cx);
         let text = editor.read_with(cx, |editor, cx| editor.text(cx));
 
-        // `r` and `shift-r` are the review's reviewed marks.
+        // `r` and `shift-r` are the review's reviewed marks, `c` and `shift-c` add comments and
+        // `i` edits the comment below the cursor line (there is none).
         for keystrokes in [
-            "i", "a", "shift-i", "shift-a", "o", "shift-o", "s", "shift-s", "c c", "shift-c",
-            "g i", "insert",
+            "i", "a", "shift-i", "shift-a", "o", "shift-o", "s", "shift-s", "g i", "insert",
         ] {
             let row = cursor_point(&editor, cx).row;
             cx.simulate_keystrokes(keystrokes);

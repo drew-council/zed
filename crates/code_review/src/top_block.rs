@@ -1,4 +1,7 @@
-use crate::{commits::CommitChain, diff::ReviewDiff, target::CommitRange, view::ReviewView};
+use crate::{
+    comments::CommentBlocks, commits::CommitChain, diff::ReviewDiff, target::CommitRange,
+    view::ReviewView,
+};
 use anyhow::Result;
 use editor::hover_markdown_style;
 use git::repository::CommitData;
@@ -11,15 +14,18 @@ use ui::{Disclosure, Tooltip, WithScrollbar as _, prelude::*};
 use util::{ResultExt as _, truncate_and_trailoff};
 
 /// The fixed header above a review's diff: the commit messages of a commit review, or the base of
-/// a branch review. It sits outside the editor because a custom block can't go above the first
-/// file header, and editor blocks are lost whenever the left side of a split diff is recreated.
+/// a branch review, then the review-level comments. It sits outside the editor because a custom
+/// block can't go above the first file header, and editor blocks are lost whenever the left side
+/// of a split diff is recreated.
 pub(crate) struct ReviewTopBlock {
     content: TopBlockContent,
     expanded: bool,
     view: WeakEntity<ReviewView>,
     diff: Entity<ReviewDiff>,
+    comments: Entity<CommentBlocks>,
     scroll_handle: ScrollHandle,
-    _diff_subscription: Subscription,
+    comments_scroll_handle: ScrollHandle,
+    _subscriptions: Vec<Subscription>,
 }
 
 pub(crate) enum TopBlockContent {
@@ -55,17 +61,23 @@ impl ReviewTopBlock {
         content: TopBlockContent,
         view: WeakEntity<ReviewView>,
         diff: Entity<ReviewDiff>,
+        comments: Entity<CommentBlocks>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // The snapshot label appears once the commit diff knows its mode.
-        let diff_subscription = cx.observe(&diff, |_, _, cx| cx.notify());
+        let subscriptions = vec![
+            // The snapshot label appears once the commit diff knows its mode.
+            cx.observe(&diff, |_, _, cx| cx.notify()),
+            cx.observe(&comments, |_, _, cx| cx.notify()),
+        ];
         Self {
             content,
             expanded: false,
             view,
             diff,
+            comments,
             scroll_handle: ScrollHandle::new(),
-            _diff_subscription: diff_subscription,
+            comments_scroll_handle: ScrollHandle::new(),
+            _subscriptions: subscriptions,
         }
     }
 
@@ -326,19 +338,53 @@ fn commit_body(message: &str) -> Option<String> {
 impl Render for ReviewTopBlock {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.content {
-            TopBlockContent::None => return div().into_any_element(),
-            TopBlockContent::Branch { branch, base } => self.render_branch(branch, base, cx),
-            TopBlockContent::Commits { commits, .. } => self.render_commits(commits, window, cx),
+            TopBlockContent::None => None,
+            TopBlockContent::Branch { branch, base } => Some(self.render_branch(branch, base, cx)),
+            TopBlockContent::Commits { commits, .. } => {
+                Some(self.render_commits(commits, window, cx))
+            }
         };
-        div()
+        let review_comments = self.comments.read(cx).review_comment_views(cx);
+        if content.is_none() && review_comments.is_empty() {
+            return div().into_any_element();
+        }
+        v_flex()
             .w_full()
             .flex_none()
             .px_3()
             .py_1()
+            .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
             .bg(cx.theme().colors().editor_background)
-            .child(content)
+            .children(content)
+            .when(!review_comments.is_empty(), |top_block| {
+                top_block.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Label::new("Review comments")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .w_full()
+                                .child(
+                                    v_flex()
+                                        .id("review-comments-list")
+                                        .w_full()
+                                        .gap_1()
+                                        .max_h(window.line_height() * 16.)
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.comments_scroll_handle)
+                                        .children(review_comments),
+                                )
+                                .vertical_scrollbar_for(&self.comments_scroll_handle, window, cx),
+                        ),
+                )
+            })
             .into_any_element()
     }
 }

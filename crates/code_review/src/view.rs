@@ -1,8 +1,10 @@
 use crate::{
-    ChangeBase, FocusDiff, FocusPanel, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
-    PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
+    AddComment, AddFileComment, AddReviewComment, ChangeBase, DeleteComment, EditComment,
+    FocusDiff, FocusPanel, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor, PreviousFile,
+    PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
     ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
     ToggleHunkReviewed, ToggleSingleFileMode,
+    comments::{CommentBlocks, CommentBlocksEvent},
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
         resolve_commit_spec,
@@ -44,7 +46,7 @@ use ui::{KeyBinding, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     ItemNavHistory, Toast, Workspace,
-    item::{Item, ItemEvent},
+    item::{Item, ItemEvent, SaveOptions},
     notifications::{NotificationId, NotifyResultExt as _, NotifyTaskExt as _},
     searchable::SearchableItemHandle,
 };
@@ -348,6 +350,7 @@ pub struct ReviewView {
     line_cursor: Entity<LineCursor>,
     /// Shared by every tab reviewing the same thing; replaced when the review key changes.
     session: Entity<ReviewSession>,
+    comments: Entity<CommentBlocks>,
     filters: ReviewFilters,
     /// The generated and vendored files among the review's files.
     attributes: HashMap<RepoPath, FileAttributes>,
@@ -428,8 +431,20 @@ impl ReviewView {
                 commits: CommitsState::Loading,
             },
         };
+        let session = ReviewSession::for_key(target.review_key(&repo.read(cx)), cx);
+        let comments = cx.new(|cx| {
+            CommentBlocks::new(
+                session.clone(),
+                diff.clone(),
+                workspace.downgrade(),
+                project.read(cx).languages().clone(),
+                window,
+                cx,
+            )
+        });
         let view = cx.weak_entity();
-        let top_block = cx.new(|cx| ReviewTopBlock::new(content, view, diff.clone(), cx));
+        let top_block =
+            cx.new(|cx| ReviewTopBlock::new(content, view, diff.clone(), comments.clone(), cx));
         let load_commits_task = match &target {
             ReviewTarget::Commits(range) => {
                 let chain = first_parent_chain(
@@ -465,6 +480,11 @@ impl ReviewView {
             cx.subscribe_in(&diff, window, Self::handle_diff_event),
             // The review panel shows the diff's loading state.
             cx.observe(&diff, |_, _, cx| cx.notify()),
+            // The tab is writable while a comment is edited, for `:w`.
+            cx.subscribe(&comments, |_, _, _: &CommentBlocksEvent, cx| {
+                cx.emit(EditorEvent::TitleChanged);
+                cx.notify();
+            }),
             // A branch review is titled and keyed after the checked-out branch.
             cx.subscribe_in(
                 &repo,
@@ -509,7 +529,6 @@ impl ReviewView {
         ]);
         let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
         let line_cursor = cx.new(|cx| LineCursor::new(splittable, cx));
-        let session = ReviewSession::for_key(target.review_key(&repo.read(cx)), cx);
         let session_subscription = cx.subscribe_in(&session, window, Self::handle_session_event);
         Self {
             target,
@@ -518,6 +537,7 @@ impl ReviewView {
             top_block,
             line_cursor,
             session,
+            comments,
             filters: ReviewFilters::default(),
             attributes: HashMap::default(),
             project,
@@ -543,6 +563,9 @@ impl ReviewView {
         self.session = ReviewSession::for_key(key, cx);
         self._session_subscription =
             cx.subscribe_in(&self.session, window, Self::handle_session_event);
+        let session = self.session.clone();
+        self.comments
+            .update(cx, |comments, cx| comments.set_session(session, window, cx));
         if self.session.read(cx).is_loaded() {
             self.apply_session(window, cx);
         }
@@ -585,6 +608,7 @@ impl ReviewView {
                 }
             }
             ReviewSessionEvent::HunksChanged => self.repaint_reviewed_hunks(cx),
+            ReviewSessionEvent::Comment(_) => {}
             ReviewSessionEvent::Failed(message) => self.show_toast(
                 Toast::new(
                     NotificationId::unique::<ReviewSession>(),
@@ -1404,9 +1428,23 @@ impl ReviewView {
     }
 
     /// Both sides switch between wrapping and not wrapping together. Zed's own toggle would fall
-    /// back to the language settings first, which may not change anything.
-    fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
+    /// back to the language settings first, which may not change anything. A comment editor
+    /// toggles its own wrapping.
+    fn toggle_soft_wrap(
+        &mut self,
+        _: &ToggleSoftWrap,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let editor = self.diff.read(cx).editor().clone();
+        let splittable = editor.read(cx);
+        let diff_is_focused = [Some(splittable.rhs_editor()), splittable.lhs_editor()]
+            .into_iter()
+            .flatten()
+            .any(|editor| editor.focus_handle(cx).is_focused(window));
+        if !diff_is_focused {
+            return;
+        }
         let wraps = !matches!(
             editor.read(cx).rhs_editor().read(cx).soft_wrap_mode(cx),
             editor::SoftWrap::None
@@ -1472,6 +1510,59 @@ impl ReviewView {
                             .update(cx, |diff, cx| diff.set_single_file(None, window, cx));
                     })),
             )
+    }
+
+    fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
+        discard_vim_count(window, cx);
+        self.comments
+            .update(cx, |comments, cx| comments.add_line_comment(window, cx));
+    }
+
+    fn add_file_comment(
+        &mut self,
+        _: &AddFileComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        discard_vim_count(window, cx);
+        self.comments
+            .update(cx, |comments, cx| comments.add_file_comment(window, cx));
+    }
+
+    fn add_review_comment(
+        &mut self,
+        _: &AddReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        discard_vim_count(window, cx);
+        self.comments
+            .update(cx, |comments, cx| comments.add_review_comment(window, cx));
+    }
+
+    /// Without a comment below the cursor line, the key does what it would otherwise (`Enter`
+    /// moves down).
+    fn edit_comment(&mut self, _: &EditComment, window: &mut Window, cx: &mut Context<Self>) {
+        let edited = self.comments.update(cx, |comments, cx| {
+            comments.edit_comment_at_cursor(window, cx)
+        });
+        if edited {
+            discard_vim_count(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    fn delete_comment(&mut self, _: &DeleteComment, window: &mut Window, cx: &mut Context<Self>) {
+        discard_vim_count(window, cx);
+        self.comments.update(cx, |comments, cx| {
+            comments.delete_comment_at_cursor(window, cx)
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn comments(&self) -> &Entity<CommentBlocks> {
+        &self.comments
     }
 
     /// Compares anchors: a cursor on a folded file's header resolves to the whole folded file.
@@ -1554,6 +1645,11 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::toggle_hunk_reviewed))
             .on_action(cx.listener(Self::next_hunk))
             .on_action(cx.listener(Self::previous_hunk))
+            .on_action(cx.listener(Self::add_comment))
+            .on_action(cx.listener(Self::add_file_comment))
+            .on_action(cx.listener(Self::add_review_comment))
+            .on_action(cx.listener(Self::edit_comment))
+            .on_action(cx.listener(Self::delete_comment))
             .when(is_branch_review, |view| {
                 view.on_action(cx.listener(Self::change_base_action))
             })
@@ -1656,8 +1752,32 @@ impl Item for ReviewView {
         })))
     }
 
-    fn capability(&self, _cx: &App) -> Capability {
-        Capability::ReadOnly
+    /// The diff is read-only, but while a comment is edited the tab takes vim's `:w`, which
+    /// saves the active item, and only an editable one.
+    fn capability(&self, cx: &App) -> Capability {
+        if self.comments.read(cx).is_editing(cx) {
+            Capability::ReadWrite
+        } else {
+            Capability::ReadOnly
+        }
+    }
+
+    fn can_save(&self, cx: &App) -> bool {
+        self.comments.read(cx).is_editing(cx)
+    }
+
+    // Never dirty: autosave would save comments behind the user's back, and `:q!` couldn't
+    // discard them.
+    fn save(
+        &mut self,
+        _: SaveOptions,
+        _: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        self.comments
+            .update(cx, |comments, cx| comments.save_focused(window, cx));
+        Task::ready(Ok(()))
     }
 
     fn as_searchable(&self, _: &Entity<Self>, cx: &App) -> Option<Box<dyn SearchableItemHandle>> {

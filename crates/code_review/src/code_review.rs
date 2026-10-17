@@ -1,3 +1,4 @@
+mod comments;
 mod commits;
 mod diff;
 mod gitattributes;
@@ -103,6 +104,25 @@ actions!(
         SelectNextMatch,
         /// Selects the previous file matching the review panel's path search.
         SelectPreviousMatch,
+        /// Comments on the line at the cursor, or on the selected lines.
+        AddComment,
+        /// Comments on the file at the cursor.
+        AddFileComment,
+        /// Adds a comment on the whole review, shown at the top of the review.
+        AddReviewComment,
+        /// Edits the comment below the cursor line.
+        EditComment,
+        /// Deletes the comment below the cursor line, after asking.
+        DeleteComment,
+        /// Saves the comment being edited and returns to the diff.
+        SaveComment,
+        /// Returns to the diff without saving the changes to the comment being edited. A new
+        /// comment is deleted.
+        DiscardCommentChanges,
+        /// Changes the type of the comment being edited: none, issue, suggestion, note, praise.
+        CycleCommentType,
+        /// Changes the type of the comment being edited, in reverse order.
+        CycleCommentTypeBackward,
     ]
 );
 
@@ -743,11 +763,24 @@ mod tests {
             assert!(error.is_none(), "{error:?}");
             let (vim_bindings, error) = parse_keymap(VIM_KEYMAP, KeybindSource::Vim, cx);
             assert!(error.is_none(), "{error:?}");
-            assert!(
-                vim_bindings
-                    .iter()
-                    .any(|binding| binding.action().name() == "code_review::FocusPanel")
-            );
+            for action in [
+                "code_review::FocusPanel",
+                "code_review::AddComment",
+                "code_review::AddFileComment",
+                "code_review::AddReviewComment",
+                "code_review::EditComment",
+                "code_review::DeleteComment",
+                "code_review::SaveComment",
+                "code_review::CycleCommentType",
+                "code_review::CycleCommentTypeBackward",
+            ] {
+                assert!(
+                    vim_bindings
+                        .iter()
+                        .any(|binding| binding.action().name() == action),
+                    "{action} isn't bound"
+                );
+            }
         });
     }
 

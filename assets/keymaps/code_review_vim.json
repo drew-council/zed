@@ -60,7 +60,8 @@
       "; e": "code_review::TogglePanel",
       "; h": "code_review::FocusPanel",
       "; l": "code_review::FocusDiff",
-      // Nothing may enter insert mode on the read-only diff (comments will rebind some of these).
+      // Nothing may enter insert mode on the read-only diff (comments rebind `i`, `c` and
+      // `shift-c` below).
       "i": null,
       "a": null,
       "shift-i": null,
@@ -84,7 +85,7 @@
     "bindings": {
       "i": null,
       "a": null,
-      "c": null,
+      "c": "code_review::AddComment",
       "s": null,
       "shift-s": null,
       "r": null,
@@ -93,6 +94,42 @@
       "shift-a": null,
       "g shift-i": null,
       "g shift-a": null,
+    },
+  },
+  {
+    // Comments. After the block above: its `i` and `c` nulls rank lower, so these win, and a
+    // propagated `i` (no comment at the cursor) still doesn't reach vim's insert mode.
+    "context": "CodeReview > Editor && mode == full && vim_mode == normal && !menu",
+    "bindings": {
+      "c": "code_review::AddComment",
+      "shift-c": "code_review::AddFileComment",
+      "; c": "code_review::AddReviewComment",
+      "i": "code_review::EditComment",
+      "enter": "code_review::EditComment",
+    },
+  },
+  {
+    // `dd`, as vim's second `d`: a `d d` binding would hold back every `d` until the next key,
+    // and replaying it then misses vim's operator bindings (`d u`, `d o`, …).
+    "context": "CodeReview > Editor && mode == full && vim_operator == d && !menu",
+    "bindings": {
+      "d": "code_review::DeleteComment",
+    },
+  },
+  {
+    // A comment being edited. Vim's insert mode binds `ctrl-s` to signature help.
+    "context": "ReviewComment > Editor",
+    "bindings": {
+      "ctrl-enter": "code_review::SaveComment",
+      "ctrl-s": "code_review::SaveComment",
+    },
+  },
+  {
+    // In insert mode `tab` inserts a tab.
+    "context": "ReviewComment > Editor && VimControl && vim_mode == normal && !menu",
+    "bindings": {
+      "tab": "code_review::CycleCommentType",
+      "shift-tab": "code_review::CycleCommentTypeBackward",
     },
   },
   {
