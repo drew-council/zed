@@ -9,8 +9,14 @@ HARNESS_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 STATE_ROOT="${ZH_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zed-live-harness}"
 RUN_DIR="$STATE_ROOT/run"
 # Unix socket paths must be < 108 bytes and Zed puts its CLI socket in its data dir, so the
-# isolated Zed only ever sees $RUN_DIR through this short symlink.
-LINK="${ZH_LINK:-/tmp/zh-$(id -u)}"
+# isolated Zed only ever sees $RUN_DIR through this short symlink. It lives in the per-user
+# runtime dir when there is one: in a shared /tmp another user could plant it.
+if [[ -n "${XDG_RUNTIME_DIR-}" && -d "$XDG_RUNTIME_DIR" && -O "$XDG_RUNTIME_DIR" ]]; then
+    DEFAULT_LINK="$XDG_RUNTIME_DIR/zh"
+else
+    DEFAULT_LINK="/tmp/zh-$(id -u)"
+fi
+LINK="${ZH_LINK:-$DEFAULT_LINK}"
 TOOLS="$STATE_ROOT/tools"
 STATE="$RUN_DIR/state.env"
 LOCK="$STATE_ROOT/zh.lock"
@@ -268,11 +274,15 @@ EOF
 
 ensure_link() {
     if [[ -L "$LINK" ]]; then
+        # Only follow a link we own, and only read a PID from what it points at: sourcing it
+        # would run whatever its owner put there.
+        [[ "$(stat -c %u "$LINK")" == "$(id -u)" ]] ||
+            die "$LINK is not owned by you; set ZH_LINK to another short path"
         [[ "$(readlink "$LINK")" == "$RUN_DIR" ]] && return
-        local other
+        local other other_pid
         other="$(readlink "$LINK")"
-        # shellcheck disable=SC1091
-        if [[ -f "$other/state.env" ]] && (source "$other/state.env" && alive "${ZED_PID-}"); then
+        other_pid="$(sed -n 's/^ZED_PID=\([0-9][0-9]*\)$/\1/p' "$other/state.env" 2>/dev/null | head -n 1)"
+        if [[ -n "$other_pid" ]] && alive "$other_pid"; then
             die "$LINK points at another running harness ($other); set ZH_LINK"
         fi
         rm -f "$LINK"

@@ -33,7 +33,7 @@ $ZH stop
 | --- | --- |
 | `start [--binary PATH \| --fork] [--workdir DIR] [--size WxH] [--fresh] [--settings F] [--keymap F]` | Start Xvfb + dbus + Zed opening DIR. Idempotent: if already running with the same options it just prints status; with different options it refuses (use `restart`). Returns once the first frame is rendered. |
 | `restart [start options]` | `stop` then `start`. |
-| `stop [--clean]` | Kill Zed (whole process group), dbus, Xvfb; remove the `/tmp/zh-$UID` link. `--clean` also deletes the run dir (isolated HOME, logs, screenshots). |
+| `stop [--clean]` | Kill Zed (whole process group), dbus, Xvfb; remove the `$XDG_RUNTIME_DIR/zh` link. `--clean` also deletes the run dir (isolated HOME, logs, screenshots). |
 | `status` | Display, PIDs, window id, binary + its mtime, workdir. Exit 1 if not running. |
 | `keys KEY...` | One xdotool keypress per whitespace-separated token. Chords: `ctrl+shift+p`, `alt+h`, `shift+Tab`. Punctuation is mapped for you (`]`, `[`, `:`, `/`, `ctrl+]`…). Aliases: `esc enter tab bs del up down left right pgup pgdn home end`. Uppercase letters (`G`) send shift automatically. Use `space` for a space key. |
 | `type TEXT` | Type literal text (25 ms/char). Newlines become Return. |
@@ -132,7 +132,7 @@ Never start a cargo build from a harness session.
 | `ZH_KEY_DELAY_MS` / `ZH_TYPE_DELAY_MS` / `ZH_SHOT_DELAY_MS` | `60` / `25` / `400` | input pacing, screenshot settle time |
 | `ZH_START_TIMEOUT_S` | `90` | how long `start` waits for the window + first frame |
 | `ZH_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/zed-live-harness` | all runtime state |
-| `ZH_LINK` | `/tmp/zh-$UID` | short symlink to `<state>/run` (see gotchas) |
+| `ZH_LINK` | `$XDG_RUNTIME_DIR/zh` (`/tmp/zh-$UID` without a runtime dir) | short symlink to `<state>/run` (see gotchas); only followed when you own it |
 | `ZH_VK_ICD` | `/run/opengl-driver/share/vulkan/icd.d/lvp_icd.x86_64.json` | lavapipe ICD |
 | `ZH_SHELL` | caller's `$SHELL` | login shell Zed uses to load its environment |
 | `ZH_EXTRA_ENV` | – | space-separated `VAR=value` pairs added to Zed's environment |
@@ -161,8 +161,8 @@ installed offline). `diff_view_style` is left at Zed's default (`split`), as in 
 
 - **Socket path length**: Unix socket paths must be < 108 bytes. Zed puts its CLI socket in
   its data dir, so the isolated Zed only sees the state dir through the short symlink
-  `/tmp/zh-$UID`. Paths in Zed's UI/logs therefore show either the real path (worktrees are
-  canonicalized) or `/tmp/zh-1000/...`.
+  `$XDG_RUNTIME_DIR/zh`. Paths in Zed's UI/logs therefore show either the real path (worktrees are
+  canonicalized) or `/run/user/1000/zh/...`.
 - **Clipboard targets**: Zed on X11 offers `UTF8_STRING`/`text/plain;charset=utf-8` but not
   `STRING`, which plain `xclip -o` asks for ("target STRING not available"). `zh clip`
   requests `UTF8_STRING`. The clipboard only exists while the owning app runs: read it before
