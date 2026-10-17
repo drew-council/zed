@@ -1147,10 +1147,24 @@ impl ReviewView {
             if self.filters.hide_reviewed && reviewed_hidden {
                 SharedString::from("All files reviewed")
             } else {
+                // The panel counts generated and vendored files on their own, so they aren't
+                // among the changed files, unless they are all there is.
+                let count = match files
+                    .iter()
+                    .filter(|file| {
+                        !self
+                            .filters
+                            .hides_attributes(self.attributes(&file.repo_path))
+                    })
+                    .count()
+                {
+                    0 => files.len(),
+                    count => count,
+                };
                 format!(
                     "All {} changed file{} are hidden",
-                    files.len(),
-                    if files.len() == 1 { "" } else { "s" }
+                    count,
+                    if count == 1 { "" } else { "s" }
                 )
                 .into()
             }
@@ -1164,10 +1178,8 @@ impl ReviewView {
         let session = self.session.read(cx);
         let mut summary = ReviewSummary::default();
         for file in self.diff.read(cx).files(cx) {
-            if !self.filters.passes_patterns(&file.repo_path) {
-                summary.filtered_out += 1;
-                continue;
-            }
+            // Generated and vendored files are hidden by default, so they count as such rather
+            // than as filtered out by the patterns.
             let attributes = self.attributes(&file.repo_path);
             if self.filters.hides_attributes(attributes) {
                 if attributes.generated && !self.filters.show_generated {
@@ -1175,6 +1187,10 @@ impl ReviewView {
                 } else {
                     summary.vendored_hidden += 1;
                 }
+                continue;
+            }
+            if !self.filters.passes_patterns(&file.repo_path) {
+                summary.filtered_out += 1;
                 continue;
             }
             summary.total += 1;

@@ -1895,7 +1895,11 @@ mod tests {
         assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("src/a/b/c.rs"));
         let (count, status) = header(&panel, cx);
         assert_eq!(count, "0/3 reviewed");
-        assert_eq!(status.as_deref(), Some("include ^SRC/ · 4 filtered out"));
+        // Generated and vendored files count as such, not as filtered out (V2.08).
+        assert_eq!(
+            status.as_deref(),
+            Some("include ^SRC/ · 2 filtered out · 1 generated hidden · 1 vendored hidden")
+        );
 
         // File navigation stays among the shown files.
         cx.simulate_keystrokes("; l ] f ] f ] f");
@@ -1947,6 +1951,18 @@ mod tests {
         cx.simulate_keystrokes("/");
         assert_eq!(prompt(&panel, cx), Some((".RS".into(), None)));
         cx.simulate_keystrokes("escape");
+
+        // With everything hidden, the generated and vendored files (hidden anyway) aren't
+        // counted among the changed files.
+        cx.simulate_keystrokes("i");
+        cx.simulate_input("nothing matches");
+        cx.simulate_keystrokes("enter");
+        let empty_label = |cx: &mut VisualTestContext| {
+            review.read_with(cx, |review, cx| review.diff().read(cx).empty_label(cx).to_string())
+        };
+        assert_eq!(empty_label(cx), "All 5 changed files are hidden");
+        dispatch(crate::ToggleShowGenerated, cx);
+        assert_eq!(empty_label(cx), "All 6 changed files are hidden");
     }
 
     #[gpui::test]
