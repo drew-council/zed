@@ -23,7 +23,8 @@ use project::{Project, git_store::Repository};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
-    Chip, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, prelude::*,
+    Chip, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, Tooltip,
+    prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
@@ -1142,11 +1143,14 @@ impl PickerDelegate for StartReviewDelegate {
             Entry::Commit { index, positions } => {
                 self.render_commit(entry_index, *index, positions, selected, None)
             }
+            // Hints (how to set up a token, a GitHub host) are often longer than a row, and the
+            // picker's list measures rows unwrapped: the whole text is in the tooltip.
             Entry::Status(text) => Some(
                 ListItem::new(("start-review-status", entry_index))
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
-                    .child(Label::new(text.clone()).color(Color::Muted))
+                    .tooltip(Tooltip::text(text.clone()))
+                    .child(Label::new(text.clone()).color(Color::Muted).truncate())
                     .into_any_element(),
             ),
         }
