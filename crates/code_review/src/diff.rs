@@ -711,6 +711,11 @@ impl ReviewDiff {
         Some(self.entry(path_key)?.display_buffer.read(cx).remote_id())
     }
 
+    /// The (right-hand side) buffer showing the file, also while the file is hidden.
+    pub(crate) fn display_buffer(&self, path_key: &PathKey) -> Option<&Entity<Buffer>> {
+        Some(&self.entry(path_key)?.display_buffer)
+    }
+
     pub(crate) fn repo_path_for_buffer(&self, buffer_id: BufferId, cx: &App) -> Option<RepoPath> {
         self.buffer_subscriptions
             .iter()

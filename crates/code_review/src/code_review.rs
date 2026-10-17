@@ -114,6 +114,10 @@ actions!(
         EditComment,
         /// Deletes the comment below the cursor line, after asking.
         DeleteComment,
+        /// Moves to the next comment, wrapping around.
+        NextComment,
+        /// Moves to the previous comment, wrapping around.
+        PreviousComment,
         /// Saves the comment being edited and returns to the diff.
         SaveComment,
         /// Returns to the diff without saving the changes to the comment being edited. A new
@@ -770,6 +774,8 @@ mod tests {
                 "code_review::AddReviewComment",
                 "code_review::EditComment",
                 "code_review::DeleteComment",
+                "code_review::NextComment",
+                "code_review::PreviousComment",
                 "code_review::SaveComment",
                 "code_review::CycleCommentType",
                 "code_review::CycleCommentTypeBackward",

@@ -88,6 +88,15 @@ pub(crate) enum CommentTarget {
     },
 }
 
+impl CommentTarget {
+    pub(crate) fn path(&self) -> Option<&RepoPath> {
+        match self {
+            Self::Review => None,
+            Self::File { path } | Self::Lines { path, .. } => Some(path),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommentState {
     Draft,

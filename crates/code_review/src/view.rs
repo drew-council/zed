@@ -1,9 +1,9 @@
 use crate::{
     AddComment, AddFileComment, AddReviewComment, ChangeBase, DeleteComment, EditComment,
-    FocusDiff, FocusPanel, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor, PreviousFile,
-    PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
-    ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
-    ToggleHunkReviewed, ToggleSingleFileMode,
+    FocusDiff, FocusPanel, NextComment, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
+    PreviousComment, PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch,
+    ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed,
+    ToggleHeader, ToggleHunkReviewed, ToggleSingleFileMode,
     comments::{CommentBlocks, CommentBlocksEvent},
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
@@ -1560,6 +1560,23 @@ impl ReviewView {
         });
     }
 
+    fn next_comment(&mut self, _: &NextComment, window: &mut Window, cx: &mut Context<Self>) {
+        discard_vim_count(window, cx);
+        self.comments
+            .update(cx, |comments, cx| comments.go_to_next(window, cx));
+    }
+
+    fn previous_comment(
+        &mut self,
+        _: &PreviousComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        discard_vim_count(window, cx);
+        self.comments
+            .update(cx, |comments, cx| comments.go_to_previous(window, cx));
+    }
+
     #[cfg(test)]
     pub(crate) fn comments(&self) -> &Entity<CommentBlocks> {
         &self.comments
@@ -1650,6 +1667,8 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::add_review_comment))
             .on_action(cx.listener(Self::edit_comment))
             .on_action(cx.listener(Self::delete_comment))
+            .on_action(cx.listener(Self::next_comment))
+            .on_action(cx.listener(Self::previous_comment))
             .when(is_branch_review, |view| {
                 view.on_action(cx.listener(Self::change_base_action))
             })

@@ -98,7 +98,8 @@
   },
   {
     // Comments. After the block above: its `i` and `c` nulls rank lower, so these win, and a
-    // propagated `i` (no comment at the cursor) still doesn't reach vim's insert mode.
+    // propagated `i` (no comment at the cursor) still doesn't reach vim's insert mode. `m` and
+    // `shift-m` give up vim's marks and `WindowMiddle` in the review.
     "context": "CodeReview > Editor && mode == full && vim_mode == normal && !menu",
     "bindings": {
       "c": "code_review::AddComment",
@@ -106,6 +107,10 @@
       "; c": "code_review::AddReviewComment",
       "i": "code_review::EditComment",
       "enter": "code_review::EditComment",
+      "] t": "code_review::NextComment",
+      "[ t": "code_review::PreviousComment",
+      "m": "code_review::NextComment",
+      "shift-m": "code_review::PreviousComment",
     },
   },
   {

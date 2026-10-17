@@ -15,8 +15,10 @@ use editor::{
     scroll::Autoscroll,
 };
 use gpui::{Entity, EventEmitter, Focusable as _, PromptLevel, Subscription, WeakEntity};
-use language::{Buffer, BufferId, LanguageRegistry, Point, language_settings::SoftWrap};
-use multi_buffer::{MultiBuffer, MultiBufferRow, RowInfo, ToPoint as _};
+use language::{
+    Buffer, BufferId, LanguageRegistry, Point, ToPoint as _, language_settings::SoftWrap,
+};
+use multi_buffer::{MultiBuffer, MultiBufferRow, PathKey, RowInfo, ToPoint as _};
 use std::{ops::RangeInclusive, sync::Arc};
 use ui::prelude::*;
 use util::{ResultExt as _, truncate_and_trailoff};
@@ -38,6 +40,9 @@ pub(crate) struct CommentBlocks {
     views: HashMap<CommentId, Entity<CommentView>>,
     /// The blocks showing comments on the right side of the diff.
     hosted: HashMap<CommentId, HostedBlock>,
+    /// The comment `]t`/`[t` moved to, with the row the cursor landed on: several comments can
+    /// sit below one row.
+    selected: Option<(CommentId, u32)>,
     targeted: Option<CommentId>,
     focus_guard: Option<Subscription>,
     _session_subscription: Subscription,
@@ -67,6 +72,12 @@ impl Placement {
     fn is_file(self) -> bool {
         matches!(self, Self::AboveFile(_))
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Next,
+    Previous,
 }
 
 /// What `c` comments on.
@@ -116,6 +127,7 @@ impl CommentBlocks {
             language_registry,
             views: HashMap::default(),
             hosted: HashMap::default(),
+            selected: None,
             targeted: None,
             focus_guard: None,
             _session_subscription: session_subscription,
@@ -148,6 +160,7 @@ impl CommentBlocks {
             editor.remove_blocks(blocks, None, cx);
         });
         self.views.clear();
+        self.selected = None;
         self.targeted = None;
         self.session = session;
         self._session_subscription =
@@ -736,10 +749,163 @@ impl CommentBlocks {
         .detach();
     }
 
-    /// The comment `i`, `Enter` and `dd` act on: the first line comment below the cursor row,
-    /// else the file comment above it.
+    /// `]t` / `[t`: moves to the next or previous line or file comment, wrapping around.
+    /// Review-level comments aren't in the diff.
+    pub(crate) fn go_to_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_comment(Direction::Next, window, cx);
+    }
+
+    pub(crate) fn go_to_previous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_comment(Direction::Previous, window, cx);
+    }
+
+    fn go_to_comment(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.comment_order(cx);
+        if items.is_empty() {
+            self.show_toast("No comments", cx);
+            return;
+        }
+        let order = self.diff.read(cx).file_order();
+        let cursor_row = self.rhs_cursor_row(cx);
+        let current = self
+            .selected
+            .filter(|(_, row)| Some(*row) == cursor_row)
+            .and_then(|(id, _)| items.iter().find(|item| item.2 == id).copied());
+        let target = match current {
+            Some(current) => match direction {
+                Direction::Next => items.iter().find(|item| **item > current),
+                Direction::Previous => items.iter().rev().find(|item| **item < current),
+            },
+            None => {
+                // A comment sits below its row, so the comment on the cursor row is the next one.
+                let position = self.cursor_position(cx).and_then(|(path_key, row)| {
+                    let file_index = order.iter().position(|key| key == &path_key)?;
+                    Some((file_index, i64::from(row)))
+                });
+                match (direction, position) {
+                    (Direction::Next, Some(position)) => items
+                        .iter()
+                        .find(|(file_index, row, _)| (*file_index, *row) >= position),
+                    (Direction::Previous, Some(position)) => items
+                        .iter()
+                        .rev()
+                        .find(|(file_index, row, _)| (*file_index, *row) < position),
+                    (_, None) => None,
+                }
+            }
+        };
+        let target = match direction {
+            Direction::Next => target.or(items.first()),
+            Direction::Previous => target.or(items.last()),
+        };
+        if let Some((_, _, id)) = target.copied() {
+            self.land_on(id, window, cx);
+        }
+    }
+
+    /// The line and file comments in the order of the diff: by file, file comments first, then
+    /// by line. Comments in files the filters hide, and comments on lines the diff doesn't show,
+    /// are left out.
+    fn comment_order(&self, cx: &App) -> Vec<(usize, i64, CommentId)> {
+        let diff = self.diff.read(cx);
+        let order = diff.file_order();
+        let snapshot = self.rhs_editor(cx).read(cx).buffer().read(cx).snapshot(cx);
+        let mut items = self
+            .session
+            .read(cx)
+            .comments()
+            .iter()
+            .filter_map(|comment| {
+                let path_key = review_path_key(comment.target.path()?);
+                let file_index = order.iter().position(|key| key == &path_key)?;
+                let row = match &comment.target {
+                    CommentTarget::File { .. } => -1,
+                    CommentTarget::Lines {
+                        side: Side::New, ..
+                    } => {
+                        let anchor = comment.anchor.as_ref()?;
+                        // Files hidden by single-file mode have no excerpts to check.
+                        if diff.is_shown(&path_key) {
+                            snapshot.anchor_in_excerpt(anchor.end)?;
+                        }
+                        let buffer = diff.display_buffer(&path_key)?.read(cx);
+                        i64::from(anchor.end.to_point(&buffer.snapshot()).row)
+                    }
+                    CommentTarget::Lines {
+                        side: Side::Old, ..
+                    }
+                    | CommentTarget::Review => return None,
+                };
+                Some((file_index, row, comment.id))
+            })
+            .collect::<Vec<_>>();
+        items.sort();
+        items
+    }
+
+    /// Moves the cursor to the row the comment's block is attached to, showing its file first.
+    fn land_on(&mut self, id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path_key) = self
+            .session
+            .read(cx)
+            .comments()
+            .get(id)
+            .and_then(|comment| comment.target.path())
+            .map(review_path_key)
+        else {
+            return;
+        };
+        self.show_file(&path_key, window, cx);
+        self.reconcile(window, cx);
+        let Some(anchor) = self.hosted.get(&id).map(|hosted| hosted.placement.anchor()) else {
+            return;
+        };
+        let rhs = self.rhs_editor(cx);
+        let row = rhs.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let point = Point::new(anchor.to_point(&snapshot).row, 0);
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_ranges([point..point]),
+            );
+            point.row
+        });
+        self.focus_diff_editor(&rhs, window, cx);
+        self.selected = Some((id, row));
+        self.update_targeted(cx);
+    }
+
+    /// Single-file mode switches to the file, and a reviewed file opens.
+    fn show_file(&mut self, path_key: &PathKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff.update(cx, |diff, cx| {
+            if diff
+                .single_file()
+                .is_some_and(|single_file| single_file != path_key)
+            {
+                diff.move_to_path(path_key.clone(), window, cx);
+            }
+        });
+        if let Some(buffer_id) = self.diff.read(cx).buffer_id_for(path_key, cx) {
+            self.rhs_editor(cx).update(cx, |editor, cx| {
+                if editor.is_buffer_folded(buffer_id, cx) {
+                    editor.unfold_buffer(buffer_id, cx);
+                }
+            });
+        }
+    }
+
+    /// The comment `i`, `Enter` and `dd` act on: the one `]t`/`[t` moved to, else the first line
+    /// comment below the cursor row, else the file comment above it.
     fn comment_at_cursor(&self, cx: &mut App) -> Option<CommentId> {
         let row = self.rhs_cursor_row(cx)?;
+        if let Some((id, selected_row)) = self.selected
+            && selected_row == row
+            && self.hosted.contains_key(&id)
+        {
+            return Some(id);
+        }
         let snapshot = self.rhs_editor(cx).read(cx).buffer().read(cx).snapshot(cx);
         self.hosted
             .iter()
@@ -786,6 +952,18 @@ impl CommentBlocks {
                     .row,
             )
         })
+    }
+
+    /// The file at the cursor and the cursor's row in its buffer (the row after them on removed
+    /// lines).
+    fn cursor_position(&self, cx: &mut App) -> Option<(PathKey, u32)> {
+        let row = self.rhs_cursor_row(cx)?;
+        let rhs = self.rhs_editor(cx);
+        let snapshot = rhs.read(cx).buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(Point::new(row, 0));
+        let (text_anchor, buffer) = snapshot.anchor_to_buffer_anchor(anchor)?;
+        let path_key = snapshot.path_for_buffer(text_anchor.buffer_id)?.clone();
+        Some((path_key, text_anchor.to_point(buffer).row))
     }
 
     fn update_targeted(&mut self, cx: &mut Context<Self>) {
@@ -1499,6 +1677,78 @@ mod tests {
         assert!(comments(&review, cx).is_empty());
         assert!(hosted_rows(&review, cx).is_empty());
         assert_eq!(cursor_line(&rhs, cx), "line 3");
+    }
+
+    #[gpui::test]
+    async fn test_comment_navigation(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let add = |row_text: &str, keys: &str, cx: &mut VisualTestContext| {
+            move_to_row_with_text(&rhs, row_text, cx);
+            cx.simulate_keystrokes(keys);
+            cx.simulate_input(row_text);
+            cx.simulate_keystrokes("ctrl-enter");
+        };
+        add("line 36", "c", cx);
+        add("line 3", "c", cx);
+        add("three", "c", cx);
+        add("two", "shift-c", cx);
+        add("line 4", "; c", cx);
+        let targeted = |cx: &mut VisualTestContext| {
+            let blocks = blocks(&review, cx);
+            cx.update(|_, cx| {
+                blocks.update(cx, |blocks, cx| {
+                    let id = blocks.comment_at_cursor(cx)?;
+                    let comment = blocks.session.read(cx).comments().get(id)?;
+                    Some(comment.body.clone())
+                })
+            })
+        };
+
+        move_to_row_with_text(&rhs, "line 1", cx);
+        for (keys, body, path) in [
+            ("] t", "line 3", "a.rs"),
+            ("] t", "line 36", "a.rs"),
+            // File comments come first in their file.
+            ("m", "two", "modified.txt"),
+            ("] t", "three", "modified.txt"),
+            // Wraps around; review-level comments aren't in the diff.
+            ("] t", "line 3", "a.rs"),
+            ("[ t", "three", "modified.txt"),
+            ("shift-m", "two", "modified.txt"),
+            ("[ t", "line 36", "a.rs"),
+        ] {
+            cx.simulate_keystrokes(keys);
+            assert_eq!(targeted(cx).as_deref(), Some(body), "after {keys}");
+            assert_eq!(
+                path_at_cursor(&review, cx).as_deref(),
+                Some(path),
+                "after {keys}"
+            );
+            assert_back_in_diff(&rhs, cx);
+        }
+        assert_eq!(cursor_line(&rhs, cx), "line 36");
+
+        // From a plain row, the next comment is the first one below it.
+        move_to_row_with_text(&rhs, "line 4", cx);
+        cx.simulate_keystrokes("] t");
+        assert_eq!(targeted(cx).as_deref(), Some("line 36"));
+        move_to_row_with_text(&rhs, "line 4", cx);
+        cx.simulate_keystrokes("[ t");
+        assert_eq!(targeted(cx).as_deref(), Some("line 3"));
+
+        // Single-file mode switches files.
+        cx.simulate_keystrokes("; f");
+        cx.simulate_keystrokes("] t ] t");
+        assert_eq!(targeted(cx).as_deref(), Some("two"));
+        assert_eq!(
+            review.read_with(cx, |review, cx| review
+                .diff()
+                .read(cx)
+                .excerpt_file_paths(cx)),
+            ["modified.txt"]
+        );
     }
 
     #[gpui::test]
