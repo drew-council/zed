@@ -247,6 +247,20 @@ impl ReviewTopBlock {
         cx: &App,
     ) -> AnyElement {
         let details = state.map(|state| state.read(cx).details());
+        // Another branch checked out, or the pull request moved on.
+        let local_head = self
+            .view
+            .upgrade()
+            .and_then(|view| view.read(cx).head_sha(cx));
+        let moved_head = details.zip(local_head).and_then(|(details, local_head)| {
+            (details.head_oid.to_string() != local_head.as_ref()).then(|| {
+                format!(
+                    "Checked out {}, pull request head {}",
+                    local_head.get(..7).unwrap_or(&local_head),
+                    details.head_oid.display_short()
+                )
+            })
+        });
         h_flex()
             .gap_1()
             .min_w_0()
@@ -270,6 +284,19 @@ impl ReviewTopBlock {
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .truncate(),
+                )
+            })
+            .when_some(moved_head, |line, moved_head| {
+                line.child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Warning),
+                )
+                .child(
+                    Label::new(moved_head)
+                        .size(LabelSize::Small)
+                        .color(Color::Warning)
+                        .flex_none(),
                 )
             })
             .into_any_element()

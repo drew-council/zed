@@ -516,3 +516,8 @@ pub fn show_error_toast(
     }
     workspace.show_toast(toast, cx);
 }
+
+/// Hides the toast of [`show_error_toast`], once what failed has worked.
+pub fn dismiss_error_toast(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    workspace.dismiss_toast(&NotificationId::unique::<ForgeErrorToast>(), cx);
+}

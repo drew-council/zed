@@ -840,25 +840,17 @@ impl StartReviewDelegate {
                                 ),
                         )
                         .child(
-                            h_flex()
-                                .gap_1()
-                                .min_w_0()
-                                .child(
-                                    Label::new(format!(
-                                        "{} → {}",
-                                        pull_request.head_ref, pull_request.base_ref
-                                    ))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate(),
+                            Label::new(if pull_request.is_cross_repository {
+                                format!(
+                                    "{} → {} · fork",
+                                    pull_request.head_ref, pull_request.base_ref
                                 )
-                                .when(pull_request.is_cross_repository, |row| {
-                                    row.child(
-                                        Chip::new("fork")
-                                            .label_size(LabelSize::XSmall)
-                                            .label_color(Color::Muted),
-                                    )
-                                }),
+                            } else {
+                                format!("{} → {}", pull_request.head_ref, pull_request.base_ref)
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
                         ),
                 )
                 .into_any_element(),
@@ -951,7 +943,7 @@ impl PickerDelegate for StartReviewDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Review uncommitted changes, the branch, or commits…".into()
+        "Review changes, the branch, commits, or a pull request (#123, URL)…".into()
     }
 
     fn match_count(&self) -> usize {
@@ -1579,7 +1571,7 @@ mod tests {
         });
         assert_eq!(
             tab_title(&review, cx),
-            "PR #1: Add template filters and retire the legac…"
+            "PR #1: Add template filters and retire the legacy renderer"
         );
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {

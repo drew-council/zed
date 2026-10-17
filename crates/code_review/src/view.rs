@@ -1158,6 +1158,19 @@ impl ReviewView {
             .map(|branch| SharedString::from(branch.name().to_owned()))
     }
 
+    pub(crate) fn workspace(&self) -> &WeakEntity<Workspace> {
+        &self.workspace
+    }
+
+    /// The reviewed repository's HEAD commit, as Zed last saw it.
+    pub(crate) fn head_sha(&self, cx: &App) -> Option<SharedString> {
+        self.repo
+            .read(cx)
+            .head_commit
+            .as_ref()
+            .map(|commit| commit.sha.clone())
+    }
+
     /// The project path of a file in the review (`None` for deleted files).
     pub(crate) fn project_path(&self, repo_path: &RepoPath, cx: &App) -> Option<ProjectPath> {
         self.repo.read(cx).repo_path_to_project_path(repo_path, cx)
@@ -1972,7 +1985,7 @@ impl Item for ReviewView {
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match &self.target {
             // "PR #N: …" already says what the tab is.
-            ReviewTarget::PullRequest(_) => truncate_and_trailoff(&self.title(cx), 48).into(),
+            ReviewTarget::PullRequest(_) => truncate_and_trailoff(&self.title(cx), 64).into(),
             ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
                 format!("Review: {}", self.title(cx)).into()
             }

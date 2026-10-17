@@ -131,13 +131,24 @@ pub(crate) fn open_pull_request_and_notify(
     cx: &mut Context<Workspace>,
 ) {
     let task = open_pull_request(workspace, repository, reference, options, window, cx);
-    cx.spawn(async move |workspace, cx| {
-        if let Err(error) = task.await {
-            workspace
+    cx.spawn(async move |workspace, cx| match task.await {
+        // The review may be in another workspace (a new worktree's), which may have replaced
+        // this one in the window.
+        Ok(view) => {
+            let review_workspace = view.read_with(cx, |view, _| view.workspace().clone());
+            review_workspace
                 .update(cx, |workspace, cx| {
-                    forge::show_error_toast(workspace, &error, cx)
+                    forge::dismiss_error_toast(workspace, cx)
                 })
                 .log_err();
+        }
+        Err(error) => {
+            let shown = workspace.update(cx, |workspace, cx| {
+                forge::show_error_toast(workspace, &error, cx)
+            });
+            if shown.is_err() {
+                log::error!("opening a pull request: {error:#}");
+            }
         }
     })
     .detach();
