@@ -754,6 +754,7 @@ cmd_cli() {
     if [[ "${1-}" == -C ]]; then
         dir="${2:?cli -C DIR}"
         shift 2
+        [[ -d "$dir" ]] || die "cli: $dir is not a directory"
     fi
     [[ -d "$dir" ]] || dir="$(dirname "$WORKDIR")"
     isolated_env

@@ -4,17 +4,21 @@
 
 use crate::{
     ReviewView,
-    commits::{check_branch_base, resolve_commit_spec},
+    commits::{changed_file_count, check_branch_base, resolve_commit_spec},
     forge,
     pull_request::{OpenPullRequestOptions, ReviewCancelled, open_pull_request, repository_at},
     session::ReviewOutcome,
+    submit::FinishedReviewToast,
     target::{BranchBase, ReviewTarget, TargetSpec, parse_target_spec},
 };
 use ::cli::{CliResponse, CliResponseSink};
 use anyhow::{Context as _, Result, anyhow, bail};
 use fs::Fs;
 use futures::{FutureExt as _, channel::oneshot};
-use gpui::{App, AsyncApp, Entity, Task, WeakEntity, Window, WindowHandle};
+use gpui::{
+    App, AsyncApp, ClipboardItem, Entity, PromptLevel, Subscription, Task, WeakEntity, Window,
+    WindowHandle,
+};
 use http_client::Url;
 use project::git_store::Repository;
 use std::{
@@ -25,7 +29,15 @@ use std::{
     time::Duration,
 };
 use util::ResultExt as _;
-use workspace::{AppState, MultiWorkspace, OpenOptions, Workspace, WorkspaceMatching};
+use workspace::{
+    AppState, MultiWorkspace, OpenOptions, Toast, Workspace, WorkspaceMatching,
+    notifications::NotificationId,
+};
+
+/// A link's review with more changed files than this asks before it opens: a link can name any
+/// commit range of a repository, a whole tree's worth of buffers.
+const LARGE_REVIEW_FILES: usize = 2000;
+const MAX_LINK_ERROR_CHARS: usize = 300;
 
 /// Whether `url` is a `zed://review` link (`zed://review`, `zed://review?…`, `zed://review/…`).
 pub fn is_review_url(url: &str) -> bool {
@@ -100,17 +112,24 @@ impl CliReply {
         self.sink.send(CliResponse::Ping)
     }
 
-    fn exit(&self, status: i32, stdout: Option<String>, stderr: Option<String>) {
+    /// Returns whether the CLI got `stdout` (it may have gone since the last ping).
+    fn exit(&self, status: i32, stdout: Option<String>, stderr: Option<String>) -> bool {
         if self.exited.replace(true) {
-            return;
+            return false;
         }
+        let mut delivered = true;
         if let Some(message) = stdout {
-            self.sink.send(CliResponse::Stdout { message }).log_err();
+            delivered = self
+                .sink
+                .send(CliResponse::Stdout { message })
+                .log_err()
+                .is_some();
         }
         if let Some(message) = stderr {
             self.sink.send(CliResponse::Stderr { message }).log_err();
         }
         self.sink.send(CliResponse::Exit { status }).log_err();
+        delivered
     }
 }
 
@@ -127,35 +146,40 @@ pub async fn handle_cli_review(
         sink: responses,
         exited: Cell::new(false),
     });
+    // First: the CLI tells this Zed from one that doesn't know `--review` by it.
+    reply.ping().log_err();
+    // Tasks don't run again once Zed quits, so the quit hook answers itself (also while the
+    // review is still being opened).
+    let _quit_subscription = request.wait.then(|| quit_hook(&reply, cx));
     cx.update(|cx| cx.activate(true));
     // `zed --review` sends the repository's path along with the link. A link from a browser
     // (xdg-open runs the CLI with the link alone) can't, so only the CLI's own request is
-    // trusted to move the checkout without asking.
+    // trusted to move the checkout (or open a repository) without asking. Its errors go to the
+    // terminal; a link's show in Zed too, since nobody may see the terminal.
+    let from_command_line = request.paths.len() == 1;
     let is_trusted = |link: &ReviewLink| match request.paths.as_slice() {
         [path] => Path::new(path) == link.repo,
         _ => false,
     };
     let mut opened_in = None;
-    let (opened, trusted) = match ReviewLink::parse(&request.url) {
+    let opened = match ReviewLink::parse(&request.url) {
         Ok(link) => {
-            let trusted = is_trusted(&link);
-            let opened = open_link(
+            open_link(
                 &link,
-                trusted,
+                is_trusted(&link),
                 &request.open_options,
                 &app_state,
                 &mut opened_in,
                 cx,
             )
-            .await;
-            (opened, trusted)
+            .await
         }
-        Err(error) => (Err(error), false),
+        Err(error) => Err(error),
     };
     let review = match opened {
         Ok(review) => review,
         Err(error) => {
-            if !trusted {
+            if !from_command_line {
                 show_link_error(opened_in, &error, cx);
             }
             reply.exit(1, None, Some(forge::error_message(&error).to_string()));
@@ -168,11 +192,30 @@ pub async fn handle_cli_review(
     }
     // Only the receiver is kept: a handle on the review or its session would keep the session
     // alive after its tabs closed, and the wait would never end.
-    let outcome = review
-        .read_with(cx, |review, _| review.session().clone())
-        .update(cx, |session, _| session.wait_for_outcome());
+    let (session, workspace) = review.read_with(cx, |review, _| {
+        (review.session().clone(), review.workspace().clone())
+    });
+    let outcome = session.update(cx, |session, _| session.wait_for_outcome());
+    drop(session);
     drop(review);
-    wait_for_outcome(outcome, reply, cx).await;
+    wait_for_outcome(outcome, reply, workspace, cx).await;
+}
+
+/// Answers the CLI when Zed quits before the review's outcome.
+fn quit_hook(reply: &Rc<CliReply>, cx: &mut AsyncApp) -> Subscription {
+    cx.update(|cx| {
+        cx.on_app_quit({
+            let reply = reply.clone();
+            move |_| {
+                reply.exit(
+                    2,
+                    None,
+                    Some("Zed quit before the review was submitted".into()),
+                );
+                async {}
+            }
+        })
+    })
 }
 
 /// Opens the review a `zed://review` link names, from outside the CLI (a link Zed was started
@@ -196,22 +239,9 @@ pub async fn open_review_link(
 async fn wait_for_outcome(
     outcome: oneshot::Receiver<ReviewOutcome>,
     reply: Rc<CliReply>,
+    workspace: WeakEntity<Workspace>,
     cx: &mut AsyncApp,
 ) {
-    // Tasks don't run again once Zed quits, so the quit hook answers itself.
-    let _quit_subscription = cx.update(|cx| {
-        cx.on_app_quit({
-            let reply = reply.clone();
-            move |_| {
-                reply.exit(
-                    2,
-                    None,
-                    Some("Zed quit before the review was submitted".into()),
-                );
-                async {}
-            }
-        })
-    });
     let mut outcome = outcome.fuse();
     let background = cx.background_executor().clone();
     let outcome = loop {
@@ -228,17 +258,33 @@ async fn wait_for_outcome(
         }
     };
     match outcome {
-        Ok(ReviewOutcome::Submitted { url }) => reply.exit(0, Some(url), None),
+        Ok(ReviewOutcome::Submitted { url }) => {
+            reply.exit(0, Some(url), None);
+        }
         // The CLI prints each message with a newline.
         Ok(ReviewOutcome::Finished {
             markdown: Some(markdown),
         }) => {
-            let markdown = markdown.strip_suffix('\n').unwrap_or(&markdown).to_string();
-            reply.exit(0, Some(markdown), None)
+            let printed = markdown.strip_suffix('\n').unwrap_or(&markdown).to_string();
+            // The CLI went away since the last ping: the review isn't lost.
+            if !reply.exit(0, Some(printed), None) {
+                cx.update(|cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+                    let toast = Toast::new(
+                        NotificationId::unique::<FinishedReviewToast>(),
+                        "The terminal went away: review finished and copied as Markdown",
+                    );
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
+                        .log_err();
+                });
+            }
         }
-        Ok(ReviewOutcome::Finished { markdown: None }) => reply.exit(0, None, None),
+        Ok(ReviewOutcome::Finished { markdown: None }) => {
+            reply.exit(0, None, None);
+        }
         Err(oneshot::Canceled) => {
-            reply.exit(2, None, Some("Review closed without submitting".into()))
+            reply.exit(2, None, Some("Review closed without submitting".into()));
         }
     }
 }
@@ -262,6 +308,12 @@ async fn open_link(
     } else {
         cx.update(|cx| find_review_workspace(&root, cx))
     };
+    // A link from outside Zed may name any repository on this machine.
+    let mut confirm_open = !trusted && found.is_none();
+    if confirm_open && let Some(window) = cx.update(|cx| workspace_windows(cx).into_iter().next()) {
+        confirm_link(window, &root, &link.target, cx).await?;
+        confirm_open = false;
+    }
     let (window, workspace, repository) = match found {
         Some(found) => found,
         None => {
@@ -281,8 +333,13 @@ async fn open_link(
         }
     };
     *opened_in = Some(workspace.downgrade());
+    // No window to ask in before: the repository's own, before the review opens.
+    if confirm_open {
+        confirm_link(window, &root, &link.target, cx).await?;
+    }
     let options = OpenReviewOptions {
         confirm_checkout: !trusted,
+        confirm_large_review: !trusted,
     };
     let open = window.update(cx, |multi_workspace, window, cx| {
         window.activate_window();
@@ -296,6 +353,33 @@ async fn open_link(
     open.await
 }
 
+/// Asks before a link opens a review of a repository that isn't open in Zed yet.
+async fn confirm_link(
+    window: WindowHandle<MultiWorkspace>,
+    root: &Path,
+    target: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let detail = format!(
+        "A link asks to review {} in {}, which isn't open in Zed.",
+        util::truncate_and_trailoff(target, 80),
+        root.display()
+    );
+    let answer = window.update(cx, |_, window, cx| {
+        window.prompt(
+            PromptLevel::Warning,
+            &format!("Open {} for a review?", root.display()),
+            Some(&detail),
+            &["Open", "Cancel"],
+            cx,
+        )
+    })?;
+    if answer.await? != 0 {
+        return Err(ReviewCancelled.into());
+    }
+    Ok(())
+}
+
 /// Shows why a link didn't open, unless the user cancelled it.
 fn show_link_error(
     opened_in: Option<WeakEntity<Workspace>>,
@@ -305,6 +389,15 @@ fn show_link_error(
     if error.chain().any(|cause| cause.is::<ReviewCancelled>()) {
         return;
     }
+    // A link's errors repeat its text, which anyone may have written: not all of it.
+    let message = forge::error_message(error);
+    let shortened;
+    let error = if message.chars().count() > MAX_LINK_ERROR_CHARS {
+        shortened = anyhow!(util::truncate_and_trailoff(&message, MAX_LINK_ERROR_CHARS));
+        &shortened
+    } else {
+        error
+    };
     let shown = cx.update(|cx| {
         let workspace = opened_in
             .and_then(|workspace| workspace.upgrade())
@@ -412,6 +505,9 @@ fn find_review_workspace(
 pub(crate) struct OpenReviewOptions {
     /// Ask before a pull request's checkout moves the repository (a link from outside Zed).
     pub(crate) confirm_checkout: bool,
+    /// Ask before a review of more than [`LARGE_REVIEW_FILES`] committed changes opens (a link
+    /// from outside Zed).
+    pub(crate) confirm_large_review: bool,
 }
 
 /// Opens (or activates) the review `spec` names in `repository`, once its revisions resolve.
@@ -466,6 +562,32 @@ pub(crate) fn open_review(
     };
     window.spawn(cx, async move |cx| {
         let target = target.await?;
+        if options.confirm_large_review {
+            let count = cx.update(|_, cx| changed_file_count(&repository, &target, cx))?;
+            if let Some(files) = count.await?
+                && files > LARGE_REVIEW_FILES
+            {
+                let root = repository.read_with(cx, |repository, _| {
+                    repository.work_directory_abs_path.clone()
+                });
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &format!("Open a review of {files} changed files?"),
+                        Some(&format!(
+                            "A link asks to review changes to {files} files in {}, which can \
+                             take a while to open.",
+                            root.display()
+                        )),
+                        &["Open", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if answer.await? != 0 {
+                    return Err(ReviewCancelled.into());
+                }
+            }
+        }
         workspace_handle.update_in(cx, |workspace, window, cx| {
             ReviewView::deploy_in_repo(workspace, target, repository, window, cx)
         })
@@ -1206,5 +1328,139 @@ pub(crate) mod tests {
             waiting.received(),
             [stderr("Zed quit before the review was submitted"), exit(2)]
         );
+    }
+
+    /// Zed answers a review request with a ping before anything else: the CLI tells it from a
+    /// Zed without `--review`, which exits 0 at once. A command line's own errors (a blank
+    /// target here) only go to the terminal.
+    #[gpui::test]
+    async fn test_ping_first_and_command_line_errors(cx: &mut TestAppContext) {
+        let app_state = app_with_repository(cx).await;
+        let window = open_window(&app_state, path!("/project"), cx).await;
+        let workspace = workspace_of(window, cx);
+        notification_count(&workspace, cx);
+
+        let mut cli = Cli::run(command_line(path!("/project"), "", true), &app_state, cx);
+        assert!(matches!(cli.responses.try_recv(), Ok(CliResponse::Ping)));
+        assert_eq!(
+            cli.received(),
+            [
+                stderr("Invalid review link: no target. Use zed://review?repo=PATH&target=TARGET"),
+                exit(1)
+            ]
+        );
+        assert_eq!(notification_count(&workspace, cx), 0);
+    }
+
+    /// The CLI went away just before the review finished (after its last ping): the review
+    /// goes to the clipboard instead, and the toast says so.
+    #[gpui::test]
+    async fn test_finish_after_the_cli_went_away(cx: &mut TestAppContext) {
+        let app_state = app_with_repository(cx).await;
+        let window = open_window(&app_state, path!("/project"), cx).await;
+        let workspace = workspace_of(window, cx);
+        let mut cli = Cli::run(
+            command_line(path!("/project"), "uncommitted", true),
+            &app_state,
+            cx,
+        );
+        let review = reviews(&workspace, cx).pop().unwrap();
+        add_review_comment(&review, "Not lost", cx);
+        let markdown = review
+            .read_with(cx, |review, cx| review.review_markdown(cx))
+            .unwrap();
+        cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
+        notification_count(&workspace, cx);
+        cli.disconnect();
+        finish(&workspace, &review, cx);
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(clipboard, Some(markdown));
+        assert_eq!(notification_count(&workspace, cx), 1);
+    }
+
+    /// A link (not the CLI's own request) asks before it opens a repository that isn't open in
+    /// Zed, and before a review with very many changed files. Cancel is quiet.
+    #[gpui::test]
+    async fn test_links_ask_before_opening_much(cx: &mut TestAppContext) {
+        let app_state = app_with_repository(cx).await;
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            path!("/other"),
+            json!({ ".git": { "HEAD": "ref: refs/heads/main\n" }, "b.rs": "" }),
+        )
+        .await;
+        // `branch:main` deletes every file main has.
+        let main_files = (0..=LARGE_REVIEW_FILES)
+            .map(|index| (format!("old/{index}.txt"), "old\n".to_string()))
+            .collect::<Vec<_>>();
+        let main_files = main_files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.clone()))
+            .collect::<Vec<_>>();
+        fs.set_merge_base_content_for_repo(dot_git(), &main_files);
+        crate::test_support::insert_commit_ref(&fs, "main", crate::test_support::C1);
+        let window = open_window(&app_state, path!("/project"), cx).await;
+        let workspace = workspace_of(window, cx);
+        notification_count(&workspace, cx);
+
+        let mut cli = Cli::run(clicked_link(path!("/other"), "uncommitted"), &app_state, cx);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cli.received(), [stderr("Review cancelled"), exit(1)]);
+        assert_eq!(workspace_windows_in(cx).len(), 1);
+        assert_eq!(notification_count(&workspace, cx), 0);
+
+        let mut cli = Cli::run(clicked_link(path!("/other"), "uncommitted"), &app_state, cx);
+        cx.simulate_prompt_answer("Open");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(cli.received(), [exit(0)]);
+        assert!(
+            cx.update(|cx| find_review_workspace(Path::new(path!("/other")), cx))
+                .is_some()
+        );
+        // The command line opens it without asking.
+        let mut cli = Cli::run(
+            command_line(path!("/other"), "uncommitted", false),
+            &app_state,
+            cx,
+        );
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cli.received(), [exit(0)]);
+
+        // A review of more than LARGE_REVIEW_FILES files.
+        let mut cli = Cli::run(
+            clicked_link(path!("/project"), "branch:main"),
+            &app_state,
+            cx,
+        );
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cli.received(), [stderr("Review cancelled"), exit(1)]);
+        assert_eq!(reviews(&workspace, cx).len(), 0);
+        assert_eq!(notification_count(&workspace, cx), 0);
+    }
+
+    /// Opened by a link while no window is open: the repository's window asks before the
+    /// review opens.
+    #[gpui::test]
+    async fn test_link_without_a_window_asks_in_the_new_one(cx: &mut TestAppContext) {
+        let app_state = app_with_repository(cx).await;
+        let mut cli = Cli::run(
+            clicked_link(path!("/project"), "uncommitted"),
+            &app_state,
+            cx,
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        let windows = workspace_windows_in(cx);
+        assert_eq!(windows.len(), 1);
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cli.received(), [stderr("Review cancelled"), exit(1)]);
+        assert_eq!(reviews(&workspace_of(windows[0], cx), cx).len(), 0);
     }
 }

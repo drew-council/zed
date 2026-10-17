@@ -77,6 +77,10 @@ pub(crate) struct ReviewSession {
     unchecked: HashSet<CommentId>,
     /// Who waits for the review to be submitted or finished.
     outcome_waiters: Vec<oneshot::Sender<ReviewOutcome>>,
+    /// The tabs showing the session now. A tab also keeps the sessions it showed before a key
+    /// switch (to switch back): those don't count, so the review counts as closed once no tab
+    /// shows it.
+    shown_by: usize,
     _load_task: Task<()>,
 }
 
@@ -152,6 +156,7 @@ impl ReviewSession {
             moved_comments: HashSet::default(),
             unchecked: HashSet::default(),
             outcome_waiters: Vec::new(),
+            shown_by: 0,
             _load_task: load_task,
         }
     }
@@ -505,8 +510,8 @@ impl ReviewSession {
         cx.notify();
     }
 
-    /// Resolves once the review is submitted or finished; canceled when every tab of the review
-    /// is closed first (the session is released).
+    /// Resolves once the review is submitted or finished; canceled when no tab shows the review
+    /// any more (see [`Self::hide`]).
     pub(crate) fn wait_for_outcome(&mut self) -> oneshot::Receiver<ReviewOutcome> {
         let (sender, receiver) = oneshot::channel();
         self.outcome_waiters.retain(|waiter| !waiter.is_canceled());
@@ -526,14 +531,33 @@ impl ReviewSession {
         }
     }
 
-    /// Hands the waiters over to the session a tab switched to (its review key changed), so they
-    /// wait for the review the tab shows now.
-    pub(crate) fn move_outcome_waiters_to(&mut self, other: &mut ReviewSession) {
-        other.outcome_waiters.extend(
-            self.outcome_waiters
-                .drain(..)
-                .filter(|waiter| !waiter.is_canceled()),
-        );
+    /// A tab shows the session.
+    pub(crate) fn show(&mut self) {
+        self.shown_by += 1;
+    }
+
+    /// A tab stopped showing the session: it closed, or it switched to `successor` (its review
+    /// key changed: another base, another branch). Once no tab shows the session, its waiters
+    /// wait for the review the last tab switched to, or hear that the review was closed.
+    pub(crate) fn hide(&mut self, successor: Option<&mut ReviewSession>) {
+        self.shown_by = self.shown_by.saturating_sub(1);
+        if self.shown_by > 0 {
+            return;
+        }
+        let waiters = self
+            .outcome_waiters
+            .drain(..)
+            .filter(|waiter| !waiter.is_canceled());
+        match successor {
+            Some(successor) => successor.outcome_waiters.extend(waiters),
+            // Dropping a sender cancels its waiter.
+            None => waiters.for_each(drop),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shown_by(&self) -> usize {
+        self.shown_by
     }
 
     pub(crate) fn flush(&mut self, cx: &mut Context<Self>) {

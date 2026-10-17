@@ -670,6 +670,7 @@ impl ReviewView {
             },
         };
         let session = ReviewSession::for_key(key, cx);
+        session.update(cx, |session, _| session.show());
         let comments = cx.new(|cx| {
             CommentBlocks::new(
                 session.clone(),
@@ -723,6 +724,8 @@ impl ReviewView {
         };
 
         let mut subscriptions = vec![
+            // `zed --review --wait` ends once no tab shows the review.
+            cx.on_release(|this, cx| this.session.update(cx, |session, _| session.hide(None))),
             cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
                 cx.emit(event.clone())
             }),
@@ -896,10 +899,13 @@ impl ReviewView {
             .remove(&key)
             .unwrap_or_else(|| ReviewSession::for_key(key, cx));
         let previous = std::mem::replace(&mut self.session, session);
-        // `zed --review --wait` waits for the review this tab shows, whatever its key is now.
+        // `zed --review --wait` waits for the review its tab shows, whatever its key is now,
+        // unless another tab (a split clone) still shows the previous one.
         previous.update(cx, |previous, cx| {
-            self.session
-                .update(cx, |session, _| previous.move_outcome_waiters_to(session))
+            self.session.update(cx, |session, _| {
+                previous.hide(Some(session));
+                session.show();
+            })
         });
         let previous_key = previous.read(cx).key().clone();
         self.previous_sessions.insert(previous_key, previous);
@@ -3125,6 +3131,72 @@ mod tests {
 
             workspace.update(cx, |workspace, cx| {
                 crate::submit::finish_local_review(workspace, &review, cx)
+            });
+            assert_eq!(
+                futures::FutureExt::now_or_never(outcome),
+                Some(Ok(crate::ReviewOutcome::Finished { markdown: None }))
+            );
+        }
+
+        /// `--wait` waits for the review a tab shows. A split clone changing its base leaves the
+        /// waiter with the original tab, which still shows the review; once no tab shows it (the
+        /// clone keeps it only to switch back), the wait ends as closed.
+        #[gpui::test]
+        async fn test_waiters_stay_with_the_tab_showing_their_review(cx: &mut TestAppContext) {
+            crate::init_test(cx);
+            let (_fs, workspace, cx) = branch_fixture(cx).await;
+            dispatch(ReviewBranch::default(), cx);
+            let review = active_review(&workspace, cx);
+            let session = review.read_with(cx, |review, _| review.session().clone());
+            let mut outcome = session.update(cx, |session, _| session.wait_for_outcome());
+
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+            let split = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.split_and_clone(pane, workspace::SplitDirection::Right, window, cx)
+            });
+            cx.run_until_parked();
+            drop(split);
+            let clone = active_review(&workspace, cx);
+            assert_ne!(clone, review);
+            assert_eq!(session.read_with(cx, |session, _| session.shown_by()), 2);
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                let base = BranchBase::new("main").unwrap();
+                ReviewView::select_base(clone.clone(), base, workspace, window, cx)
+            });
+            cx.run_until_parked();
+            let clone_session = clone.read_with(cx, |review, _| review.session().clone());
+            assert_ne!(clone_session, session);
+            assert_eq!(session.read_with(cx, |session, _| session.shown_by()), 1);
+            assert!(session.update(cx, |session, _| session.has_outcome_waiters()));
+            assert!(!clone_session.update(cx, |session, _| session.has_outcome_waiters()));
+            assert_eq!(outcome.try_recv(), Ok(None));
+
+            // The original tab closes; the clone still holds the session to switch back to.
+            let pane = workspace.read_with(cx, |workspace, _| workspace.pane_for(&review).unwrap());
+            let close = pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(review.entity_id(), workspace::SaveIntent::Skip, window, cx)
+            });
+            cx.run_until_parked();
+            drop((close, review));
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            assert_eq!(session.read_with(cx, |session, _| session.shown_by()), 0);
+            assert_eq!(outcome.try_recv(), Err(futures::channel::oneshot::Canceled));
+
+            // Switching back shows it again, for a new waiter.
+            let outcome = session.update(cx, |session, _| session.wait_for_outcome());
+            workspace.update_in(cx, |workspace, window, cx| {
+                let base = BranchBase::new("origin/main").unwrap();
+                ReviewView::select_base(clone.clone(), base, workspace, window, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                clone.read_with(cx, |review, _| review.session().clone()),
+                session
+            );
+            workspace.update(cx, |workspace, cx| {
+                crate::submit::finish_local_review(workspace, &clone, cx)
             });
             assert_eq!(
                 futures::FutureExt::now_or_never(outcome),

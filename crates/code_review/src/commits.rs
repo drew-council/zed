@@ -1,4 +1,4 @@
-use crate::target::{BranchBase, CommitRange, CommitSpec};
+use crate::target::{BranchBase, CommitRange, CommitSpec, ReviewTarget};
 use anyhow::{Context as _, Result, anyhow, bail};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
@@ -294,6 +294,30 @@ pub(crate) fn check_branch_base(
         },
         cx,
     )
+}
+
+/// How many files the committed changes of a branch or commits review touch (`None` for other
+/// reviews): what such a review loads.
+pub(crate) fn changed_file_count(
+    repo: &Entity<Repository>,
+    target: &ReviewTarget,
+    cx: &mut App,
+) -> Task<Result<Option<usize>>> {
+    let diff_type = match target {
+        ReviewTarget::Branch { base } => DiffTreeType::MergeBase {
+            base: base.name().clone(),
+            head: "HEAD".into(),
+        },
+        ReviewTarget::Commits(range) => DiffTreeType::Since {
+            base: base_tree(range),
+            head: range.head.to_string().into(),
+        },
+        ReviewTarget::Uncommitted | ReviewTarget::PullRequest(_) => {
+            return Task::ready(Ok(None));
+        }
+    };
+    let tree_diff = repo.update(cx, |repo, cx| repo.diff_tree(diff_type, cx));
+    cx.spawn(async move |_| Ok(Some(tree_diff.await??.entries.len())))
 }
 
 /// Git's `diff --merge-base` stops with "no merge base found" or "multiple merge bases found".
