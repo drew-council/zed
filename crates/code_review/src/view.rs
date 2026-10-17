@@ -17,7 +17,7 @@ use collections::{HashMap, HashSet};
 use editor::ToPoint as _;
 use editor::{
     Editor, EditorEvent, PathKey, SelectionEffects, SplittableEditor,
-    actions::{OpenExcerpts, ToggleSoftWrap},
+    actions::{OpenExcerpts, ReloadFile, ToggleSoftWrap},
     scroll::Autoscroll,
 };
 use git::{repository::RepoPath, status::FileStatus};
@@ -254,6 +254,14 @@ fn discard_vim_count(window: &mut Window, cx: &mut App) {
     if let Some(action) = cx.build_action("vim::ClearOperators", None).log_err() {
         window.dispatch_action(action, cx);
     }
+}
+
+/// The review is read-only, but the editor handles staging (which also saves the dirty buffers
+/// under the cursor) and reloading (which drops the unsaved edits of every buffer in the review)
+/// without checking that. Vim's `d u` and `:e!` dispatch these too.
+fn block_write_action(window: &mut Window, cx: &mut App) {
+    cx.stop_propagation();
+    discard_vim_count(window, cx);
 }
 
 /// A file as the review panel lists it.
@@ -1472,6 +1480,10 @@ impl Render for ReviewView {
         let single_file = self.diff.read(cx).single_file().cloned();
         v_flex()
             .key_context("CodeReview")
+            .capture_action(|_: &git::ToggleStaged, window, cx| block_write_action(window, cx))
+            .capture_action(|_: &git::StageAndNext, window, cx| block_write_action(window, cx))
+            .capture_action(|_: &git::UnstageAndNext, window, cx| block_write_action(window, cx))
+            .capture_action(|_: &ReloadFile, window, cx| block_write_action(window, cx))
             .capture_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::scroll_left))
             .on_action(cx.listener(Self::scroll_right))
@@ -2202,6 +2214,120 @@ mod tests {
                 assert_eq!(take_notifications(&workspace, cx), 1, "{commits:?}");
             }
             assert_eq!(review_count(&workspace, cx), 2);
+        }
+    }
+
+    mod read_only {
+        use super::*;
+        use crate::test_support::{
+            cursor_line, dispatch, dot_git, init_vim_test, lhs_editor, move_to_row_with_text,
+            open_review_fixture, rhs_editor, splittable,
+        };
+        use fs::Fs as _;
+        use gpui::{Action, VisualTestContext};
+        use language::Buffer;
+
+        fn index(fs: &FakeFs) -> HashMap<String, String> {
+            fs.with_git_state(dot_git(), false, |state| {
+                state
+                    .index_contents
+                    .iter()
+                    .map(|(path, content)| {
+                        let content = String::from_utf8_lossy(content).into_owned();
+                        (path.as_unix_str().to_string(), content)
+                    })
+                    .collect()
+            })
+            .unwrap()
+        }
+
+        async fn open_buffer(
+            workspace: &Entity<Workspace>,
+            path: &str,
+            cx: &mut VisualTestContext,
+        ) -> Entity<Buffer> {
+            let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+            project
+                .update(cx, |project, cx| project.open_local_buffer(path, cx))
+                .await
+                .unwrap()
+        }
+
+        #[gpui::test]
+        async fn test_staging_actions_do_nothing(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (fs, workspace, review, cx) = open_review_fixture(cx).await;
+            let editor = rhs_editor(&review, cx);
+            let index_before = index(&fs);
+            // Staging saves the dirty buffers under the cursor first.
+            let buffer = open_buffer(&workspace, path!("/project/modified.txt"), cx).await;
+            buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+            cx.run_until_parked();
+            cx.focus(&review);
+
+            let actions: [Box<dyn Action>; 3] = [
+                Box::new(git::ToggleStaged),
+                Box::new(git::StageAndNext),
+                Box::new(git::UnstageAndNext),
+            ];
+            for action in actions {
+                move_to_row_with_text(&editor, "four", cx);
+                cx.update(|window, cx| window.dispatch_action(action.boxed_clone(), cx));
+                cx.run_until_parked();
+                assert_eq!(index(&fs), index_before, "{}", action.name());
+                assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+            }
+
+            // Vim's `d u`, `d shift-o` and `d shift-u`.
+            for keystrokes in ["d u", "d shift-o", "d shift-u"] {
+                move_to_row_with_text(&editor, "LINE 2", cx);
+                cx.simulate_keystrokes(keystrokes);
+                assert_eq!(index(&fs), index_before, "{keystrokes}");
+                // The operator doesn't stay pending.
+                cx.simulate_keystrokes("j");
+                assert_eq!(cursor_line(&editor, cx), "line 3", "{keystrokes}");
+            }
+            assert_eq!(
+                fs.load(path!("/project/modified.txt").as_ref())
+                    .await
+                    .unwrap(),
+                "ONE\ntwo\nthree\nfour\n"
+            );
+        }
+
+        #[gpui::test]
+        async fn test_staging_on_the_old_side_does_nothing(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Split);
+            let (fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let lhs = lhs_editor(&review, cx);
+            let index_before = index(&fs);
+            cx.simulate_keystrokes("ctrl-w h");
+            assert!(
+                splittable(&review, cx).read_with(cx, |editor, _| editor.focused_editor() == &lhs)
+            );
+
+            move_to_row_with_text(&lhs, "one", cx);
+            dispatch(git::StageAndNext, cx);
+            dispatch(git::ToggleStaged, cx);
+            cx.simulate_keystrokes("d u");
+            assert_eq!(index(&fs), index_before);
+        }
+
+        #[gpui::test]
+        async fn test_reload_keeps_unsaved_edits(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+            let buffer = open_buffer(&workspace, path!("/project/modified.txt"), cx).await;
+            buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+            cx.run_until_parked();
+            cx.focus(&review);
+
+            // Vim's `:e` and `:e!` dispatch the same action.
+            dispatch(ReloadFile, cx);
+            buffer.read_with(cx, |buffer, _| {
+                assert!(buffer.is_dirty());
+                assert!(buffer.text().starts_with("unsaved ONE"));
+            });
         }
     }
 
