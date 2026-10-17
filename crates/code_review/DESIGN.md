@@ -15,11 +15,12 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: milestone 1 (walking skeleton) done.** The long-lived fork branch `code-review` exists
-locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is untouched
-and equals upstream `main`. `code_review::ReviewUncommitted` opens a read-only review tab of HEAD →
-working tree over real project buffers; an empty review panel sits in the left dock. Next:
-milestone 2 (§6).
+**Status: milestone 2 (line cursor + navigation) done.** The long-lived fork branch `code-review`
+exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
+untouched and equals upstream `main`. `code_review::ReviewUncommitted` opens a read-only review tab of
+HEAD → working tree over real project buffers, with a tuicr-style line cursor and file navigation
+(§2.5 minus comments/reviewed marks/export); the review panel in the left dock only shows the active
+review's title so far. Next: milestone 3 (§6).
 
 What exists:
 
@@ -27,12 +28,13 @@ What exists:
 |---|---|
 | branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
-| `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), actions `ReviewUncommitted` / `ToggleFocus`, keymap loading helpers, shared `init_test` |
+| `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions, keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers) |
 | `crates/code_review/src/target.rs` | `ReviewTarget` (only `Uncommitted` so far): title, empty-state label |
-| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by `DiffBufferList`; `ReviewTarget` → `DiffBase` mapping (`diff_base`) |
-| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `ReviewView::deploy`, GPUI tests |
-| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock, empty placeholder) |
-| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim one empty for now) |
+| `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by `DiffBufferList`; `ReviewTarget` → `DiffBase` mapping (`diff_base`); file order, `path_at_cursor`, `move_to_path`, single-file mode |
+| `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll |
+| `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `ReviewView::deploy`, handlers for the review keys, `FocusDiff`, GPUI tests |
+| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab and shows its title; `FocusPanel` / `TogglePanel` / `ToggleFocus` |
+| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (the non-vim one is empty; everything is in the command palette) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
 | `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks |
@@ -44,7 +46,8 @@ Upstream glue so far (all append-style, §3.10): root `Cargo.toml` (member + wor
 `crates/zed/Cargo.toml` (dep), `crates/zed/src/main.rs` (`code_review::init` after `git_ui::init`),
 `crates/zed/src/zed.rs` (`ReviewPanel::load` in `initialize_panels`; `code_review::key_bindings`
 after the base keymap and `code_review::vim_key_bindings` right after `vim.json` in
-`load_default_keymap`; `"code_review"` in `test_action_namespaces`). Core patch #1 not applied yet.
+`load_default_keymap`; `"code_review"` in `test_action_namespaces`). Core patches #1 and #2 are
+applied (`crates/editor/src/config.rs`, `scroll.rs`, `scroll/autoscroll.rs`; §3.10).
 
 **Implementation decisions (milestone 1)** — implementation details, not user questions:
 
@@ -73,14 +76,82 @@ after the base keymap and `code_review::vim_key_bindings` right after `vim.json`
   `activation_priority` 4 (must be unique per dock: debug builds panic on duplicates, `dock.rs:786`);
   icon `ListTodo`, always shown; `persistent_name` "Review Panel", `panel_key` "ReviewPanel".
 
+**Implementation decisions (milestone 2)** — the M2 plan's defaults unless noted:
+
+- **No column pinning** (deviates from §3.4 and the plan): a cursor pinned to column 0 breaks `n`,
+  because `Editor::match_index_for_direction` (`editor/src/items.rs:1969`) picks the first match
+  starting *after* the cursor, so it re-finds the same row's match forever. The caret is hidden and
+  every column motion is a no-op, so the column vim keeps is invisible (search, `G`, `ctrl-d` can leave
+  it non-zero; `e` then opens the file at that column).
+- Painting: `show_local_selections = false` on both sides (re-asserted on every refresh, since a rename
+  turns it back on) and `highlight_rows` with three marker types (context/added/deleted rows): color =
+  editor background, then the row's diff background, then the theme's `players().local().selection`, so
+  green/red stay visible under the cursor (row highlights replace diff backgrounds). One marker set
+  serves cursor and visual rows. Mirroring maps the focused side's display rows to the real rows of the
+  other side (split display rows are aligned); a row facing a spacer gets no mirror.
+- `LineCursor` observes the `SplittableEditor` to configure each new LHS (hidden selections,
+  `set_forbid_horizontal_autoscroll`) and to follow focus between the sides.
+- `h`/`l` (and `left`/`right`): 4 columns on the focused side (the x offset is shared). Reads are clamped
+  to the widest line, so `l` at the right edge never accumulates. `h` at x = 0 dispatches `FocusPanel`
+  in normal mode only (in visual mode it only scrolls). In split view, `h` at the left edge of either
+  side focuses the panel (orchestrator decision; `ctrl-w h/l` switches sides).
+- **Soft wrap off by default** in the review editor (tuicr's `wrap = false`): without an override, the
+  first file's language settings decide for the whole multibuffer (Plain Text wraps), so `h`/`l` would
+  depend on which file comes first. `editor::ToggleSoftWrap` is captured on the `CodeReview` div and
+  switches both sides between no wrap and editor-width wrap (Zed's own toggle falls back to the
+  language settings first, which may change nothing).
+- Keys (`code_review_vim.json`): `v`, `V`, `ctrl-v`, `ctrl-q` start line-wise visual. Null in normal +
+  visual: `w W b B e E ge gE f F t T ; , ^ $ | home end g0 g^ g$ g<home> g<end> gM space backspace`,
+  `( ) % * # g* g#`. Null in normal: `i a I A o O s S c C r R gi insert`; in visual: `i a c s S r R I A gI gA`.
+  Left as vim's: row motions, `0` (binding it would break counts like `10j`), `y`, `d` and the editing
+  keys (blocked by read-only, though `dd`/`x` may move the cursor), `]c`/`[c`, `K`, `gd`. `; e`/`; l` also
+  work in the panel.
+- File navigation: `]f`/`[f`, `}`/`{` stop at the first/last file; `]u`/`[u` wrap around (skipping the
+  current file) — tuicr's behaviour, confirmed by the orchestrator. `is_file_reviewed` is a stub (false)
+  until M4. Landing: the first row of the file's first excerpt (`location_for_path`), scrolled with
+  `Autoscroll::focused()`; on the LHS through its own multibuffer (same `PathKey`s). Order: sorted
+  `PathKey`s of files with hunks (`ReviewDiff::file_order`), including files hidden by single-file mode.
+- Counts: not supported by `code_review` actions (orchestrator: no vim patch). Each handler dispatches
+  `vim::ClearOperators` (built by name) so a typed count doesn't multiply the next motion.
+- Single-file mode (`; f`): excerpt visibility in `ReviewDiff` (`single_file`, `sync_excerpts` honours
+  `is_visible`) — not folding (reserved for reviewed marks), not a second multibuffer. It shows the new
+  file before hiding the others (an empty multibuffer moves focus to the placeholder), leaves the mode
+  when the shown file loses its changes, and keeps files that change meanwhile hidden. No indicator yet.
+- `e` = `Editor::open_excerpts` on the focused side (the LHS is translated by `SplittableEditor`).
+- Panel: subscribes to workspace events — adopts the active `ReviewView` on `ActiveItemChanged`, falls
+  back to another open review (or "No review open") on `ItemRemoved`, and keeps the last active review
+  while another kind of tab is active. `FocusDiff` = active review tab, else the panel's review, else any
+  open review. `TogglePanel` closes the panel only when it is the left dock's visible panel and returns
+  focus to the diff if it was in the panel. M1's `; h`/`; l` → `ToggleFocus` bindings became
+  `FocusPanel`/`FocusDiff`; `ToggleFocus` stays the panel's toggle action.
+- Tests: `vim` is a dev-dependency (the keymap only loads when its actions are registered);
+  `test_support::init_vim_test` binds `default-linux.json`, `vim.json` and ours in `zed`'s order.
+
 **Known issues / notes for the next slices:**
 
 - Saving: for an active item whose `capability` isn't editable, the workspace doesn't register
   `workspace::Save` (`workspace.rs:8065-8100`) and `save_item` returns early for save intents
   (`pane.rs:2276`). The comments milestone (`:w` / `ctrl-s` saving drafts, §3.5) must make the
   capability editable or route saving differently.
+- **Empty-row bleed** (visible in the live check): on an empty row directly followed by a spacer — the
+  last empty line of a file before an added/deleted file, or a blank context line before a pure
+  addition — the cursor highlight also covers the spacer rows. `highlight_rows` excludes an end at
+  column 0 and an empty row has no other column, so its range must reach the next row. Proposed core
+  patch #3 (not applied, needs approval): in `Editor::highlighted_display_rows_in_range`
+  (`editor.rs:9483` on `code-review`) only exclude the end row when `end.row() > start.row()`, so an
+  empty range highlights its own row; `line_cursor::highlight_run` would then pass `start..start` for
+  an empty last row. M5 comment blocks right below an empty row would be painted the same way unless
+  opaque.
+- Upstream quirks seen live: vim relative line numbers apply to the focused side only and count across
+  file sections; on the LHS the current line shows 0 instead of its number; after toggling soft wrap in
+  split view the LHS is mis-laid-out until the next frame.
+- `]c` (`GoToHunk`) unfolds ranges — will fight M4's reviewed-file folding.
+- Single-file mode removes excerpts and the LHS is recreated on split toggles: M5 must re-host comment
+  blocks for both (`LineCursor::sync_split_state` shows how to catch LHS re-creation). The
+  `ToggleSoftWrap` capture will also catch the action inside M5 comment editors — scope it then.
+- Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - Not run: `zed`'s own tests (incl. `test_action_namespaces`), clippy. `cargo test -p code_review`:
-  5 tests, stable under `ITERATIONS=30`.
+  18 tests, stable under `ITERATIONS=10`.
 - DESIGN's file:line pointers checked on `v1.25.0-pre` for this slice (`diff_buffer_list.rs`,
   `diff_multibuffer.rs`, `split.rs:1192`, `git_store.rs`, `zed.rs`, `main.rs`) match within a line or
   two. `git_ui` on the tag also has `staged_diff.rs` — a read-only `DiffMultibuffer` item, the
@@ -93,6 +164,10 @@ after the base keymap and `code_review::vim_key_bindings` right after `vim.json`
   onto `v1.25.0` once that stable tag ships; until then `crates/zed/RELEASE_CHANNEL` is `preview`.
 - Agent build cap: **`-j8` under `nice -n 10`** for every cargo invocation. Never run cargo without
   these limits. This applies to agent sessions only; the Nix package build stays uncapped (§2.1).
+- Core patch #2 (horizontal-autoscroll opt-out in `editor`) accepted; batch core edits so `editor`
+  rebuilds once.
+- M2 (orchestrator): `]f`/`[f` stop at the ends and `]u`/`[u` wrap, as in tuicr; `h` at the left edge of
+  the right side in split view focuses the panel; no counted `3}`-style jumps (no vim patch).
 
 **Before writing code, the next agent should:**
 
@@ -275,7 +350,7 @@ move line by line; there is no column.
 
 - Visual: no caret, no char-level selection; the current line is a strong **full-width row highlight
   incl. gutter**, mirrored on the other side in split view; visual mode highlights whole rows.
-- Under the hood: **Zed's real vim**, column pinned to 0. Counts, `{N}G`, `gg`/`G`,
+- Under the hood: **Zed's real vim**; the column exists but is never shown (pinning it breaks `n`, §0). Counts, `{N}G`, `gg`/`G`,
   `ctrl-d/u/f/b/e/y`, `zz/zt/zb`, `H/M/L`, `/` + `n`/`N` (lands on the row) all behave exactly as in
   Zed. Character/word motions (`w b e f t 0 $ ^ …`) do nothing in the review tab.
 - `h`/`l` scroll the view horizontally (tuicr: 4 columns); `h` at the left edge focuses the panel.
@@ -439,10 +514,11 @@ crates/code_review/
   types for visual-range rows. Refresh on `SelectionsChanged`. Keep `autoscroll: false` (else autoscroll
   chases the highlight). Mirror onto the companion editor only when display rows match (spacer rows
   can't be highlighted without a core change — skip).
-- Column pinning: in normal mode, after selection changes, collapse to column 0 of the row.
+- ~~Column pinning~~: dropped in M2 — it breaks search repeat (`n`); see §0.
 - `v` → `vim::ToggleVisualLine` in the review contexts (normal + visual). Selection → row range via
   `selections.newest_adjusted` + the `spanned_rows` rule (end column 0 excludes last row).
-- `h`/`l` → horizontal scroll actions; `h` at scroll-x 0 → focus panel.
+- `h`/`l` → horizontal scroll actions; `h` at scroll-x 0 → focus panel. Needs core patch #2 (autoscroll
+  would snap x back on every `j`/`k`) and no soft wrap (the review turns it off by default).
 - Rebind `i`/`a`/`o` etc. (vim would enter insert mode on a read-only buffer).
 - Cursor never lands on custom blocks (`BlockSnapshot::clip_point`, `block_map.rs:2504-2558`) — good;
   folded (reviewed) file headers *are* cursor stops (matches tuicr fork `a3ac1a3`).
