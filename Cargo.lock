@@ -3247,6 +3247,7 @@ dependencies = [
  "buffer_diff",
  "collections",
  "command_palette",
+ "command_palette_hooks",
  "ctor",
  "db",
  "editor",

@@ -9,13 +9,18 @@ use crate::{
 };
 use buffer_diff::DiffHunkStatusKind;
 use collections::{HashMap, HashSet};
+use command_palette_hooks::GlobalCommandPaletteInterceptor;
 use editor::{
     Anchor, Bias, DisplayPoint, Editor, EditorEvent, EditorMode, SelectionEffects,
     display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
     scroll::Autoscroll,
 };
+use futures::FutureExt as _;
 use git::repository::RepoPath;
-use gpui::{Entity, EntityId, EventEmitter, Focusable as _, PromptLevel, Subscription, WeakEntity};
+use gpui::{
+    DispatchPhase, Entity, EntityId, EventEmitter, Focusable as _, Global, PromptLevel,
+    Subscription, WeakEntity,
+};
 use language::{
     Buffer, BufferId, BufferSnapshot, LanguageRegistry, Point, ToOffset as _, ToPoint as _,
     language_settings::SoftWrap,
@@ -24,6 +29,7 @@ use multi_buffer::{
     MultiBuffer, MultiBufferRow, MultiBufferSnapshot, PathKey, RowInfo, ToPoint as _,
 };
 use std::{
+    any::TypeId,
     ops::{Range, RangeInclusive},
     sync::Arc,
 };
@@ -876,6 +882,8 @@ impl CommentBlocks {
         let return_to = return_to
             .unwrap_or_else(|| self.focused_diff_editor(cx))
             .downgrade();
+        let vim_save = vim_save_action_type(self.workspace.clone(), cx);
+        let blocks = cx.weak_entity();
         let editor = cx.new(|cx| {
             // Created with its text, so that undo can't empty it.
             let buffer = cx.new(|cx| Buffer::local(body, cx));
@@ -895,6 +903,26 @@ impl CommentBlocks {
             editor.set_use_modal_editing(true);
             editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
             editor.set_placeholder_text("Leave a comment…", window, cx);
+            // Vim's `:w` with a range and a file name (`:%w file`) writes the lines through the
+            // editor's project, which comment editors don't have (vim panics), and `:w!` or
+            // `:'<,'>w` wouldn't leave the comment. Every `:w` leaves it, keeping the text.
+            if let Some(vim_save) = vim_save {
+                editor
+                    .register_action_renderer(move |_, window, _| {
+                        let blocks = blocks.clone();
+                        window.on_action(vim_save, move |_, phase, window, cx| {
+                            if phase == DispatchPhase::Capture {
+                                cx.stop_propagation();
+                                blocks
+                                    .update(cx, |blocks, cx| {
+                                        blocks.leave(id, Leave::Keep, window, cx)
+                                    })
+                                    .log_err();
+                            }
+                        });
+                    })
+                    .detach();
+            }
             editor
         });
         let subscription = cx.subscribe_in(
@@ -1566,6 +1594,28 @@ fn side_buffer<'a>(
     }
 }
 
+/// Vim's `:w` action, `vim::VimSave`, is private, so its type is taken from an instance: the
+/// command palette's interceptor, which vim installs while it is enabled, makes one for `w`.
+fn vim_save_action_type(workspace: WeakEntity<Workspace>, cx: &mut App) -> Option<TypeId> {
+    struct VimSaveAction(TypeId);
+    impl Global for VimSaveAction {}
+
+    if let Some(action) = cx.try_global::<VimSaveAction>() {
+        return Some(action.0);
+    }
+    let intercepted = GlobalCommandPaletteInterceptor::intercept("w", workspace, cx)?;
+    let type_id = intercepted
+        .now_or_never()?
+        .results
+        .iter()
+        .find(|item| item.action.name() == "vim::VimSave")?
+        .action
+        .as_any()
+        .type_id();
+    cx.set_global(VimSaveAction(type_id));
+    Some(type_id)
+}
+
 /// The anchor range of whole rows of a buffer, and their text. Text typed at the start of the
 /// first row or at the end of the last one lands outside the range, so a line typed below the
 /// last row doesn't become part of the comment.
@@ -2075,6 +2125,9 @@ mod tests {
             "ctrl-s",
             "escape ctrl-enter",
             "escape : w enter",
+            "escape : w ! enter",
+            "escape v : w enter",
+            "escape : % w space x enter",
             "escape : w q enter",
             "escape : x enter",
             "escape shift-z shift-z",
