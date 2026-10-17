@@ -88,10 +88,7 @@ impl CodeReviewDb {
         review_key: String,
     ) -> impl Future<Output = Result<StoredReview>> + use<> {
         self.queue(move |connection| {
-            connection.exec_bound::<&str>(sql!(
-                INSERT INTO code_review_sessions(review_key) VALUES (?)
-                ON CONFLICT(review_key) DO UPDATE SET last_opened_at = unixepoch()
-            ))?(review_key.as_str())?;
+            ensure_session(connection, review_key.as_str())?;
             let files = connection.select_bound::<&str, (String, Option<u64>)>(sql!(
                 SELECT path, content_hash FROM code_review_reviewed_files WHERE review_key = ?
             ))?(review_key.as_str())?;
@@ -196,9 +193,15 @@ impl CodeReviewDb {
         })
     }
 
-    /// Completes once every write queued before it has.
     pub(crate) fn sync(&self) -> impl Future<Output = Result<()>> + use<> {
         self.queue(|_| Ok(()))
+    }
+
+    pub(crate) fn touch_review(
+        &self,
+        review_key: String,
+    ) -> impl Future<Output = Result<()>> + use<> {
+        self.queue(move |connection| ensure_session(connection, review_key.as_str()))
     }
 
     /// Forgets the reviews (marks and comments) not opened for `max_age_seconds`.
@@ -225,9 +228,11 @@ impl CodeReviewDb {
 }
 
 /// Marks and comments reference their review's session row, which pruning may have deleted
-/// while the review was open.
+/// while the review was open. Every write counts as opening the review, so that a review kept
+/// open (in a tab, or in a Zed that runs for months) isn't pruned as unopened.
 fn ensure_session(connection: &Connection, review_key: &str) -> Result<()> {
     connection.exec_bound::<&str>(sql!(
-        INSERT OR IGNORE INTO code_review_sessions(review_key) VALUES (?)
+        INSERT INTO code_review_sessions(review_key) VALUES (?)
+        ON CONFLICT(review_key) DO UPDATE SET last_opened_at = unixepoch()
     ))?(review_key)
 }

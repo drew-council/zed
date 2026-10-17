@@ -21,7 +21,7 @@ use std::{
 use util::ResultExt as _;
 
 /// Reviews not opened for this long are forgotten (marks and comments), once per run of Zed,
-/// when the first review opens.
+/// after the first review has loaded.
 const FORGET_REVIEWS_AFTER_DAYS: i64 = 90;
 
 /// Identifies a review across tabs and restarts (DESIGN §2.6): the repository plus what is
@@ -93,17 +93,26 @@ impl ReviewSession {
 
     fn new(key: ReviewKey, cx: &mut Context<Self>) -> Self {
         let db = CodeReviewDb::global(cx);
-        if !cx.has_global::<PrunedOldReviews>() {
+        let prune = !cx.has_global::<PrunedOldReviews>();
+        if prune {
             cx.set_global(PrunedOldReviews);
-            let prune = db.prune(FORGET_REVIEWS_AFTER_DAYS * 24 * 60 * 60);
-            cx.background_spawn(async move { prune.await.context("forgetting old reviews") })
-                .detach_and_log_err(cx);
         }
         let load = db.open_review(key.0.to_string());
         let load_task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| match result {
-                Ok(stored) => this.apply_stored_review(stored, cx),
+                Ok(stored) => {
+                    // Only now, so that the review being opened (whose load marked it opened)
+                    // is never the one forgotten.
+                    if prune {
+                        let prune = this.db.prune(FORGET_REVIEWS_AFTER_DAYS * 24 * 60 * 60);
+                        cx.background_spawn(async move {
+                            prune.await.context("forgetting old reviews")
+                        })
+                        .detach_and_log_err(cx);
+                    }
+                    this.apply_stored_review(stored, cx)
+                }
                 // Marks and comments stay unchangeable, so that nothing overwrites the stored
                 // ones.
                 Err(error) => {
@@ -129,8 +138,7 @@ impl ReviewSession {
     }
 
     fn apply_stored_review(&mut self, stored: StoredReview, cx: &mut Context<Self>) {
-        let marks = stored;
-        for (path, content_hash) in marks.files {
+        for (path, content_hash) in stored.files {
             match RepoPath::new(&path) {
                 Ok(repo_path) => {
                     self.reviewed_files.insert(repo_path, content_hash);
@@ -138,7 +146,7 @@ impl ReviewSession {
                 Err(error) => log::warn!("skipping reviewed file {path:?}: {error:#}"),
             }
         }
-        for (path, hunk_key) in marks.hunks {
+        for (path, hunk_key) in stored.hunks {
             match RepoPath::new(&path) {
                 Ok(repo_path) => {
                     self.reviewed_hunks
@@ -149,12 +157,13 @@ impl ReviewSession {
                 Err(error) => log::warn!("skipping reviewed hunk in {path:?}: {error:#}"),
             }
         }
-        self.comments
-            .restore(marks.comments.into_iter().filter_map(|(id, json)| {
-                Comment::from_json(CommentId(id), &json)
-                    .with_context(|| format!("skipping stored comment {id}"))
-                    .log_err()
-            }));
+        let max_stored_id = stored.comments.iter().map(|(id, _)| *id).max();
+        let comments = stored.comments.into_iter().filter_map(|(id, json)| {
+            Comment::from_json(CommentId(id), &json)
+                .with_context(|| format!("skipping stored comment {id}"))
+                .log_err()
+        });
+        self.comments.restore(comments, max_stored_id);
         self.loaded = true;
         cx.emit(ReviewSessionEvent::Loaded);
         cx.notify();
@@ -434,14 +443,18 @@ impl ReviewSession {
         }
     }
 
-    /// Saves the comments whose position changed since they were last saved.
     pub(crate) fn flush(&mut self, cx: &mut Context<Self>) {
         for id in std::mem::take(&mut self.moved_comments) {
             self.save_comment(id, cx);
         }
+        // A review used for longer than the pruning age without being reopened is kept.
+        persist(
+            self.db.touch_review(self.key.0.to_string()),
+            "Couldn't save the review",
+            cx,
+        );
     }
 
-    /// Completes once every write queued so far has.
     pub(crate) fn saved(&self) -> impl Future<Output = ()> + use<> {
         let done = self.db.sync();
         async move {
@@ -886,7 +899,9 @@ mod tests {
         cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
         let old_key = ReviewKey("uncommitted:/old".into());
         let recent_key = ReviewKey("uncommitted:/recent".into());
-        for key in [&old_key, &recent_key] {
+        let first_key = ReviewKey("uncommitted:/first".into());
+        let used_key = ReviewKey("uncommitted:/used".into());
+        for key in [&old_key, &recent_key, &first_key, &used_key] {
             let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
             cx.run_until_parked();
             add_line_comment(&session, "kept?", cx);
@@ -899,23 +914,73 @@ mod tests {
         let db = cx.update(|cx| CodeReviewDb::global(cx));
         let days = |days: i64| days * 24 * 60 * 60;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        db.set_last_opened_at(old_key.0.to_string(), now - days(91))
+        for (key, age) in [(&old_key, 91), (&recent_key, 89), (&first_key, 91)] {
+            db.set_last_opened_at(key.0.to_string(), now - days(age))
+                .await
+                .unwrap();
+        }
+        // A review open all along counts as opened whenever it is written to.
+        let used = cx.update(|cx| ReviewSession::for_key(used_key.clone(), cx));
+        cx.run_until_parked();
+        db.set_last_opened_at(used_key.0.to_string(), now - days(91))
             .await
             .unwrap();
-        db.set_last_opened_at(recent_key.0.to_string(), now - days(89))
-            .await
-            .unwrap();
+        add_line_comment(&used, "still used", cx);
+        cx.run_until_parked();
 
-        // The next run of Zed forgets the old review when it opens its first review.
+        // The next run of Zed forgets the old reviews once its first review has loaded, which
+        // is never one of them.
         cx.update(|cx| cx.remove_global::<PrunedOldReviews>());
+        let first = cx.update(|cx| ReviewSession::for_key(first_key.clone(), cx));
+        cx.run_until_parked();
         let recent = cx.update(|cx| ReviewSession::for_key(recent_key.clone(), cx));
         let old = cx.update(|cx| ReviewSession::for_key(old_key.clone(), cx));
         cx.run_until_parked();
+        assert_eq!(comment_bodies(&first, cx).len(), 1);
         assert_eq!(comment_bodies(&recent, cx).len(), 1);
         assert!(comment_bodies(&old, cx).is_empty());
         let path = RepoPath::new("src/lib.rs").unwrap();
+        first.read_with(cx, |first, _| assert!(first.is_file_reviewed(&path)));
         recent.read_with(cx, |recent, _| assert!(recent.is_file_reviewed(&path)));
         old.read_with(cx, |old, _| assert!(!old.is_file_reviewed(&path)));
+        let used_rows = db.open_review(used_key.0.to_string()).await.unwrap();
+        assert_eq!(used_rows.comments.len(), 2);
+        assert_eq!(used_rows.files.len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_unreadable_comments_are_kept(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let key = ReviewKey("uncommitted:/project".into());
+        let db = cx.update(|cx| CodeReviewDb::global(cx));
+        // A newer version of Zed wrote a comment this one can't read, with the largest id.
+        let readable = r#"{"target":{"kind":"review"},"body":"readable"}"#;
+        let unreadable = r#"{"target":{"kind":"thread","id":"t1"},"body":"from the future"}"#;
+        db.save_comment(key.0.to_string(), 2, readable.into())
+            .await
+            .unwrap();
+        db.save_comment(key.0.to_string(), 7, unreadable.into())
+            .await
+            .unwrap();
+
+        let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(comment_bodies(&session, cx), [(2, "readable".to_string())]);
+        let new = add_line_comment(&session, "new", cx);
+        assert_eq!(new, CommentId(8));
+        drop(session);
+        cx.run_until_parked();
+
+        let stored = db.open_review(key.0.to_string()).await.unwrap();
+        assert_eq!(
+            stored
+                .comments
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [2, 7, 8]
+        );
+        assert!(stored.comments.contains(&(7, unreadable.to_string())));
     }
 
     /// `digest` with the hunk at `index` changed.

@@ -213,7 +213,7 @@ impl CommentStore {
 
     pub(crate) fn insert(&mut self, new_comment: NewComment) -> CommentId {
         let id = CommentId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         self.comments.push(Comment {
             id,
             target: new_comment.target,
@@ -226,13 +226,22 @@ impl CommentStore {
         id
     }
 
-    /// Adds comments read from the database, keeping their ids.
-    pub(crate) fn restore(&mut self, comments: impl IntoIterator<Item = Comment>) {
+    /// Adds comments read from the database, keeping their ids. New ids continue after
+    /// `max_stored_id`, the largest id stored, which may belong to a row that couldn't be read (a
+    /// newer version wrote it): a new comment with that id would overwrite it.
+    pub(crate) fn restore(
+        &mut self,
+        comments: impl IntoIterator<Item = Comment>,
+        max_stored_id: Option<u64>,
+    ) {
+        if let Some(max_stored_id) = max_stored_id {
+            self.next_id = self.next_id.max(max_stored_id.saturating_add(1));
+        }
         for comment in comments {
             if self.get(comment.id).is_some() {
                 continue;
             }
-            self.next_id = self.next_id.max(comment.id.0 + 1);
+            self.next_id = self.next_id.max(comment.id.0.saturating_add(1));
             self.comments.push(comment);
         }
         self.comments.sort_by_key(|comment| comment.id);
