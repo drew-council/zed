@@ -223,6 +223,23 @@ impl PullRequestState {
         self.load(true, cx);
     }
 
+    /// Whether GitHub would take a comment on `target`: only on lines inside its diff hunks, and
+    /// on files of the pull request.
+    pub(crate) fn check_comment(&self, target: &CommentTarget) -> Result<(), SharedString> {
+        if *target == CommentTarget::Review {
+            return Ok(());
+        }
+        match &self.commentable {
+            Some(commentable) => check_comment_target(commentable, target),
+            None if self.is_loading => Err("Loading the pull request's diff from GitHub…".into()),
+            None => Err(
+                "The pull request's diff couldn't be loaded from GitHub: reload the pull request \
+                 to comment on its lines"
+                    .into(),
+            ),
+        }
+    }
+
     fn load(&mut self, with_details: bool, cx: &mut Context<Self>) {
         let number = self.details.number;
         let mut forge = self.forge.clone();
@@ -449,6 +466,51 @@ fn comment_side(side: DiffSide) -> Side {
     match side {
         DiffSide::Left => Side::Old,
         DiffSide::Right => Side::New,
+    }
+}
+
+fn diff_side(side: Side) -> DiffSide {
+    match side {
+        Side::Old => DiffSide::Left,
+        Side::New => DiffSide::Right,
+    }
+}
+
+/// Whether GitHub takes a comment on `target`, by its diff: lines (old ones on the left side)
+/// inside its hunks, a range whose start comes before its end there, files of the pull request.
+pub(crate) fn check_comment_target(
+    commentable: &CommentableLines,
+    target: &CommentTarget,
+) -> Result<(), SharedString> {
+    let (path, lines) = match target {
+        CommentTarget::Review => return Ok(()),
+        CommentTarget::File { path } => {
+            return if commentable.contains_file(path.as_unix_str()) {
+                Ok(())
+            } else {
+                Err("This file isn't part of the pull request on GitHub".into())
+            };
+        }
+        CommentTarget::Lines { path, side, lines } => (path.as_unix_str(), (*side, lines)),
+    };
+    let Some(file) = commentable.file(path) else {
+        return Err(if commentable.is_truncated() {
+            "GitHub didn't list this file's diff (the pull request has too many files), so it \
+             only takes a file comment"
+                .into()
+        } else {
+            "This file isn't part of the pull request on GitHub".into()
+        });
+    };
+    if file.hunks.is_none() {
+        return Err("GitHub shows no diff for this file, so it only takes a file comment".into());
+    }
+    let (side, lines) = lines;
+    let side = diff_side(side);
+    if commentable.allows_range(path, (side, *lines.start()), (side, *lines.end())) {
+        Ok(())
+    } else {
+        Err("GitHub only accepts comments within its diff hunks".into())
     }
 }
 
@@ -1083,6 +1145,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_comment_gate() {
+        use crate::github::test_support::{PR1_FILES, PR4_FILES, changed_files_fixture};
+
+        let files = changed_files_fixture(PR1_FILES);
+        let lines =
+            |path: &str, side: Side, lines: std::ops::RangeInclusive<u32>| CommentTarget::Lines {
+                path: RepoPath::new(path).unwrap(),
+                side,
+                lines,
+            };
+        let file = |path: &str| CommentTarget::File {
+            path: RepoPath::new(path).unwrap(),
+        };
+        let check = |target: &CommentTarget| check_comment_target(&files, target);
+        let outside: Result<(), SharedString> =
+            Err("GitHub only accepts comments within its diff hunks".into());
+        let not_in_pull_request: Result<(), SharedString> =
+            Err("This file isn't part of the pull request on GitHub".into());
+
+        // R59 is between two local hunks but inside GitHub's merged one; R100 is far from any.
+        assert_eq!(check(&lines("src/engine.rs", Side::New, 59..=59)), Ok(()));
+        assert_eq!(
+            check(&lines("src/engine.rs", Side::New, 100..=100)),
+            outside
+        );
+        assert_eq!(check(&lines("src/engine.rs", Side::Old, 193..=193)), Ok(()));
+        // Ranges may span hunks, but not start after their end.
+        assert_eq!(check(&lines("src/engine.rs", Side::New, 2..=13)), Ok(()));
+        assert_eq!(check(&lines("src/engine.rs", Side::New, 2..=10)), outside);
+        // The renamed file's old lines, under its old path.
+        assert_eq!(check(&lines("src/format.rs", Side::Old, 18..=18)), Ok(()));
+        // Files.
+        assert_eq!(check(&file("docs/guide.md")), Ok(()));
+        assert_eq!(check(&file("README.md")), not_in_pull_request);
+        assert_eq!(
+            check(&lines("README.md", Side::New, 1..=1)),
+            not_in_pull_request
+        );
+        assert_eq!(check(&CommentTarget::Review), Ok(()));
+
+        // A pure rename has no diff on GitHub: file comments only.
+        let files = changed_files_fixture(PR4_FILES);
+        assert_eq!(
+            check_comment_target(&files, &lines("docs/design-notes.md", Side::New, 1..=1)),
+            Err("GitHub shows no diff for this file, so it only takes a file comment".into())
+        );
+        assert_eq!(
+            check_comment_target(&files, &file("docs/design-notes.md")),
+            Ok(())
+        );
+    }
+
     mod review {
         use super::*;
         use crate::{
@@ -1533,6 +1648,62 @@ mod tests {
             assert_eq!(requests_of(&requests, "ReviewThreads"), loads + 1);
             assert_eq!(requests_of(&requests, "PullRequestDetails"), 2);
             assert_eq!(remote_keys(&review, cx).len(), 4);
+        }
+
+        #[gpui::test]
+        async fn test_comments_only_on_lines_github_accepts(cx: &mut TestAppContext) {
+            let (_fs, workspace, review, _requests, cx) =
+                open_pull_request_review(DiffViewStyle::Unified, Default::default(), cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let comment_count = |cx: &VisualTestContext| {
+                review.read_with(cx, |review, cx| {
+                    review.session().read(cx).comments().iter().count()
+                })
+            };
+            notification_count(&workspace, cx);
+
+            // Line 100 is outside GitHub's hunks: a toast says so and nothing opens.
+            move_to_row_with_text(&rhs, "ENGINE 100", cx);
+            cx.simulate_keystrokes("c");
+            assert!(!has_open_comment_editor(&review, cx));
+            assert_eq!(comment_count(cx), 0);
+            assert_eq!(notification_count(&workspace, cx), 1);
+
+            // Line 59 is inside one, and so is the deleted old line 193.
+            for row_text in ["ENGINE 59", "engine 193"] {
+                move_to_row_with_text(&rhs, row_text, cx);
+                cx.simulate_keystrokes("c");
+                assert!(has_open_comment_editor(&review, cx), "{row_text}");
+                cx.simulate_input("ok");
+                cx.simulate_keystrokes("ctrl-enter");
+            }
+            assert_eq!(comment_count(cx), 2);
+            assert_eq!(notification_count(&workspace, cx), 0);
+
+            // File and review comments.
+            cx.simulate_keystrokes("shift-c");
+            assert!(has_open_comment_editor(&review, cx));
+            cx.simulate_input("file");
+            cx.simulate_keystrokes("ctrl-enter");
+            cx.simulate_keystrokes("; c");
+            assert!(has_open_comment_editor(&review, cx));
+            cx.simulate_input("review");
+            cx.simulate_keystrokes("ctrl-enter");
+            assert_eq!(comment_count(cx), 4);
+
+            // On a row with a thread and a comment, `i` edits the comment.
+            move_to_row_with_text(&rhs, "engine 193", cx);
+            cx.simulate_keystrokes("i");
+            assert!(has_open_comment_editor(&review, cx));
+            cx.simulate_keystrokes("escape escape");
+            assert!(!has_open_comment_editor(&review, cx));
+
+            // The export has only the review's own comments.
+            let markdown = review
+                .read_with(cx, |review, cx| review.review_markdown(cx))
+                .unwrap();
+            assert!(markdown.contains("src/engine.rs:59"));
+            assert!(!markdown.contains("Splitting on"));
         }
 
         #[gpui::test]

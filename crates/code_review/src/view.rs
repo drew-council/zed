@@ -721,6 +721,15 @@ impl ReviewView {
                 window,
                 |this, _, _: &PullRequestEvent, window, cx| this.update_remote_items(window, cx),
             ));
+            // GitHub only takes comments on the lines of its diff hunks.
+            let gate_source = pull_request.downgrade();
+            session.update(cx, |session, _| {
+                session.set_comment_gate(Some(Arc::new(move |target, cx| {
+                    gate_source
+                        .read_with(cx, |pull_request, _| pull_request.check_comment(target))
+                        .unwrap_or(Ok(()))
+                })))
+            });
             let items = remote_items(pull_request, head_oid(&repo, cx), cx);
             comments.update(cx, |comments, cx| {
                 comments.set_remote_items(items, window, cx)

@@ -985,6 +985,13 @@ impl CommentBlocks {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let gate = self.session.read(cx).comment_gate().cloned();
+        if let Some(gate) = gate
+            && let Err(reason) = gate(&new_comment.target, cx)
+        {
+            self.show_toast(reason, cx);
+            return;
+        }
         let Some(id) = self
             .session
             .update(cx, |session, cx| session.add_comment(new_comment, cx))
