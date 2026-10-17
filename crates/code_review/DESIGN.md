@@ -26,9 +26,9 @@ upstream-inherited FAIL and one known issue) and fix 3 (the sweeps' last cheap f
 left of the observations is under "Known issues". After the user's own testing: opening a review
 shows the review panel (see "UX: opening a review shows the review panel"), and the UX batch
 (`plans/UX-1.md`, the user's answers in its §7) is under way: slice A, the review's overview
-scrolling with the diff as one document, is done (see "UX-1 slice A"); slices B (mouse comments
-from the gutter, editor footer) and C (pane toolbar, review context menu, panel mouse controls)
-are next.
+scrolling with the diff as one document, is done (see "UX-1 slice A"), and so is slice B, comments
+with the mouse: a GitHub-style "+" in the gutter, the comment editor's footer, file header buttons
+(see "UX-1 slice B"); slice C (pane toolbar, review context menu, panel mouse controls) is next.
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -94,8 +94,9 @@ What exists:
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path` (polish B: `file_start_autoscroll`), single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
 | `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned; M7d: `mark_submitted`, `ReviewOutcome` + `wait_for_outcome`/`has_outcome_waiters`/`resolve_outcome` for `--wait`; polish A: `shown_by` + `show`/`hide` (waiters follow the tabs showing the review), submitted comments immutable), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
 | `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
-| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch; polish B: each holds its buffer, and remembers where deleted lines were, `restored_lines`) with the outdated check (both ways since polish B), deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
-| `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
+| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch; polish B: each holds its buffer, and remembers where deleted lines were, `restored_lines`) with the outdated check (both ways since polish B), deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`; UX-1 B: `add_line_comment_on` a given side and rows, `add_file_comment_for`, `set_type`), comment at cursor, `Y`/visual `y` text; comment GPUI tests (UX-1 B: the mouse ones too) |
+| `crates/code_review/src/comments/blocks/gutter.rs` | UX-1 B: the gutter's "+" (`install` sets the editor's gutter row renderer on each side; visibility, the row's target and the gate's refusal, the click and the drag from it, `select_display_rows`) |
+| `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor; UX-1 B: the editor's footer with the type menu, Cancel, Save, Delete) and its `ReviewComment` key context with the leave/keep actions |
 | `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered); fix 2: `github_markdown` (GitHub's `<details>`/`<summary>` tags dropped) |
 | `crates/code_review/src/submit.rs` | M7d: `comment_body`/`review_body` (`[TYPE] ` prefixes), `needs_body` (LV §5.1), `plan_review` → `PlannedReview` (the payload mapping, counts, outdated and refused drafts), `SubmitReviewModal` (events, blockers, warnings, body prompt; polish A: re-plans on every change, starts `PullRequestState::submit`/`check_uncertain_submit` and shows their reply, can't be dismissed while its submit runs), `finish_local_review`; payload/flow/modal tests |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
@@ -109,10 +110,10 @@ What exists:
 | `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
-| `crates/code_review/src/reviewed.rs` | Header checkbox, `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
+| `crates/code_review/src/reviewed.rs` | Header controls (UX-1 B: "Comment" button, checkbox labelled "Reviewed"), `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
 | `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: the review's overview, a block above the diff's first file that scrolls with it (UX-1 slice A; `block_properties`, `is_empty`) — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
 | `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action |
-| `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll |
+| `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll; configures each side (UX-1 B: breakpoint/bookmark gutter hover off) |
 | `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the single-file bar, the panel's read API (`panel_files`, `summary`); GPUI tests |
 | `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); GPUI tests |
 | `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
@@ -1812,6 +1813,89 @@ Q4 no automatic scroll after posting). Upstream glue: one `editor` commit with c
   rows, a plain click included (`row..=row`). Display rows are the side's own; map them through
   `RowInfo`/the side's snapshot.
 
+**UX-1 slice B (comments with the mouse)** — the user's report: "not really any buttons for certain
+parts to have proper mouse interactions, no way to leave comment with mouse for example — take
+inspiration from github review UI etc. to make this happen properly". `plans/UX-1.md` part B with
+the user's §7 answers (Q5 breakpoint/bookmark hover off, Q6 "+" on the hovered row, the cursor row
+and the selection's end, Q7 "Cancel"/"Save", Q9 "Reviewed", Q11 drag from the "+": yes). No
+upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' order changed only.
+
+- **The "+"** (`comments/blocks/gutter.rs`): `gutter::install` sets the editor's gutter row
+  renderer on the right side once and on every new left side (`CommentBlocks`' left-side observer).
+  A solid accent "+" (GitHub's) over the start of the line-number column shows on the row under the
+  pointer (gutter or text), and on the cursor's row and the selection's last row of the side that
+  has the cursor (the split editor's focused side). It's for rows with a buffer row only: no
+  blocks, spacers or folded headers. Its target is the row's line: the old line on the left side
+  and on removed rows of a unified diff (`RowInfo`'s buffer and row), so the comment gate can say
+  per row whether the review takes it.
+- **Click / drag**: pressing the "+" focuses its side, moves the line cursor to the row (unless the
+  row is in the side's selection of several rows) and starts `start_gutter_row_drag`. While the
+  button is held, the renderer sees the drag's rows and (deferred to after the frame) sets the
+  side's selection to them as whole rows, so the line cursor paints the range on both sides and
+  vim shows VISUAL. The release comments on the rows (`add_line_comment_on(editor, Some(rows))`,
+  the same rules as `c` on a selection: a range over removed and added rows takes the added ones,
+  removed rows alone are old lines, across files the last file's rows) and leaves the cursor on
+  the last row; a plain click on a "+" inside a selection comments on the whole selection. The
+  side is passed explicitly: a side focused directly is the split editor's focused one only on the
+  next frame. Shift-click on a "+" is left to the gutter (extends the selection); otherwise the
+  mouse down prevents the default and stops propagating, because the excerpts' expand buttons sit
+  under the "+" on the first and last rows of excerpts (found by a test: the click expanded the
+  excerpt and the editor never saw the mouse up, so the drag never ended).
+- **Ranges the native way**: shift-click on a row's text extends the selection; a drag in the
+  gutter (not on the digits: a click on a line number of a multibuffer opens the file there,
+  upstream) selects whole lines; either way the "+" at the selection's end (or on a hovered row
+  inside it, tooltip "Comment on the Selected Lines") comments on all of it.
+- **Gate** (pull request reviews): a refused row gets a muted, disabled "+" whose tooltip is the
+  gate's reason (e.g. "GitHub only accepts comments within its diff hunks"); its click does
+  nothing (no toast, no line selection). Enabled "+": "Add a Comment `c`", "Drag to comment on
+  several lines".
+- **Breakpoints/bookmarks**: `set_show_breakpoints(false)`/`set_show_bookmarks(false)` in
+  `LineCursor`'s `configure`, which runs for the right side and every new left side.
+- **Comment editor footer** (`comments/view.rs`, below the editor while editing): a type menu
+  (`PopoverMenu` + `ContextMenu`, built when opened: No Type / Issue / Suggestion / Note / Praise,
+  `CommentBlocks::set_type`; the menu gives the focus back to the editor, which stays in its vim
+  mode), Delete (saved comments only: the same confirm as `dd`), Cancel (`Leave::Discard`: a new
+  comment goes away, an edit gets its old text back), Save (`Leave::Keep`) with its key. Decision:
+  the keymaps list `ctrl-s` before `ctrl-enter` for `SaveComment` (the last binding is the one a
+  key hint shows), so Save shows `ctrl-enter`. The card's pencil/trash stay, always visible with
+  tooltips.
+- **File headers** (`reviewed.rs`, the only header addon): a "Comment" button (chat icon, tooltip
+  "Comment on File `shift-c`") makes a file comment on that header's file wherever the cursor is
+  (`add_file_comment_for`; a folded reviewed file unfolds for it), and the checkbox is labelled
+  "Reviewed" (the label toggles it too). Split and unified headers are the same function.
+- **Clicking a row's text** still moves the line cursor there (no caret), verified by a test and
+  live.
+- Tests: 8 new (214 + 1 ignored; the new ones stable under `ITERATIONS=5`): click "+" on a hovered
+  row → comment on that line, insert mode, cursor there; on a removed row (unified) → the old line;
+  a text click moves the line cursor; drag "+" over 3 rows → live painted rows, a range comment,
+  cursor on the last row; an upward drag over a removed row → the added lines; shift-click range
+  and the "+" at its end / on a hovered row inside it → the whole range (on the excerpt's last row:
+  the excerpt doesn't expand); a "+" outside a selection → its own row; split view: the left
+  side's "+" (hover only while the right side has the cursor) → old line, block on the left, then
+  the right side's; no breakpoint/bookmark hover button (red without the fix); the footer: Save,
+  Cancel on a new comment and on an edit, the type menu (`MENU_ITEM-…`), Delete with the prompt
+  (Cancel, then Delete), Save's key is `ctrl-enter`; the header's "Comment" in unified and split
+  view, also on a folded header; PR review: a disabled "+" on a refused row with the gate's reason,
+  no comment and no toast on click, enabled on GitHub's lines (new and removed). Clippy
+  (`-p code_review`) clean.
+- **Live check** (harness, `validation/ux-b/`; local fixture `validation/FINAL/fix2/mkfixture.sh`
+  in `/tmp/uxb/ws/fx`; sandbox PR A #1 read-only, token via `ZH_EXTRA_ENV`, leak grep clean), all
+  PASS: split view: "+" on the cursor row and on a hovered row, its tooltip; click → comment editor
+  in insert mode with the footer; the type menu → Suggestion, typing continues; Save; left side:
+  hovered removed row's "+", a drag over 2 rows paints both sides live → "Old lines 2–3"; Cancel on
+  it removes it; the card's pencil (tooltip "Edit Comment") → footer with Delete; an edit +
+  Cancel restores the text; Delete → the confirm → deleted; header "Comment" (tooltip "Comment on
+  File shift-c") → file comment; "Reviewed" label → marked and folded; a gutter drag (beside the
+  digits) → VISUAL 3 lines, the "+" at its end → "Lines 1–3"; a right-side drag over 3 rows →
+  "Lines 2–4"; unified: removed row's "+" → "Old line 2", a drag over a removed row → "Lines 1–3";
+  no breakpoint dot on gutter hover; shift-click range, "+" on a hovered row inside it ("Comment
+  on the Selected Lines") → "Lines 1–3". PR #1: solid "+" on GitHub's rows, a muted "+" on rows of
+  an expanded excerpt outside GitHub's hunks with the tooltip "GitHub only accepts comments within
+  its diff hunks", its click does nothing. Logs: only the usual noise.
+- **Notes for slice C**: the "+" sits where Zed draws excerpt expand buttons on excerpt edge rows
+  (it wins the click there); a review context menu (Q10) can reuse `add_line_comment_on` /
+  `add_file_comment_for` / `set_type`; the toolbar's "Add Review Comment" is `AddReviewComment`.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -1844,6 +1928,9 @@ Q4 no automatic scroll after posting). Upstream glue: one `editor` commit with c
   "Check out the pull request's head … to comment on its lines"), the text typed next runs as
   normal-mode commands (`e` opens the file, `s` substitutes; autosave then writes the edit). Inherent
   to modal editing; a blocking hint or swallowing keys until Escape would be safer.
+- **Line numbers open the file** (upstream, seen in UX-1 slice B): in a multibuffer a click on a
+  line number's digits opens the file at that line (a preview tab), so a native line-number drag
+  must start in the gutter beside the digits; the "+" drag is the GitHub-like way to select rows.
 - **Seen in the R1 sweep, upstream or by design**: `ctrl-u` back to the very top leaves the cursor
   three rows into the first file (vim's scroll clamps the cursor to the scroll margin below the
   header block; R1 O2); V3.O7 above reads like a dead key right after `r` (`r r M`: the first `M`
@@ -1890,8 +1977,8 @@ Q4 no automatic scroll after posting). Upstream glue: one `editor` commit with c
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 206 tests + 1 ignored live
-  GitHub test (after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 214 tests + 1 ignored live
+  GitHub test (after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
   A; 166 after M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
@@ -2198,6 +2285,11 @@ move line by line; there is no column.
 - **Types:** untyped default; Issue / Suggestion / Note / Praise; `Tab` in the editor's **normal**
   mode cycles (insert-mode `Tab` is a tab); colored badge; `[TYPE] ` prefix on GitHub submission.
   Custom type sets later (settings).
+- **Mouse** (UX-1, GitHub-like): a "+" in the gutter of the hovered row, the cursor row and the
+  selection's end (both sides, removed rows too) comments on the row or the selection it's in;
+  pressing it and dragging over rows comments on them; disabled with the gate's reason where a pull
+  request doesn't take comments. The editor's footer has a type menu, Cancel, Save and (saved
+  comments) Delete; file headers have "Comment" and the "Reviewed" checkbox.
 - **Review-level comments** (`;c`) live in the top section and become the **GitHub review body** on
   submit (tuicr: `src/forge/submit.rs:568` `build_review_body` joins them with `[TYPE]` prefixes).
 - **Persistence:** drafts + reviewed marks saved locally in **Zed's DB**, keyed by review target
