@@ -166,7 +166,7 @@ struct Args {
     #[arg(
         long,
         value_name = "TARGET",
-        conflicts_with = "diff",
+        conflicts_with_all = ["diff", "foreground", "dev_container"],
         verbatim_doc_comment
     )]
     review: Option<String>,
@@ -781,12 +781,16 @@ fn run() -> Result<()> {
 
                 tx.send(open_request)?;
 
+                let mut pinged = false;
                 while let Ok(response) = rx.recv() {
                     match response {
-                        CliResponse::Ping => {}
+                        CliResponse::Ping => pinged = true,
                         CliResponse::Stdout { message } => println!("{message}"),
                         CliResponse::Stderr { message } => eprintln!("{message}"),
                         CliResponse::Exit { status } => {
+                            if is_review {
+                                review::check_exit(pinged, status)?;
+                            }
                             exit_status.lock().replace(status);
                             return Ok(());
                         }

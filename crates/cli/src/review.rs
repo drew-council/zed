@@ -1,8 +1,8 @@
 //! `zed --review TARGET [REPO_DIR]`, sent to Zed as a `zed://review` link plus the repository's
 //! path (Zed checks the target and the repository).
 
-use anyhow::{Context as _, Result, bail};
-use std::path::Path;
+use anyhow::{Context as _, Result, anyhow, bail};
+use std::{io, path::Path};
 
 pub struct ReviewRequest {
     pub url: String,
@@ -29,6 +29,15 @@ pub fn request(target: Option<&str>, paths: &[String]) -> Result<Option<ReviewRe
     let Some(target) = target else {
         return Ok(None);
     };
+    if target.trim().is_empty() {
+        bail!(
+            "--review needs a TARGET: uncommitted, branch, branch:BASE, commit:REV, \
+             commits:A..B, pr:N, OWNER/REPO#N or a pull request URL"
+        );
+    }
+    if let Some(option) = paths.iter().skip(1).find(|path| path.starts_with('-')) {
+        bail!("Options must come before the repository path (got {option})");
+    }
     let repo_dir = match paths {
         [] => std::env::current_dir().context("Couldn't read the current directory")?,
         [path] => Path::new(path).to_path_buf(),
@@ -36,7 +45,10 @@ pub fn request(target: Option<&str>, paths: &[String]) -> Result<Option<ReviewRe
     };
     let repo_dir = repo_dir
         .canonicalize()
-        .with_context(|| format!("{} doesn't exist", repo_dir.display()))?;
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => anyhow!("{} doesn't exist", repo_dir.display()),
+            _ => anyhow!("{}: {error}", repo_dir.display()),
+        })?;
     if !repo_dir.is_dir() {
         bail!("{} isn't a directory", repo_dir.display());
     }
@@ -48,6 +60,16 @@ pub fn request(target: Option<&str>, paths: &[String]) -> Result<Option<ReviewRe
         url: review_url(&repo_dir, target),
         repo_dir,
     }))
+}
+
+/// Zed answers a `--review` request with a ping before anything else. A Zed that doesn't know
+/// `--review` (still running after an update) takes the link for an unknown URL and exits with
+/// 0 at once, which would look like a submitted review.
+pub fn check_exit(pinged: bool, status: i32) -> Result<()> {
+    if !pinged && status == 0 {
+        bail!("This Zed doesn't support --review: restart Zed after updating it");
+    }
+    Ok(())
 }
 
 fn review_url(repo_dir: &str, target: &str) -> String {
@@ -121,6 +143,20 @@ mod tests {
             error(Some("uncommitted"), &[&path, &path]),
             "--review takes one repository path"
         );
+        assert_eq!(
+            error(Some("pr:1"), &[&path, "--wait"]),
+            "Options must come before the repository path (got --wait)"
+        );
+        assert_eq!(
+            error(Some("uncommitted"), &[&path, "-n"]),
+            "Options must come before the repository path (got -n)"
+        );
+        for blank in ["", "  "] {
+            assert!(
+                error(Some(blank), &[&path]).starts_with("--review needs a TARGET: uncommitted"),
+                "{blank:?}"
+            );
+        }
         let missing = format!("{path}/missing");
         assert_eq!(
             error(Some("uncommitted"), &[&missing]),
@@ -131,6 +167,24 @@ mod tests {
         assert_eq!(
             error(Some("uncommitted"), &[&file]),
             format!("{file} isn't a directory")
+        );
+        // A file in the way of a path's directory.
+        let below_file = format!("{file}/x");
+        assert!(
+            error(Some("uncommitted"), &[&below_file]).starts_with(&format!("{below_file}: ")),
+            "{}",
+            error(Some("uncommitted"), &[&below_file])
+        );
+    }
+
+    #[test]
+    fn test_check_exit() {
+        assert!(check_exit(true, 0).is_ok());
+        assert!(check_exit(true, 2).is_ok());
+        assert!(check_exit(false, 1).is_ok());
+        assert_eq!(
+            check_exit(false, 0).unwrap_err().to_string(),
+            "This Zed doesn't support --review: restart Zed after updating it"
         );
     }
 }
