@@ -220,8 +220,11 @@ fn resolved_commit(revision: &str, object: Option<String>, commit: Option<String
     if let Some(oid) = commit.as_deref().and_then(|sha| sha.parse::<Oid>().ok()) {
         return Ok(oid);
     }
-    let is_ambiguous =
-        |answer: &Option<String>| answer.as_deref().is_some_and(|answer| answer.ends_with(" ambiguous"));
+    let is_ambiguous = |answer: &Option<String>| {
+        answer
+            .as_deref()
+            .is_some_and(|answer| answer.ends_with(" ambiguous"))
+    };
     if is_ambiguous(&object) || is_ambiguous(&commit) {
         bail!("Ambiguous revision {revision}");
     }
@@ -619,7 +622,9 @@ async fn build_snapshot_files(
             continue;
         }
         let (worktree_id, path) = cx
-            .update(|cx| project_path_for_repo_path(repo.read(cx), project.read(cx), &repo_path, cx))
+            .update(|cx| {
+                project_path_for_repo_path(repo.read(cx), project.read(cx), &repo_path, cx)
+            })
             .context("the project has no worktrees")?;
         let is_deleted = texts.new.is_none();
         let is_binary = texts.old.as_deref().is_some_and(is_binary_content)
@@ -1082,7 +1087,10 @@ mod tests {
         review_commits(C2, cx);
         let review = active_review(&workspace, cx);
         assert!(is_snapshot(&review, cx));
-        assert_eq!(excerpt_paths(&review, cx), ["latin1.txt", "lib.rs", "x.txt"]);
+        assert_eq!(
+            excerpt_paths(&review, cx),
+            ["latin1.txt", "lib.rs", "x.txt"]
+        );
         let text = rhs_editor(&review, cx).read_with(cx, |editor, cx| editor.text(cx));
         assert!(text.contains("caf\u{fffd}"), "{text:?}");
         assert!(!text.contains("binary file"), "{text:?}");

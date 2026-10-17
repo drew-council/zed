@@ -1151,8 +1151,9 @@ impl ReviewView {
             .update(cx, |diff, cx| diff.set_branch_base(base, cx));
         self.update_session(window, cx);
         let branch = branch_name(&self.repo, cx);
-        self.top_block
-            .update(cx, |top_block, cx| top_block.set_branch(branch, base_name, cx));
+        self.top_block.update(cx, |top_block, cx| {
+            top_block.set_branch(branch, base_name, cx)
+        });
         cx.emit(EditorEvent::TitleChanged);
         cx.notify();
     }
@@ -1333,27 +1334,30 @@ impl ReviewView {
         let workspace = self.workspace.clone();
         // Opening activates another item, which calls back into this one.
         window
-            .spawn(cx, async move |cx| {
-                let item = workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.open_path(project_path, None, true, window, cx)
-                    })?
-                    .await?;
-                if let Some(editor) = item.downcast::<Editor>() {
-                    editor.update_in(cx, |editor, window, cx| {
-                        let max_row = editor.buffer().read(cx).snapshot(cx).max_point().row;
-                        let point = Point::new(row.min(max_row), 0);
-                        editor.change_selections(
-                            SelectionEffects::scroll(Autoscroll::center()),
-                            window,
-                            cx,
-                            |selections| selections.select_ranges([point..point]),
-                        );
-                    })?;
+            .spawn(cx, {
+                let workspace = workspace.clone();
+                async move |cx| {
+                    let item = workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.open_path(project_path, None, true, window, cx)
+                        })?
+                        .await?;
+                    if let Some(editor) = item.downcast::<Editor>() {
+                        editor.update_in(cx, |editor, window, cx| {
+                            let max_row = editor.buffer().read(cx).snapshot(cx).max_point().row;
+                            let point = Point::new(row.min(max_row), 0);
+                            editor.change_selections(
+                                SelectionEffects::scroll(Autoscroll::center()),
+                                window,
+                                cx,
+                                |selections| selections.select_ranges([point..point]),
+                            );
+                        })?;
+                    }
+                    anyhow::Ok(())
                 }
-                anyhow::Ok(())
             })
-            .detach_and_log_err(cx);
+            .detach_and_notify_err(workspace, window, cx);
     }
 
     /// Both sides switch between wrapping and not wrapping together. Zed's own toggle would fall

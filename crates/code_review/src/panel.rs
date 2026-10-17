@@ -23,10 +23,11 @@ use ui::{
     CommonAnimationExt as _, ContextMenu, IndentGuideColors, ListItem, ListItemSpacing,
     PopoverMenu, Tooltip, prelude::*,
 };
+use util::ResultExt as _;
 use workspace::{
     Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
-    notifications::NotificationId,
+    notifications::{NotificationId, NotifyTaskExt as _},
 };
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
@@ -859,14 +860,14 @@ impl ReviewPanel {
                         ToggleFileReviewed.boxed_clone(),
                     )
                     .entry("Open File", None, move |window, cx| {
-                        if let Some(project_path) = project_path.clone() {
-                            workspace
+                        if let Some(project_path) = project_path.clone()
+                            && let Some(open) = workspace
                                 .update(cx, |workspace, cx| {
-                                    workspace
-                                        .open_path(project_path, None, true, window, cx)
-                                        .detach_and_log_err(cx);
+                                    workspace.open_path(project_path, None, true, window, cx)
                                 })
-                                .ok();
+                                .log_err()
+                        {
+                            open.detach_and_notify_err(workspace.clone(), window, cx);
                         }
                     })
                     .entry("Copy Relative Path", None, move |_, cx| {

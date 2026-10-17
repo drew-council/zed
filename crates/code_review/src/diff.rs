@@ -35,7 +35,9 @@ use settings::Settings as _;
 use std::{collections::BTreeMap, sync::Arc};
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
-use workspace::{CloseActiveItem, Item as _, ItemNavHistory, Workspace};
+use workspace::{
+    CloseActiveItem, Item as _, ItemNavHistory, Toast, Workspace, notifications::NotificationId,
+};
 
 /// Loading every changed file at once makes the first one land no sooner than the
 /// last, leaving a large diff on a spinner. Throughput flattens past this point.
@@ -198,6 +200,7 @@ pub struct ReviewDiff {
     empty_label: SharedString,
     /// Replaces `empty_label` while every file is hidden.
     all_hidden_label: Option<SharedString>,
+    workspace: WeakEntity<Workspace>,
     refresh_task: Task<Result<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -214,6 +217,7 @@ impl ReviewDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let source = DiffSource::new(target, repo, project.clone(), commits, cx);
+        let workspace_handle = workspace.downgrade();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -287,6 +291,7 @@ impl ReviewDiff {
             focus_handle: cx.focus_handle(),
             empty_label: target.empty_label(),
             all_hidden_label: None,
+            workspace: workspace_handle,
             refresh_task: Task::ready(Ok(())),
             _subscriptions: subscriptions,
         };
@@ -906,30 +911,62 @@ impl ReviewDiff {
         }))
         .buffered(MAX_CONCURRENT_BUFFER_LOADS);
 
+        let mut failed_loads = Vec::new();
         while let Some((path_key, repo_path, file_status, loaded)) = loads.next().await {
             // Buffered loads can already be complete when we poll them, in which
             // case this loop never awaits and starves the foreground thread.
             yield_now().await;
-            if let Some(loaded) = loaded.log_err() {
-                cx.update(|window, cx| {
-                    this.update(cx, |this, cx| {
-                        this.register_buffer(
-                            repo_path,
-                            path_key,
-                            file_status,
-                            loaded.display_buffer,
-                            loaded.diff,
-                            window,
-                            cx,
-                        );
-                    })
-                    .ok();
-                })?;
+            match loaded {
+                Ok(loaded) => {
+                    cx.update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.register_buffer(
+                                repo_path,
+                                path_key,
+                                file_status,
+                                loaded.display_buffer,
+                                loaded.diff,
+                                window,
+                                cx,
+                            );
+                        })
+                        .log_err();
+                    })?;
+                }
+                Err(error) => {
+                    log::error!("loading {repo_path:?} for a review: {error:#}");
+                    failed_loads.push((repo_path, error));
+                }
             }
         }
-        this.update(cx, |_, cx| cx.notify())?;
+        this.update(cx, |this, cx| {
+            this.show_failed_loads(&failed_loads, cx);
+            cx.notify()
+        })?;
 
         Ok(())
+    }
+
+    /// A file that fails to load would otherwise just be missing from the review.
+    fn show_failed_loads(
+        &self,
+        failed_loads: &[(RepoPath, anyhow::Error)],
+        cx: &mut Context<Self>,
+    ) {
+        let Some((repo_path, error)) = failed_loads.first() else {
+            return;
+        };
+        let path = repo_path.as_unix_str();
+        let message = match failed_loads.len() {
+            1 => format!("Couldn't load {path} for the review: {error:#}"),
+            count => format!("Couldn't load {count} files for the review, e.g. {path}: {error:#}"),
+        };
+        let id = NotificationId::composite::<Self>(("review-load-failed", cx.entity_id()));
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(Toast::new(id, message), cx)
+            })
+            .log_err();
     }
 
     pub fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {

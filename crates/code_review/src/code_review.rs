@@ -11,12 +11,10 @@ mod target;
 mod top_block;
 mod view;
 
-use anyhow::Context as _;
 use gpui::{Action, App, KeyBinding, actions};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{KeybindSource, KeymapFile, KeymapFileLoadResult};
-use util::ResultExt as _;
 use workspace::Workspace;
 
 pub use diff::ReviewDiff;
@@ -148,34 +146,53 @@ pub fn init(cx: &mut App) {
 
 /// Bindings from `assets/keymaps/code_review.json`, loaded after the base keymap.
 pub fn key_bindings(cx: &App) -> Vec<KeyBinding> {
-    parse_keymap(KEYMAP, KeybindSource::Default, cx)
-        .context("loading keymaps/code_review.json")
-        .log_err()
-        .unwrap_or_default()
+    load_keymap(
+        KEYMAP,
+        "keymaps/code_review.json",
+        KeybindSource::Default,
+        cx,
+    )
 }
 
 /// Bindings from `assets/keymaps/code_review_vim.json`. They override vim's own bindings, so they
 /// must be loaded right after `keymaps/vim.json`, under the same vim/helix mode condition.
 pub fn vim_key_bindings(cx: &App) -> Vec<KeyBinding> {
-    parse_keymap(VIM_KEYMAP, KeybindSource::Vim, cx)
-        .context("loading keymaps/code_review_vim.json")
-        .log_err()
-        .unwrap_or_default()
+    load_keymap(
+        VIM_KEYMAP,
+        "keymaps/code_review_vim.json",
+        KeybindSource::Vim,
+        cx,
+    )
 }
 
-fn parse_keymap(content: &str, source: KeybindSource, cx: &App) -> anyhow::Result<Vec<KeyBinding>> {
-    match KeymapFile::load(content, cx) {
-        KeymapFileLoadResult::Success { mut key_bindings } => {
-            for key_binding in &mut key_bindings {
-                key_binding.set_meta(source.meta());
-            }
-            Ok(key_bindings)
-        }
-        KeymapFileLoadResult::SomeFailedToLoad { error_message, .. } => {
-            anyhow::bail!("{error_message}")
-        }
-        KeymapFileLoadResult::JsonParseFailure { error } => Err(error),
+/// One binding that fails to load (say, an action upstream renamed) mustn't take the others with
+/// it: the bindings that block insert mode in the review would go too.
+fn load_keymap(content: &str, name: &str, source: KeybindSource, cx: &App) -> Vec<KeyBinding> {
+    let (key_bindings, error) = parse_keymap(content, source, cx);
+    if let Some(error) = error {
+        log::error!("loading {name}: {error:#}");
     }
+    key_bindings
+}
+
+/// The bindings that loaded, and why the others didn't.
+fn parse_keymap(
+    content: &str,
+    source: KeybindSource,
+    cx: &App,
+) -> (Vec<KeyBinding>, Option<anyhow::Error>) {
+    let (mut key_bindings, error) = match KeymapFile::load(content, cx) {
+        KeymapFileLoadResult::Success { key_bindings } => (key_bindings, None),
+        KeymapFileLoadResult::SomeFailedToLoad {
+            key_bindings,
+            error_message,
+        } => (key_bindings, Some(anyhow::anyhow!("{error_message}"))),
+        KeymapFileLoadResult::JsonParseFailure { error } => (Vec::new(), Some(error)),
+    };
+    for key_binding in &mut key_bindings {
+        key_binding.set_meta(source.meta());
+    }
+    (key_bindings, error)
 }
 
 #[cfg(test)]
@@ -239,9 +256,9 @@ pub(crate) mod test_support {
                 cx.bind_keys(key_bindings);
             };
             load_asset("keymaps/default-linux.json", KeybindSource::Default, cx);
-            cx.bind_keys(parse_keymap(KEYMAP, KeybindSource::Default, cx).unwrap());
+            cx.bind_keys(key_bindings(cx));
             load_asset("keymaps/vim.json", KeybindSource::Vim, cx);
-            cx.bind_keys(parse_keymap(VIM_KEYMAP, KeybindSource::Vim, cx).unwrap());
+            cx.bind_keys(vim_key_bindings(cx));
         });
     }
 
@@ -719,16 +736,35 @@ mod tests {
 
     #[gpui::test]
     fn test_keymaps_load_without_errors(cx: &mut TestAppContext) {
-        // Unknown action names fail the whole keymap, so vim's actions must be registered.
+        // Unknown action names are errors, so vim's actions must be registered.
         test_support::init_vim_test(cx, settings::DiffViewStyle::Unified);
         cx.update(|cx| {
-            parse_keymap(KEYMAP, KeybindSource::Default, cx).unwrap();
-            let vim_bindings = parse_keymap(VIM_KEYMAP, KeybindSource::Vim, cx).unwrap();
+            let (_, error) = parse_keymap(KEYMAP, KeybindSource::Default, cx);
+            assert!(error.is_none(), "{error:?}");
+            let (vim_bindings, error) = parse_keymap(VIM_KEYMAP, KeybindSource::Vim, cx);
+            assert!(error.is_none(), "{error:?}");
             assert!(
                 vim_bindings
                     .iter()
                     .any(|binding| binding.action().name() == "code_review::FocusPanel")
             );
+        });
+    }
+
+    #[gpui::test]
+    fn test_a_bad_binding_keeps_the_others(cx: &mut TestAppContext) {
+        test_support::init_vim_test(cx, settings::DiffViewStyle::Unified);
+        cx.update(|cx| {
+            let keymap = r#"[
+                {
+                    "context": "CodeReview > Editor",
+                    "bindings": { "] f": "code_review::NextFile", "] q": "vim::NoSuchAction" }
+                }
+            ]"#;
+            let (bindings, error) = parse_keymap(keymap, KeybindSource::Vim, cx);
+            assert!(error.is_some());
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].action().name(), "code_review::NextFile");
         });
     }
 }
