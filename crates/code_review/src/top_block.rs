@@ -38,6 +38,8 @@ pub(crate) struct ReviewTopBlock {
     scroll_handle: ScrollHandle,
     comments_scroll_handle: ScrollHandle,
     hovered_link: HoveredLink,
+    /// The URL of the review posted from Zed that the description block last scrolled to.
+    revealed_review: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -91,14 +93,18 @@ impl ReviewTopBlock {
             cx.observe(&diff, |_, _, cx| cx.notify()),
             cx.observe(&comments, |_, _, cx| cx.notify()),
         ];
+        let mut revealed_review = None;
         if let TopBlockContent::PullRequest {
             state: Some(state), ..
         } = &content
         {
             subscriptions.push(cx.observe(state, |this, _, cx| {
                 this.sync_pull_request_markdown(cx);
+                this.reveal_posted_review(cx);
                 cx.notify();
             }));
+            // A tab opened after a review was posted starts at the description.
+            revealed_review = state.read(cx).posted_review_url().cloned();
         }
         // A pull request's description is what the review is about; commit messages stay out
         // of the way until asked for.
@@ -114,6 +120,7 @@ impl ReviewTopBlock {
             scroll_handle: ScrollHandle::new(),
             comments_scroll_handle: ScrollHandle::new(),
             hovered_link: HoveredLink::default(),
+            revealed_review,
             _subscriptions: subscriptions,
         };
         this.sync_pull_request_markdown(cx);
@@ -155,6 +162,38 @@ impl ReviewTopBlock {
             };
             self.markdown.insert(key, markdown);
         }
+    }
+
+    /// Once the review just posted from Zed is loaded, scrolls the description block to its
+    /// summary: it comes last, below a description that can fill the block's 8 lines.
+    fn reveal_posted_review(&mut self, cx: &mut Context<Self>) {
+        let TopBlockContent::PullRequest {
+            state: Some(state), ..
+        } = &self.content
+        else {
+            return;
+        };
+        let state = state.read(cx);
+        let Some(url) = state.posted_review_url() else {
+            return;
+        };
+        if self.revealed_review.as_ref() == Some(url) {
+            return;
+        }
+        let Some(index) = state
+            .visible_summaries()
+            .position(|summary| &summary.url == url)
+        else {
+            return;
+        };
+        // After the description and the "Reviews" label.
+        self.scroll_handle.scroll_to_item(2 + index);
+        self.revealed_review = Some(url.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn description_scroll_offset(&self) -> Pixels {
+        self.scroll_handle.offset().y
     }
 
     #[cfg(test)]

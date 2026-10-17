@@ -76,6 +76,8 @@ pub struct PullRequestState {
     review_event: ReviewEvent,
     /// The threads loaded since the last review was posted: the posted drafts are among them.
     threads_include_submitted: bool,
+    /// The URL of the last review posted from Zed, whose summary the top block scrolls to.
+    posted_review_url: Option<SharedString>,
     _load_task: Task<()>,
     /// Owned here, not by the submit modal: closing the modal (or every tab) mustn't cancel a
     /// review GitHub may already be making.
@@ -203,6 +205,7 @@ impl PullRequestState {
                 uncertain_submit: None,
                 review_event: ReviewEvent::Comment,
                 threads_include_submitted: false,
+                posted_review_url: None,
                 _load_task: Task::ready(()),
                 _submit_task: Task::ready(()),
             };
@@ -321,6 +324,10 @@ impl PullRequestState {
     /// drafts needn't be listed next to them.
     pub(crate) fn threads_include_submitted(&self) -> bool {
         self.threads_include_submitted
+    }
+
+    pub(crate) fn posted_review_url(&self) -> Option<&SharedString> {
+        self.posted_review_url.as_ref()
     }
 
     /// Loads the details, threads, summaries and GitHub's diff again (on request, after a
@@ -641,6 +648,7 @@ impl PullRequestState {
         });
         self.review_event = ReviewEvent::Comment;
         self.threads_include_submitted = false;
+        self.posted_review_url = Some(url.clone());
         self.reload(cx);
         let toast = Toast::new(
             NotificationId::unique::<ReviewSubmittedToast>(),

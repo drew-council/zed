@@ -1373,7 +1373,9 @@ mod tests {
 mod review_tests {
     use super::*;
     use crate::{
-        github::test_support::{PR1_DETAILS, PR1_HEAD, PR1_HEAD_OID, Reply, SentRequest},
+        github::test_support::{
+            PR1_DETAILS, PR1_HEAD, PR1_HEAD_OID, PR1_SUMMARIES, Reply, SentRequest,
+        },
         pull_request::tests::review::{
             Fixture, has_open_comment_editor, notification_count, open_review, requests_of,
         },
@@ -1463,20 +1465,45 @@ mod review_tests {
     /// GitHub) and tells whoever waits for the review.
     #[gpui::test]
     async fn test_submit_a_pull_request_review(cx: &mut TestAppContext) {
-        let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> =
-            Arc::new(|request| match request.operation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Once posted, the review's summary comes last among the pull request's reviews.
+        let posted_review = Arc::new(AtomicBool::new(false));
+        let summaries_with_posted_review = {
+            let mut summaries: serde_json::Value = serde_json::from_str(PR1_SUMMARIES).unwrap();
+            summaries["data"]["repository"]["pullRequest"]["reviews"]["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": "PRR_9",
+                    "state": "COMMENTED",
+                    "body": "Overall",
+                    "submittedAt": "2026-10-17T12:00:00Z",
+                    "url": format!("{PR1_URL}#pullrequestreview-9"),
+                    "author": { "__typename": "User", "login": "drew-council" },
+                }));
+            summaries.to_string()
+        };
+        let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> = Arc::new({
+            let posted_review = posted_review.clone();
+            move |request| match request.operation() {
                 Some("PullRequestHead") => Some(Reply::json(PR1_HEAD)),
                 Some("AddFileThread") => Some(Reply::json(
                     r#"{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_new"}}}}"#,
                 )),
+                Some("ReviewSummaries") if posted_review.load(Ordering::SeqCst) => {
+                    Some(Reply::json(summaries_with_posted_review.clone()))
+                }
                 None if request.uri.ends_with("/pulls/1/reviews/9/events") => {
+                    posted_review.store(true, Ordering::SeqCst);
                     Some(review_reply(9, "COMMENTED"))
                 }
                 None if request.uri.ends_with("/pulls/1/reviews") => {
                     Some(review_reply(9, "PENDING"))
                 }
                 _ => None,
-            });
+            }
+        });
         let fixture = Fixture {
             respond: Some(respond),
             ..Fixture::default()
@@ -1490,6 +1517,11 @@ mod review_tests {
         let session = review.read_with(cx, |review, _| review.session().clone());
         let mut outcome = session.update(cx, |session, _| session.wait_for_outcome());
         let threads_loaded = requests_of(&requests, "ReviewThreads");
+        let top_block = review.read_with(cx, |review, _| review.top_block().clone());
+        let description_scroll_offset = |cx: &mut VisualTestContext| {
+            top_block.read_with(cx, |top_block, _| top_block.description_scroll_offset())
+        };
+        assert_eq!(description_scroll_offset(cx), px(0.));
 
         cx.simulate_keystrokes("; s");
         let modal = modal(&review, cx).expect("the submit modal opens");
@@ -1584,6 +1616,9 @@ mod review_tests {
         let rows = review.read_with(cx, |review, cx| review.panel_comments(cx));
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|row| row.remote), "{:?}", rows.len());
+        // The description block, capped below the long description, scrolls to the posted
+        // review's summary (R2).
+        assert!(description_scroll_offset(cx) < px(0.));
 
         // Nothing is left to submit: a comment review then needs a body.
         cx.simulate_keystrokes("; s");
