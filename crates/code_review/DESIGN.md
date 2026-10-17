@@ -20,8 +20,9 @@ code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part
 persistence, panel list" with the M5 part 1 review fixes) and M6 (export, see "Milestone 6"); M7 in
 progress: slice (a), the GitHub client (see "Milestone 7, slice (a)"), is done, followed by a second
 hardening pass over the M5 part 2 + M6 review (see "Hardening 2"), then slice (b), pull request
-reviews from the picker with checkout in place or in a new worktree (see "Milestone 7, slice (b)");
-slices (c) description + threads and (d) submit are next.** The
+reviews from the picker with checkout in place or in a new worktree (see "Milestone 7, slice (b)"),
+and slice (c), the pull request's description and its review threads read-only in the diff, with
+GitHub's comment gate (see "Milestone 7, slice (c)"); slice (d) submit is next.** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
@@ -42,9 +43,11 @@ deleted and navigated with `i`/`Enter`, `dd` and `]t`/`[t`/`m`/`M`; they are sto
 review, follow the code while the review is open and are flagged outdated when their lines changed
 while it was closed. `y` copies the review as Markdown in tuicr's format, `Y` the comment at the
 cursor, visual `y` the selected lines. A GitHub client resolves a checkout's GitHub repository (a
-fork's parent), lists and reads its pull requests, threads, reviews and commentable lines; so far
-the picker lists pull requests and a pull request review shows one line about the pull request.
-Next: M7 slices (c)–(d), then M8 (CLI).
+fork's parent), lists and reads its pull requests, threads, reviews and commentable lines; the
+picker lists pull requests; a pull request review shows the description and review summaries in its
+top block, the existing review threads read-only below their lines (resolved, outdated and bot
+threads hidden by default, with toggles), and only takes comments on lines inside GitHub's diff
+hunks. Next: M7 slice (d) (submit), then M8 (CLI).
 
 What exists:
 
@@ -56,25 +59,26 @@ What exists:
 | `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange), PullRequest(PullRequestTarget)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI), `PullRequestReference` + `parse_pull_request_reference` (M8 reuses it), `validate_branch_name` (forge branch names) |
 | `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `check_branch_base`, `resolve_commits`) |
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
-| `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
+| `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks, the `CommentStore` and the `CommentGate` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
 | `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
-| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment blocks on both sides of the diff (`reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch) with the outdated check, deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
+| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch) with the outdated check, deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
+| `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location` |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
 | `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`), the `Forge` trait, `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
 | `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup and cache, `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache; `test_support` (fake GitHub `HttpClient`, fixtures) and tests, an ignored live test |
-| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point M8 calls), the in-place flow, `plan_worktree` and the new-worktree flow |
+| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point M8 calls), the in-place flow, `plan_worktree` and the new-worktree flow. M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment`/`check_comment_target` (the gate); PR review GPUI tests |
 | `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, the pure `plan_checkout` and `head_remote`, `run_checkout` (Zed's fetch and branch switch, plus our own git runner `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
 | `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
 | `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header checkbox, `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
-| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, the commit messages (collapsible), or the pull request line (slice (c) makes it the description block); then the review-level comments; commit tab titles |
+| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
 | `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll |
 | `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the single-file bar, the panel's read API (`panel_files`, `summary`); GPUI tests |
-| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu, empty states; workspace-level filter/copy actions; GPUI tests |
+| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); GPUI tests |
 | `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
@@ -817,19 +821,138 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   making rows uneven, a stale error toast after a successful retry, "entity released" when the
   worktree's workspace replaced the source one.
 
+**Milestone 7, slice (c) (description block, read-only threads, comment gate)** —
+`plans/M7-github-v2.md` §4 with LV §5.5 unless noted. No upstream file changed, no new dependency:
+
+- **Loading** (`PullRequestState`, one per review key, shared by the pull request's tabs, also a
+  `pr-N` worktree's): the open flow's `set` stores forge + fresh details and loads threads, summaries
+  and GitHub's files (`CommentableLines`) as concurrent background requests; `reload` (palette
+  `ReloadPullRequest`, the top block's Reload button, every tab's `HeadChanged`; a new load cancels
+  the running one) loads the details too. A part that fails keeps what was loaded before, and its
+  hint (deduplicated) shows in red in the top block; the review itself never fails.
+  `PullRequestEvent::{Loaded, FiltersChanged}`. **After a `GitHubError::Auth`** the forge is resolved
+  again (`resolve_forge` with the canonical repository as reference, which looks the token up again)
+  and the load retried once at once; if that fails too, the next load resolves first. Decision: a
+  reload doesn't move the tab's base (`details.base_oid` may differ from the target's base until the
+  pull request is reopened, whose checkout fetches the base: a reload has no fetch, so the new base
+  might not exist locally).
+- **Top block** (expanded by default for pull requests, `ToggleHeader`/disclosure collapses it):
+  header = disclosure, title, `#N`, Draft/Closed/Merged badge, "‹author› wants to merge ‹head› into
+  ‹base›", review decision badge, Open on GitHub; warnings "Checked out ‹local7›, pull request head
+  ‹pr7›" and "You have a pending review on GitHub" (C5). Expanded: the URL (a button), then **one
+  scroll area of 12 lines** (deviation from the plan's 16: the diff kept too little room in a
+  1000-pixel window) with the markdown description ("No description provided." when empty) and the
+  review summaries ("Reviews": author · state · relative time, markdown; bots hidden, "N bot reviews
+  hidden"), then "Show: ☐ Resolved threads (n) ☐ Outdated threads (n) ☐ Bots (n)", "Loading from
+  GitHub…", Reload, and the load errors. Then M5's review comments, as before.
+- **Filters** (`ThreadFilters`, on `PullRequestState`: all tabs of the pull request, not persisted;
+  all off by default): resolved, outdated, and bots (**bot threads and bot review summaries behind
+  one toggle**, user decision). Workspace actions `ToggleResolvedThreads`, `ToggleOutdatedThreads`,
+  `ToggleBotReviews` (the current review, like the file filters; a non-PR review shows "Open a pull
+  request review first"), the top block's checkboxes, and toggles in the panel's menu.
+- **Placement** (pure `place_thread`, per tab with the tab's repository HEAD): hidden by the filters →
+  nothing; `FILE` → at the file (above its first row, like a file comment); `Outdated` (null line),
+  or a line thread whose first comment's commit isn't the checked-out HEAD (C7: another branch
+  checked out, the pull request moved on, or a comment made on an older commit) → the file's
+  **"Outdated / moved threads (N)" block** at the file (one block per file, after the file's other
+  threads), each thread labelled "Originally line 223 at 5c5cdf4" / "Line 134 at abc1234"; an unknown
+  HEAD or commit counts as the same. Line threads: `Line{side, n}` → lines `n..=n` on that side
+  (LEFT = `Side::Old`, the base's numbering, i.e. the diff base buffer); a same-side range →
+  `start..=line` ("Lines 20–25"); a LEFT→RIGHT range sits below its end row ("Old line 191 – line
+  195"). **Renamed files**: the local diff has no rename detection (old path deleted, new path
+  added), so LEFT threads go under the old path and RIGHT/file threads under the new one, whichever
+  path the thread has (`CommentableLines::file` finds both).
+- **Hosting** (`CommentBlocks`, per tab): `hosted` is keyed by `ItemKey::{Remote(RemoteKey::{Thread(id),
+  Moved(path)}), Comment(id)}` and blocks carry an `AnyView`; `set_remote_items` replaces the tab's
+  thread items (views kept for unchanged threads). **Thread anchors are per tab**
+  (`RemoteBlock.anchor`, never on `PullRequestState`): made from the line numbers the first time
+  `update_anchors` sees the file's buffer of that side, they follow edits like comments' and are made
+  again when the buffer is replaced; lines past the end of the local file aren't shown. Placement,
+  re-hosting on split toggles, folds, filters and single-file mode are the comments' code
+  (`placement` takes a `CommentTarget` now). Threads come before comments at the same place (block
+  priority: the item order; comments `1 << 20` + id).
+- **Thread card** (`RemoteThreadView`, no editing actions): GitHub icon, RESOLVED/OUTDATED badges,
+  location (nothing for a single new line), Open on GitHub (`comments[0].url`), then per comment
+  author (BOT badge) · relative time and the markdown body (GitHub `suggestion` blocks render as code
+  blocks), replies separated by a rule, "…N more comments on GitHub" past the 100 fetched; the focused
+  border when it is the item at the cursor.
+- **Keys**: `]t`/`[t`/`m`/`M` include threads (and moved blocks), in diff order with comments (a
+  thread before a comment at the same place); the panel lists them. `i`/`Enter`/`dd` act on the
+  review's own comment at the cursor row (threads never count, also after `]t` landed on one): `i` on
+  a thread-only row does nothing, `Enter` moves down, `dd` says "Threads on GitHub can't be changed
+  in the review". `Y` copies a thread's first comment.
+- **Panel**: one row per thread (a moved block's threads each get a row landing on the block): GitHub
+  icon, `path:line` (`~` old side; the path for file threads and moved ones), "‹author›: ‹first
+  line›", "resolved"/"outdated" (moved counts as outdated), tooltip "… (on GitHub)". The location
+  label keeps up to 60% of the row (comments' rows too: it was squeezed to "s…" by the first line).
+  Menu (pull request reviews): Show Resolved Threads / Show Outdated Threads / Show Bot Reviews,
+  Reload Pull Request, Open Pull Request in Browser, and Copy Pull Request URL after Copy Branch Name.
+- **Copy actions**: `CopyPullRequestUrl` (workspace action, palette + menu). `CopyBranchName` copies a
+  pull request's head branch in a pull request review (works detached, e.g. in a `pr-N` worktree).
+- **Gate**: `ReviewSession::comment_gate` (`CommentGate = Arc<dyn Fn(&CommentTarget, &App) ->
+  Result<(), SharedString>>`, shared by the review's tabs), set by a pull request tab (holding a weak
+  `PullRequestState`), checked in `CommentBlocks::add_comment` (the only place comments are made);
+  a refusal is an auto-hiding toast. `check_comment_target`: lines → `allows_range` with New=RIGHT,
+  Old=LEFT ("GitHub only accepts comments within its diff hunks"; a file without GitHub diff → "GitHub
+  shows no diff for this file, so it only takes a file comment"; a file not listed → "This file isn't
+  part of the pull request on GitHub", or when the list is truncated "GitHub didn't list this file's
+  diff (the pull request has too many files), so it only takes a file comment"); files →
+  `contains_file`; review comments always. Before GitHub's files load: "Loading the pull request's
+  diff from GitHub…"; after they failed: "The pull request's diff couldn't be loaded from GitHub:
+  reload the pull request to comment on its lines". Rows the local diff shows but GitHub doesn't
+  (expanded context, uncommitted changes, another checkout) are refused, as GitHub would.
+- **Export**: decision: `y` still exports only the review's own comments (drafts), never GitHub's
+  threads.
+- **Line cursor fix** (`line_cursor.rs`): focusing a side of a split diff directly (as `]t` to a
+  comment or thread on the other side does) only reaches the split editor during the window's focus
+  phase, when `notify` doesn't reach observers (`App::notify` → `invalidate_view` returns early while
+  drawing), so the highlight stayed on the other side's row. `LineCursor` now also syncs on the sides'
+  `EditorEvent::Focused`. This affected old-side comments since M5 part 2 too.
+- Tests: 7 new (127 total + 1 ignored): `place_thread` (every PR A thread, filters, moved, unknown
+  HEAD, renamed paths both sides, LEFT→RIGHT range, LEFT context), `thread_location`, the gate over PR A
+  and PR D files; GPUI with a fake GitHub and files shaped like PR A (`pull_request::tests::review`):
+  description/summaries/bot summary hidden, inline rows of each kind in unified view, every toggle,
+  `]t`/`[t` order and wrap, read-only `i`/`dd`/`Y`, panel rows, copy actions, reload; split view (the
+  LEFT thread on the left side, four split toggles, `]t` onto the left side with the line cursor);
+  401 on threads → forge resolved again + one retry, then recovery on reload; HEAD moved → line
+  threads into moved blocks and a reload; the gate (R100 refused with a toast, R59 and old L193
+  allowed, file and review comments, `i` on a row with a thread and a comment, export without
+  threads); the line cursor's direct-focus case. New GPUI tests stable under `ITERATIONS=5`. Clippy
+  clean.
+- **Live check (c)** (harness, PR A #1 read-only, HTTPS clone + `ZH_EXTRA_ENV` token; screenshots in
+  the orchestrator's `validation/M7c/`; nothing posted; leak grep clean twice): description with
+  headings, list, code block and blockquote, the "Initial pass…" summary and "1 bot review hidden";
+  split: file thread on docs/guide.md, engine.rs:134 with its reply, the LEFT thread "Old line 193" on
+  the left side; unified: the LEFT thread below the removed row, engine.rs:134; palette toggles →
+  strings.rs:48 RESOLVED, engine.rs "Outdated / moved threads (1)" with "Originally line 223 at
+  5c5cdf4", the bot summary and the filters.rs:38 bot thread (BOT badge, suggestion block), "Lines
+  20–25"; panel: 4 rows by default, 7 with every toggle, the menu's thread toggles (Show Bot Reviews off
+  → 6), clicking a row lands on its thread; `c` on engine.rs line 100 (context expanded up to it) →
+  "GitHub only accepts comments within its diff hunks"; `c` on line 59 (between local hunks, context
+  expanded) → editor (then `:q!`); `CopyPullRequestUrl` → `zh clip` = the PR URL, Copy Branch Name →
+  `feature/template-filters`. Found and fixed there: the line cursor staying on the right side after
+  `]t` to the left side (above), panel locations squeezed to "s…", the description area taking too
+  much height (16 → 12 lines). Not verified live: the auth-error re-resolution, the pending-review
+  warning and Closed/Merged badges (no such state on PR A), a HEAD switch moving threads (GPUI tests
+  cover them).
+
 **Known issues / notes for the next slices:**
 
-- **M7 hooks** (`plans/M7-github-v2.md` §6):
-  - Gate: `CommentBlocks::add_comment` is the only place comments are made; check a `CommentGate` there,
-    before `session.add_comment` (keep the gate on `ReviewSession` so every tab of the review shares it).
-    The target (`path`, `side`, `lines`, 1-based) is in `NewComment.target`.
-  - Placement: `placement()` / `line_row_anchor()` take a `Comment` and its anchor (the tab's
-    `LineAnchor.range`). For remote threads (line numbers, no anchors), make anchors like
-    `update_anchors` does (`side_buffer` + `line_anchor_and_text`) and keep them per tab too (never on
-    state shared by the review's tabs: another project's tab has other buffers, "Hardening 2"), then
-    reuse them. Generalize `hosted: HashMap<CommentId, HostedBlock>` to a key enum (`Comment(id) |
-    Remote(thread_id)`) carrying an `AnyView`; `reconcile`, `comment_order` and
-    `ReviewView::panel_comments` then include remote items.
+- **Notes for slice (d) (submit)**:
+  - `PullRequestState`: `details()` (head oid, state, `viewer_is_author`, `pending_review`, node id),
+    `commentable()` (for `plan_submission`'s `allows_range`/`current_path`), `check_comment(target)`
+    (the gate's messages), `reload()` (after a submit), `forge()` (re-resolved after auth errors by
+    `load`; a submit that gets `GitHubError::Auth` should do the same: `resolve_forge` with the
+    canonical repository as reference, see `PullRequestState::resolve_forge`). The preflight should
+    re-query `pull_request_head` (HeadStatus isn't stored).
+  - Old-side comments map to LEFT with old numbers; renamed files' old lines are under the old path
+    locally (no rename detection): submit them with `current_path` (the new path) and `side: LEFT`.
+  - After a submit, the drafts' threads come back from `reload` as remote threads; hide `Submitted`
+    comments inline then (`placement` → `None` for them) so they don't show twice.
+  - `CommentBlocks::show_toast` takes any `Into<SharedString>` now; `current_pull_request(workspace)`
+    (view.rs) is the helper for workspace-level PR actions (`SubmitReview` can use it; `; s` in the vim
+    normal block).
+- **M7 hooks** (`plans/M7-github-v2.md` §6), still open:
   - Submitted: `CommentState::Submitted` is stored; add `ReviewSession::mark_submitted(ids, review_id)`
     (set the state + `save_comment`). The export already skips submitted comments, the panel marks
     them, `begin_edit`/`confirm_delete` refuse them; hiding them inline is M7's call (`placement` →
@@ -866,9 +989,9 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
   in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 120 tests
-  + 1 ignored live GitHub test (after M7 slice b; 113 after hardening 2, 110 after M7 slice a, 89
-  after M6, stable under
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 127 tests
+  + 1 ignored live GitHub test (after M7 slice c; 120 after slice b, 113 after hardening 2, 110 after
+  M7 slice a, 89 after M6, stable under
   `ITERATIONS=5`; the hardening-2 comment tests under `ITERATIONS=10`).
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
   snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
@@ -879,21 +1002,13 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   keeps its last tree diff when a reload fails, so a base deleted (or HEAD switched to an unrelated
   branch) after a review opened shows the stale file list; the error label only replaces an empty
   list (the base is re-checked on `HeadChanged`).
-- **M7 slice (c) entry points** (from slice b): `PullRequestState` (`pull_request.rs`) is the per-key
-  shared state to extend (threads, summaries, commentable lines, head status, filters, `reload`); it is
-  set by the open flow before the tab opens and looked up by `ReviewView::new` (also for split
-  clones) — `ReviewView::pull_request()` exists (`#[cfg(test)]` so far: drop the cfg). After a
-  `GitHubError::Auth` the held `forge()` must be re-resolved (`resolve_forge(repo, Some(target repo
-  as ForgeRepoRef), …)`). `TopBlockContent::PullRequest { repo, number, state }` and
-  `ReviewTopBlock::render_pull_request` are the one-line placeholder: keep its "Checked out ‹local7›,
-  pull request head ‹pr7›" warning (it reads `ReviewView::head_sha`, the repository snapshot's
-  `head_commit`) in the description header. The `HeadChanged` arm for `PullRequest` in
-  `ReviewView::new` re-checks the base and retitles: add `reload` there. `ReviewView::title` is
-  "PR #N: ‹title›" (the plan's `#{n} {title}` with a prefix, as the slice brief asked).
-  `CopyPullRequestUrl` / "Copy Pull Request URL" in the panel menu are still to do (slice c), as are
-  the PR-specific view actions. A pull request tab follows HEAD: with another branch checked out it
-  shows that branch's changes since the base, with the warning (slice (c) should also mark threads
-  as moved then, C7).
+- Pull request tabs: `ReviewView::title` is "PR #N: ‹title›" (the plan's `#{n} {title}` with a prefix,
+  as the slice (b) brief asked). A pull request tab follows HEAD: with another branch checked out it
+  shows that branch's changes since the base, with the warning, and its line threads move to the
+  moved blocks (C7). The palette lists the pull request actions in every review (they toast "Open a
+  pull request review first" elsewhere). Thread line numbers count in HEAD's files: uncommitted edits
+  made before a file is first shown shift a thread off its line (anchors only follow edits made
+  afterwards).
 - Upstream behaviours seen in slice (b): Zed's `change_branch` splits `remote/branch` at the first
   `/` (remote names with `/` fail); a clone whose fetch refspec lacks the PR branch (single-branch)
   fails with "Branch 'origin/…' not found"; `create_worktree_workspace` creates a worktree for every
@@ -1186,7 +1301,7 @@ covers it), tuicr's `tuicr review` CLI protocol.
 
 ## 3. Architecture
 
-### 3.1 Crate layout (proposed; as of M7 slice (b) `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,view}.rs`, `export.rs`, `forge.rs`, `github.rs` + `github/queries.graphql`, `pull_request.rs`, `checkout.rs` exist too; `submit.rs`, `cli.rs` don't yet)
+### 3.1 Crate layout (proposed; as of M7 slice (c) `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,remote,view}.rs`, `export.rs`, `forge.rs`, `github.rs` + `github/queries.graphql`, `pull_request.rs`, `checkout.rs` exist too; `submit.rs`, `cli.rs` don't yet)
 
 ```
 crates/code_review/
