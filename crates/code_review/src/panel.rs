@@ -403,14 +403,22 @@ impl ReviewPanel {
                 .entries
                 .iter()
                 .position(|entry| entry.key() == key)
-                .or_else(|| {
-                    self.selected
-                        .map(|index| index.min(self.entries.len().saturating_sub(1)))
-                })
-                .filter(|_| !self.entries.is_empty()),
+                .or_else(|| self.nearest_selectable(self.selected?)),
             None => None,
         };
         cx.notify();
+    }
+
+    /// The selectable row closest to `index` (the earlier one of two as close), for a selection
+    /// whose row went away.
+    fn nearest_selectable(&self, index: usize) -> Option<usize> {
+        let index = index.min(self.entries.len().checked_sub(1)?);
+        (0..self.entries.len()).find_map(|distance| {
+            [index.checked_sub(distance), index.checked_add(distance)]
+                .into_iter()
+                .flatten()
+                .find(|candidate| self.is_selectable(*candidate))
+        })
     }
 
     fn flatten(
@@ -2129,5 +2137,21 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(comment_rows(cx).len(), 4);
         assert_eq!(comment_rows(cx)[0], "Comments (3)");
+
+        // When the selected row goes away, the selection moves to a row next to it, never to
+        // the heading.
+        dispatch(crate::ToggleHideReviewed, cx);
+        let last_file = names(&panel, cx)
+            .iter()
+            .position(|name| name.starts_with("modified.txt"))
+            .unwrap();
+        cx.simulate_keystrokes("; h g g");
+        for _ in 0..last_file {
+            cx.simulate_keystrokes("j");
+        }
+        assert!(selected(&panel, cx).starts_with("modified.txt"));
+        cx.simulate_keystrokes("r");
+        assert!(is_reviewed(&review, "modified.txt", cx));
+        assert!(selected(&panel, cx).starts_with("long.txt"));
     }
 }
