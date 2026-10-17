@@ -15,11 +15,12 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 
 ## 0. Status & how to resume
 
-**Status: implementation complete; final validation done, its FAILs being fixed.** Milestones 1–9
+**Status: implementation complete; final validation done and its findings fixed.** Milestones 1–9
 and polish A/B are done, and so is the final validation (`plans/FINAL-validation.md`,
 `validation/FINAL/` in the orchestrator's state dir). Fix 1 (slices A and B of
-`plans/FIX-final-validation.md`: every FAIL) is done (see "Fix 1"); slice C (cheap polish from the
-validators' observations) is next.
+`plans/FIX-final-validation.md`: every FAIL) and fix 2 (slice C plus the orchestrator's additions:
+the validators' cheap observations) are done (see "Fix 1" and "Fix 2"); what is left of the
+observations is under "Known issues".
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -86,7 +87,7 @@ What exists:
 | `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
 | `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch; polish B: each holds its buffer, and remembers where deleted lines were, `restored_lines`) with the outdated check (both ways since polish B), deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
-| `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered) |
+| `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered); fix 2: `github_markdown` (GitHub's `<details>`/`<summary>` tags dropped) |
 | `crates/code_review/src/submit.rs` | M7d: `comment_body`/`review_body` (`[TYPE] ` prefixes), `needs_body` (LV §5.1), `plan_review` → `PlannedReview` (the payload mapping, counts, outdated and refused drafts), `SubmitReviewModal` (events, blockers, warnings, body prompt; polish A: re-plans on every change, starts `PullRequestState::submit`/`check_uncertain_submit` and shows their reply, can't be dismissed while its submit runs), `finish_local_review`; payload/flow/modal tests |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
 | `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`; M7d: `ReviewEvent`, `ReviewSubmission`, `ReviewLineComment`/`ReviewFileComment`, `SubmittedReview`), the `Forge` trait (with `submit_review`), `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
@@ -322,7 +323,8 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   stay distinguishable; the gutter bars keep the kind. Repainted on mark/digest/excerpt/fold changes
   and LHS re-creation, always followed by `LineCursor::refresh` (newest highlight wins). The hunk
   control (`ReviewHunkRenderer`, replaces `HiddenUnstagedDiffHunkRenderer`) reads "Mark Reviewed" or
-  "✓ Reviewed" with the `R` binding.
+  "✓ Reviewed" with the `R` binding. It covers the end of long rows at the cursor, like Zed's own
+  hunk controls in the same place: kept as is (fix 2, orchestrator decision).
 - **`]c`/`[c`** (D8) → `code_review::NextHunk`/`PreviousHunk`: Zed's wrap-around, centered `GoToHunk`
   minus hunks of folded buffers (checked on the focused side); `[c` inside a hunk goes to its start.
 - **Folded headers vs vim**: a cursor on a folded header resolves (`newest()`, "wrapping blocks") to
@@ -886,8 +888,8 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   header = disclosure, title, `#N`, Draft/Closed/Merged badge, "‹author› wants to merge ‹head› into
   ‹base›", review decision badge, Open on GitHub; warnings "Checked out ‹local7›, pull request head
   ‹pr7›" and "You have a pending review on GitHub" (C5). Expanded: the URL (a button), then **one
-  scroll area of 12 lines** (deviation from the plan's 16: the diff kept too little room in a
-  1000-pixel window) with the markdown description ("No description provided." when empty) and the
+  scroll area of 8 lines** (deviation from the plan's 16: the diff kept too little room in a
+  1000-pixel window; 12 until fix 2, where it still took ~40% of such a window) with the markdown description ("No description provided." when empty) and the
   review summaries ("Reviews": author · state · relative time, markdown; bots hidden, "N bot reviews
   hidden"), then "Show: ☐ Resolved threads (n) ☐ Outdated threads (n) ☐ Bots (n)", "Loading from
   GitHub…", Reload, and the load errors. Then M5's review comments, as before.
@@ -1559,7 +1561,103 @@ in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs`
   keeps the focus. The relative line numbers after closing a clone (V2.O6) looked right in these
   runs. No new log errors.
 
+**Fix 2 (the final validation's observations: `plans/FIX-final-validation.md` slice C and the
+orchestrator's additions)** — upstream edits: one appended help paragraph in `crates/cli/src/main.rs`:
+
+- **File starts in view** (V4.O1, V3.O5, V5.O5). A file's comments and threads (and its "Outdated /
+  moved threads" block) sit between its header and its first row, under the sticky header when the
+  view's top is between them. Now the header goes to the top (`diff::file_start_autoscroll` /
+  `file_header_row`, when the header, the blocks and the row fit with the scroll margin) when:
+  landing on a file item (`]t`/`[t`/`m`/`M`, the panel's Enter/click: `land_on`); entering
+  single-file mode on the file's start (`; f`); a reload brings or changes a file's threads above
+  the cursor on its first row (`keep_file_start_in_view`); and any scroll that follows the cursor
+  (`ScrollPositionChanged { autoscroll: true }`: vim's `gg`, a diff reload after HEAD moves) leaves
+  the cursor on a file's first row with file blocks above it (`show_file_start_at_cursor`; it only
+  asks when the header isn't at the top already, so it settles). The root of the first-file case
+  (a PR opening on `docs/guide.md`'s file thread, V5's post-submit reload on `notes.md`): scrolled
+  to the very top, Zed's `set_scroll_position` anchors the view on the first file's first row (the
+  header is a block; `clip_point` has no earlier row), so blocks inserted above that row, and their
+  measured heights (inserted as 3 rows, measured in prepaint), push the header and themselves above
+  the top. A view at y = 0 is anchored on `Anchor::Min` instead (`keep_scroll_at_start`, on every
+  scroll event and around block insertion), which always resolves to the top.
+- **Visual `y`** (V3.O2) leaves the cursor on the selection's first row, as vim's yank does.
+- **Panel**: `/` starts with the last search selected (typing replaces it; the filter prompts still
+  start at the end of the pattern); a search nothing matches keeps the prompt open with "No file path
+  contains “…”", and `n`/`N` toast when nothing matches any more (V2.O2/V8.O4). The status line
+  wraps instead of being cut (V1.O3/V2.O1). `; h` in the panel is `FocusPanel` (a no-op there)
+  instead of `;` + `h` collapsing the directory (V1.O6).
+- **GitHub text**: `comments::github_markdown` drops `<details …>`/`</details>`/`</summary>` tags and
+  makes `<summary>X</summary>` a bold line, for lines that start with one of them, outside fenced
+  code (description, review summaries, thread comments; HTML stays unparsed: it could load remote
+  images) (V4.O2). The bot badge of review summaries is "BOT" like threads' (V4.O3). Hints and
+  toasts quote commands with "…" instead of Markdown backticks (V4.O4). The description and
+  summaries scroll after 8 lines (decision: was 12, ~40% of a 1000-pixel window; collapsing long
+  bodies by default was the alternative).
+- **Picker**: the pull request a query names (`1`, `#1`, a URL) comes first among the pull
+  requests, above rows that only fuzzy-match (V4.O6).
+- **Export**: a commit range of more than 10 commits says "Reviewing N commits: base..head" instead
+  of listing every commit (V7.O3; tuicr's list up to 10).
+- **Several repositories** (V6.O3, decision): when the project has more than one repository, review
+  tabs and the panel header start with the repository's name ("zed · Review: Uncommitted changes",
+  "zed · PR #12: …") and the tab tooltip adds its path; one repository: unchanged.
+- **Submit modal**: it opens on the event (Comment / Approve / Request Changes) it was last set to
+  for the pull request (`PullRequestState::review_event`, shared by its tabs and windows) until a
+  review is posted, so "Add Review Comment" doesn't lose Request Changes (V5.O1). The counts line
+  adds "N blocked" (line comments waiting for the head + refused drafts) and "N outdated" instead of
+  "No comments" (V5.O2). After GitHub refuses a review, the modal asks GitHub about the pull request
+  again: a pending review found then replaces the refusal's message with the same blocker as when
+  the modal opens, and Submit stays disabled; coming back to the window (activation) asks again
+  while a pending review or a failed check blocks (V5.O3). Other refusals keep GitHub's message and
+  Submit.
+- **Panel after a submit** (V5.O4): once threads are loaded after the submit
+  (`PullRequestState::threads_include_submitted`), submitted drafts aren't listed (their threads
+  are; the review comment is a review summary in the top block). Before that reload, and when it
+  fails, they are, "submitted".
+- **`--wait`** (V6.O1): `; s` in a local review with no comments says "Review finished (no
+  comments)" also when a waiter gets it (nothing is printed, exit 0). V6.O8: `--help` of `-w,
+  --wait` adds "With --review, waits until the review is submitted, finished or closed (see
+  --review)." (appended paragraph in `cli/src/main.rs`).
+- Tests: 7 new (198 total + 1 ignored): the `<details>` sanitizer, the commits banner, the counts
+  line, a refusal for a pending review (blocker, disabled Submit, re-check on activation), a reload
+  keeping a file's header at the top, the top of the review staying the top when the first file's
+  threads load, repository names with two repositories. Extended: `]t`/`; f`/`gg` header-at-top
+  (`test_file_navigation_shows_the_file_header`), visual `y`'s cursor, panel search and `; h`
+  (`test_filters_and_search`), the picker's order, the event memory and the panel after a submit.
+  The scroll tests were checked red without their fixes. `cargo test -p cli`: 8 passed. Clippy
+  (`-p code_review`) clean.
+- **Live check** (harness, `validation/FINAL/fix2/`; local fixture `mkfixture.sh`, run in
+  `/tmp/fix2/ws`, since `~/.local` and `/tmp` hold stray empty `.git` directories Zed takes for
+  parent repositories; sandbox clone for GitHub), all PASS: `; f` and visual `y`; panel `; h`,
+  search prefill/replace/no match, wrapped status line; "Reviewing 12 commits: d288685..a496a19";
+  `--wait` + `; s` without comments (toast, exit 0, nothing printed); two repositories' tab titles,
+  panel header and tooltip; `--help`; PR A #1: `1` lists #1 first, opening on `docs/guide.md`'s
+  file thread with the header at the top (before the `Anchor::Min` fix it opened 2 rows down, the
+  thread under the sticky header), `gg` from the end, HEAD moved to `5c5cdf4` and back, a panel
+  click on a moved thread, the bot summary's Notes section without HTML and its BOT badge, thread
+  bodies, "1 blocked" with HEAD off the pull request's head; PR B #10: Request Changes → Add Review
+  Comment → `; s` opens on Request Changes (closed without sending); PR C #11: one COMMENTED review
+  (body, a line and a file comment, checked with `gh api`), then the panel lists the 2 threads only
+  and `notes.md`'s file thread shows under its header. Not live: `n`/`N`'s toast, the re-check on
+  window activation (no window manager in the harness; GPUI test). Sandbox writes: that review; PR
+  C reset to **#12**. Token leak grep clean.
+
 **Known issues / notes for the next slices:**
+
+- **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
+  (b)): a 13 s bare spinner while a 307-file snapshot loads (V7.O2; needs `CommitDiffList` progress
+  in the empty state); palette actions vanish while a comment editor is focused but scrolled out of
+  view (V7.O1); sticky headers are narrower than the editor (V7.O5); the cursor row can sit under
+  the sticky header after a split toggle (V7.O6); the status bar `line:col` goes stale after an
+  external edit (V3.O4); the horizontal scrollbar thumb stays visible (V1.O5); `app_will_quit`
+  timeouts on quit, also without review tabs (V3.O1/V7.O4); palette recency ranking with no non-vim
+  review keymap (V8.O1, by design); non-vim character selections are invisible (V8.O3); a visual
+  `y` across a file boundary copies the last file's rows (V3.O3); the header strip peeks out under a
+  tall top block (V3.O6); `[t` visits the file comment first (V3.O7); Review in Worktree replaces
+  the workspace (V4.O8); two `zed://review` links in one request: only the last opens (V6.O2,
+  upstream `OpenRequest` keeps one kind); `R` on a folded header gives the generic toast (V2.O3); a
+  thread posted on a previous head shows as moved until GitHub re-anchors it (V5.O6). The panel
+  selection following one `]t` across files (V2.O5/V4.O7) and stale relative line numbers after
+  closing a clone (V2.O6) weren't seen again.
 
 - **Notes for the final validation (V6)**:
   - Build with `-p zed -p cli` before `zh start` (the harness finds `target/release-fast/cli` at
@@ -1570,8 +1668,8 @@ in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs`
   - Change Base's picker preselects `origin/main` when typing `main`: press Down for the local `main`.
   - `--review` lands in the *active* window among those with the repository open (GPUI's active
     window, which `-n` doesn't always change without a window manager).
-  - Sandbox: PR A #1 (read-only), PR C **#8** (own, clean; #6 closed by polish A), PR B **#7** (bot,
-    clean), PR D #4 (API probes); the harness clone is back on `feature/template-filters`.
+  - Sandbox (after fix 2): PR A #1 (read-only), PR C **#12** (own, clean; #11 closed by fix 2), PR B
+    **#10** (bot, clean), PR D #4 (API probes); the harness clone is on `feature/template-filters`.
   - `zh keys`/`click` always refocus the window `zh` started with: when a CLI request opens a second
     window, the keys still go to the first one (it typed a draft into the PR tab once). Close the
     first window (`ctrl+shift+w`) or drive the second with `zh xdo`.
@@ -1599,8 +1697,8 @@ in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs`
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (polish B). `cargo test -p code_review`: 191 tests + 1 ignored live
-  GitHub test (after fix 1; 184 after polish B; 180 after polish A; 166 after
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 198 tests + 1 ignored live
+  GitHub test (after fix 2; 191 after fix 1; 184 after polish B; 180 after polish A; 166 after
   M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
@@ -1650,6 +1748,10 @@ in `editor` (core patch #3; #1 reverted) and a clippy fix in `cli`'s `review.rs`
   rebuilds once.
 - Polish B (orchestrator): core patch #3 (the empty-row highlight) only as an opt-in that leaves
   every existing caller unchanged; core patch #1 reverted (no caller).
+- Fix 2 (orchestrator): the "Mark Reviewed" hunk control stays where Zed's hunk controls go, over
+  the end of long rows; the pull request's description and summaries scroll after 8 lines; with
+  several repositories, review tabs and the panel header name the repository; the submit modal
+  remembers its event per pull request until a review is posted.
 - M2 (orchestrator): `]f`/`[f` stop at the ends and `]u`/`[u` wrap, as in tuicr; `h` at the left edge of
   the right side in split view focuses the panel; no counted `3}`-style jumps (no vim patch).
 - M7 (user): a fork's checkout lists the upstream parent's pull requests; bot threads hide behind the
