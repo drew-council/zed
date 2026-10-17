@@ -1,9 +1,10 @@
 use crate::{
-    ClearExcludeFilter, ClearFilters, ClearIncludeFilter, CollapseSelectedEntry,
+    ClearExcludeFilter, ClearFilters, ClearIncludeFilter, CollapseSelectedEntry, CopyBranchName,
     EditExcludeFilter, EditIncludeFilter, ExpandSelectedEntry, FocusPanel, ReviewUncommitted,
     ReviewView, SearchPaths, SelectNextMatch, SelectPreviousMatch, ToggleFileReviewed,
-    ToggleFocus, ToggleHideReviewed, TogglePanel, ToggleSelectedDirectory,
-    view::{PanelFile, ReviewFilters, current_review, filter_regex, focus_diff},
+    ToggleFocus, ToggleHideReviewed, TogglePanel, ToggleSelectedDirectory, ToggleShowGenerated,
+    ToggleShowVendored,
+    view::{PanelFile, ReviewFilters, ReviewSummary, current_review, filter_regex, focus_diff},
 };
 use anyhow::Result;
 use collections::HashSet;
@@ -11,17 +12,21 @@ use editor::{Editor, EditorEvent, PathKey, actions::MoveToEnd};
 use file_icons::FileIcons;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
-    Action, AsyncWindowContext, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    KeyContext, ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity, uniform_list,
+    Action, Anchor, AsyncWindowContext, ClipboardItem, DismissEvent, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent, Point,
+    ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity, anchored, deferred,
+    uniform_list,
 };
 use smallvec::SmallVec;
 use std::{collections::BTreeMap, ops::Range};
 use ui::{
-    CommonAnimationExt as _, IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*,
+    CommonAnimationExt as _, ContextMenu, IndentGuideColors, ListItem, ListItemSpacing,
+    PopoverMenu, Tooltip, prelude::*,
 };
 use workspace::{
-    Workspace,
+    Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::NotificationId,
 };
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
@@ -54,6 +59,28 @@ pub(crate) fn register(workspace: &mut Workspace) {
         update_filters(workspace, window, cx, |filters| {
             filters.hide_reviewed = !filters.hide_reviewed
         });
+    });
+    workspace.register_action(|workspace, _: &ToggleShowGenerated, window, cx| {
+        update_filters(workspace, window, cx, |filters| {
+            filters.show_generated = !filters.show_generated
+        });
+    });
+    workspace.register_action(|workspace, _: &ToggleShowVendored, window, cx| {
+        update_filters(workspace, window, cx, |filters| {
+            filters.show_vendored = !filters.show_vendored
+        });
+    });
+    workspace.register_action(|workspace, _: &CopyBranchName, _, cx| {
+        let Some(review) = current_review(workspace, cx) else {
+            return;
+        };
+        match review.read(cx).branch_name(cx) {
+            Some(branch) => cx.write_to_clipboard(ClipboardItem::new_string(branch.to_string())),
+            None => workspace.show_toast(
+                Toast::new(NotificationId::unique::<CopyBranchName>(), "HEAD is detached").autohide(),
+                cx,
+            ),
+        }
     });
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<ReviewPanel>(window, cx);
@@ -173,6 +200,7 @@ struct TreeNode {
 
 /// The review panel in the left dock: the file tree of the active review tab.
 pub struct ReviewPanel {
+    workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     active_review: Option<WeakEntity<ReviewView>>,
     /// The visible rows: collapsed directories hide their descendants.
@@ -184,6 +212,7 @@ pub struct ReviewPanel {
     prompt: Option<Prompt>,
     /// The last path search, repeated by `n` and `N`.
     search: Option<String>,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     _review_subscriptions: Vec<Subscription>,
     _workspace_subscription: Option<Subscription>,
 }
@@ -212,6 +241,7 @@ impl ReviewPanel {
             .active_item_as::<ReviewView>(cx)
             .or_else(|| workspace.items_of_type::<ReviewView>(cx).next());
         let mut this = Self {
+            workspace: workspace.weak_handle(),
             focus_handle: cx.focus_handle(),
             active_review: None,
             entries: Vec::new(),
@@ -220,6 +250,7 @@ impl ReviewPanel {
             scroll_handle: UniformListScrollHandle::new(),
             prompt: None,
             search: None,
+            context_menu: None,
             _review_subscriptions: Vec::new(),
             _workspace_subscription: workspace_subscription,
         };
@@ -740,6 +771,113 @@ impl ReviewPanel {
         }
     }
 
+    /// The menu of a right-clicked row (`file` for a file row) or of the header's button.
+    fn build_menu(
+        &self,
+        file: Option<PanelFile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let review = self.active_review();
+        let filters = review
+            .as_ref()
+            .map(|review| review.read(cx).filters().clone())
+            .unwrap_or_default();
+        let has_branch = review
+            .as_ref()
+            .is_some_and(|review| review.read(cx).branch_name(cx).is_some());
+        let project_path = file
+            .as_ref()
+            .zip(review.as_ref())
+            .and_then(|(file, review)| review.read(cx).project_path(&file.repo_path, cx))
+            .filter(|_| file.as_ref().is_some_and(|file| !file.status.is_deleted()));
+        let workspace = self.workspace.clone();
+        let focus_handle = self.focus_handle.clone();
+        ContextMenu::build(window, cx, move |mut menu, _, _| {
+            menu = menu.context(focus_handle);
+            if let Some(file) = file {
+                let path = file.repo_path.as_unix_str().to_string();
+                menu = menu
+                    .action(
+                        if file.reviewed {
+                            "Mark as Not Reviewed"
+                        } else {
+                            "Mark as Reviewed"
+                        },
+                        ToggleFileReviewed.boxed_clone(),
+                    )
+                    .entry("Open File", None, move |window, cx| {
+                        if let Some(project_path) = project_path.clone() {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_path(project_path, None, true, window, cx)
+                                        .detach_and_log_err(cx);
+                                })
+                                .ok();
+                        }
+                    })
+                    .entry("Copy Relative Path", None, move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                    })
+                    .separator();
+            }
+            menu.toggleable_entry(
+                "Hide Reviewed Files",
+                filters.hide_reviewed,
+                IconPosition::Start,
+                Some(ToggleHideReviewed.boxed_clone()),
+                |window, cx| window.dispatch_action(ToggleHideReviewed.boxed_clone(), cx),
+            )
+            .toggleable_entry(
+                "Show Generated Files",
+                filters.show_generated,
+                IconPosition::Start,
+                Some(ToggleShowGenerated.boxed_clone()),
+                |window, cx| window.dispatch_action(ToggleShowGenerated.boxed_clone(), cx),
+            )
+            .toggleable_entry(
+                "Show Vendored Files",
+                filters.show_vendored,
+                IconPosition::Start,
+                Some(ToggleShowVendored.boxed_clone()),
+                |window, cx| window.dispatch_action(ToggleShowVendored.boxed_clone(), cx),
+            )
+            .separator()
+            .action("Include Filter…", EditIncludeFilter.boxed_clone())
+            .action("Exclude Filter…", EditExcludeFilter.boxed_clone())
+            .action("Search Paths…", SearchPaths.boxed_clone())
+            .action_disabled_when(
+                filters.include.is_none() && filters.exclude.is_none() && !filters.hide_reviewed,
+                "Clear Filters",
+                ClearFilters.boxed_clone(),
+            )
+            .separator()
+            .action_disabled_when(!has_branch, "Copy Branch Name", CopyBranchName.boxed_clone())
+        })
+    }
+
+    fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        file: Option<PanelFile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = self.build_menu(file, window, cx);
+        let menu_focus = menu.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&menu_focus, cx));
+        let subscription = cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
+            if menu.focus_handle(cx).contains_focused(window, cx) {
+                window.focus(&this.focus_handle, cx);
+            }
+            this.context_menu = None;
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
     fn render_entry(
         &self,
         index: usize,
@@ -819,10 +957,32 @@ impl ReviewPanel {
                             )
                             .child(Label::new(letter).size(LabelSize::Small).color(color)),
                     )
+                    .when(file.attributes.generated || file.attributes.vendored, |item| {
+                        item.child(
+                            Label::new(if file.attributes.generated {
+                                "(generated)"
+                            } else {
+                                "(vendored)"
+                            })
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                    })
                     .tooltip({
                         let path = SharedString::from(file.repo_path.as_unix_str().to_string());
                         move |_, cx| Tooltip::simple(path.clone(), cx)
                     })
+                    .on_secondary_mouse_down(cx.listener(
+                        move |this, event: &MouseDownEvent, window, cx| {
+                            this.selected = Some(index);
+                            let file = match this.entries.get(index) {
+                                Some(TreeEntry::File { file, .. }) => Some(file.clone()),
+                                _ => None,
+                            };
+                            this.deploy_context_menu(event.position, file, window, cx);
+                            cx.stop_propagation();
+                        },
+                    ))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.selected = Some(index);
@@ -847,13 +1007,32 @@ impl ReviewPanel {
         let title = review.title(cx);
         let summary = review.summary(cx);
         let status = status_line(review.filters(), &summary, review.diff().read(cx).single_file().is_some());
+        let panel = cx.weak_entity();
         v_flex()
             .px_2()
             .py_1()
             .gap_0p5()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
-            .child(Label::new(title).truncate())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(div().flex_1().min_w_0().child(Label::new(title).truncate()))
+                    .child(
+                        PopoverMenu::new("review-panel-menu")
+                            .trigger_with_tooltip(
+                                IconButton::new("review-panel-menu-button", IconName::Ellipsis)
+                                    .icon_size(IconSize::Small),
+                                Tooltip::text("Filters and Actions"),
+                            )
+                            .anchor(Anchor::TopRight)
+                            .menu(move |window, cx| {
+                                panel
+                                    .update(cx, |panel, cx| panel.build_menu(None, window, cx))
+                                    .ok()
+                            }),
+                    ),
+            )
             .child(
                 Label::new(format!("{}/{} reviewed", summary.reviewed, summary.total))
                     .size(LabelSize::Small)
@@ -903,6 +1082,22 @@ impl ReviewPanel {
                             ),
                         )
                     })
+                    .when(summary.generated_hidden > 0, |el| {
+                        el.child(
+                            Button::new("review-panel-show-generated", "Show Generated Files")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(ToggleShowGenerated.boxed_clone(), cx)
+                                }),
+                        )
+                    })
+                    .when(summary.vendored_hidden > 0, |el| {
+                        el.child(
+                            Button::new("review-panel-show-vendored", "Show Vendored Files")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(ToggleShowVendored.boxed_clone(), cx)
+                                }),
+                        )
+                    })
                     .into_any_element()
             }
             Some(review) => {
@@ -949,7 +1144,14 @@ impl ReviewPanel {
                     TreeEntry::File { file, name, .. } => {
                         let (letter, _) = status_letter(file.status);
                         let reviewed = if file.reviewed { " ✓" } else { "" };
-                        format!("{marker}{indent}{name} {letter}{reviewed}")
+                        let kind = if file.attributes.generated {
+                            " (generated)"
+                        } else if file.attributes.vendored {
+                            " (vendored)"
+                        } else {
+                            ""
+                        };
+                        format!("{marker}{indent}{name}{kind} {letter}{reviewed}")
                     }
                 }
             })
@@ -958,7 +1160,7 @@ impl ReviewPanel {
 }
 
 /// Describes the active filters and what they hide, when anything applies.
-fn status_line(filters: &ReviewFilters, summary: &crate::view::ReviewSummary, single_file: bool) -> Option<String> {
+fn status_line(filters: &ReviewFilters, summary: &ReviewSummary, single_file: bool) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(include) = &filters.include {
         parts.push(format!("include {}", include.as_str()));
@@ -968,6 +1170,12 @@ fn status_line(filters: &ReviewFilters, summary: &crate::view::ReviewSummary, si
     }
     if summary.filtered_out > 0 {
         parts.push(format!("{} filtered out", summary.filtered_out));
+    }
+    if summary.generated_hidden > 0 {
+        parts.push(format!("{} generated hidden", summary.generated_hidden));
+    }
+    if summary.vendored_hidden > 0 {
+        parts.push(format!("{} vendored hidden", summary.vendored_hidden));
     }
     if summary.reviewed_hidden > 0 {
         parts.push(format!("{} reviewed hidden", summary.reviewed_hidden));
@@ -1088,6 +1296,23 @@ impl Render for ReviewPanel {
                     )
                 }
             })
+            .when(review.is_some(), |panel| {
+                panel.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        this.deploy_context_menu(event.position, None, window, cx)
+                    }),
+                )
+            })
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 
@@ -1196,7 +1421,23 @@ mod tests {
         let editor = rhs_editor(&review, cx);
         cx.run_until_parked();
 
-        // Directories first, single-child chains compacted, in the diff's order.
+        // Directories first, single-child chains compacted, in the diff's order. Generated and
+        // vendored files are hidden by default.
+        assert_eq!(
+            rows(&panel, cx),
+            [
+                "docs/",
+                ">  old.md D",
+                "src/",
+                "  a/b/",
+                "    c.rs A",
+                "  lib.rs M",
+                "  mod_b.rs M",
+                "z.txt M",
+            ]
+        );
+        dispatch(crate::ToggleShowGenerated, cx);
+        dispatch(crate::ToggleShowVendored, cx);
         assert_eq!(
             rows(&panel, cx),
             [
@@ -1208,8 +1449,8 @@ mod tests {
                 "  lib.rs M",
                 "  mod_b.rs M",
                 "vendor/",
-                "  x.js A",
-                "Cargo.lock M",
+                "  x.js (vendored) A",
+                "Cargo.lock (generated) M",
                 "z.txt M",
             ]
         );
@@ -1332,7 +1573,10 @@ mod tests {
         // `I` and `E` clear the patterns.
         cx.simulate_keystrokes("shift-i shift-e");
         assert_eq!(excerpt_paths(&review, cx), all_files);
-        assert_eq!(header(&panel, cx).1, None);
+        assert_eq!(
+            header(&panel, cx).1.as_deref(),
+            Some("1 generated hidden · 1 vendored hidden")
+        );
 
         // Path search expands collapsed directories, and `n`/`N` wrap.
         cx.simulate_keystrokes("g g j j space");
@@ -1368,7 +1612,10 @@ mod tests {
         assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("src/a/b/c.rs"));
         let total = all_files.len();
         assert_eq!(header(&panel, cx).0, format!("1/{total} reviewed"));
-        assert_eq!(header(&panel, cx).1.as_deref(), Some("1 reviewed hidden"));
+        assert_eq!(
+            header(&panel, cx).1.as_deref(),
+            Some("1 generated hidden · 1 vendored hidden · 1 reviewed hidden")
+        );
 
         // On the last file the cursor wraps around to the first shown file.
         let last = all_files.last().unwrap().clone();
@@ -1417,7 +1664,7 @@ mod tests {
         cx.simulate_keystrokes("enter");
         assert_eq!(excerpt_paths(&other, cx), ["src/lib.rs"]);
         assert_eq!(names(&panel, cx), ["src/", "lib.rs M"]);
-        assert_eq!(excerpt_paths(&review, cx).len(), 7);
+        assert_eq!(excerpt_paths(&review, cx).len(), 5);
 
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.activate_item(&review, true, true, window, cx)
@@ -1440,5 +1687,81 @@ mod tests {
         }
         assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), None);
         assert!(rows(&panel, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_generated_and_vendored_files(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (fs, workspace, review, cx) = open_tree_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        let shown = [
+            "docs/old.md",
+            "src/a/b/c.rs",
+            "src/lib.rs",
+            "src/mod_b.rs",
+            "z.txt",
+        ];
+        assert_eq!(excerpt_paths(&review, cx), shown);
+        assert_eq!(header(&panel, cx).0, "0/5 reviewed");
+        assert_eq!(
+            header(&panel, cx).1.as_deref(),
+            Some("1 generated hidden · 1 vendored hidden")
+        );
+
+        dispatch(crate::ToggleShowGenerated, cx);
+        assert!(excerpt_paths(&review, cx).contains(&"Cargo.lock".to_string()));
+        assert!(names(&panel, cx).contains(&"Cargo.lock (generated) M".to_string()));
+        assert_eq!(header(&panel, cx).1.as_deref(), Some("1 vendored hidden"));
+        dispatch(crate::ToggleShowGenerated, cx);
+        assert_eq!(excerpt_paths(&review, cx), shown);
+
+        // Attributes are read again when the file list changes.
+        fs.insert_file(
+            util::path!("/project/.gitattributes"),
+            "Cargo.lock linguist-generated\n".into(),
+        )
+        .await;
+        cx.run_until_parked();
+        assert_eq!(
+            excerpt_paths(&review, cx),
+            [
+                "docs/old.md",
+                "src/a/b/c.rs",
+                "src/lib.rs",
+                "src/mod_b.rs",
+                "vendor/x.js",
+                ".gitattributes",
+                "z.txt"
+            ]
+        );
+        assert_eq!(header(&panel, cx).1.as_deref(), Some("1 generated hidden"));
+    }
+
+    #[gpui::test]
+    async fn test_context_menu_and_copy_actions(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (fs, workspace, _review, cx) = open_tree_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        fs.set_branch_name(crate::test_support::dot_git(), Some("feature/review"));
+        cx.run_until_parked();
+
+        dispatch(crate::CopyBranchName, cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+            Some("feature/review")
+        );
+
+        cx.simulate_keystrokes("; h");
+        panel.update_in(cx, |panel, window, cx| {
+            let file = panel.files(cx).into_iter().next();
+            panel.deploy_context_menu(Point::default(), file, window, cx);
+        });
+        cx.run_until_parked();
+        let menu = panel.read_with(cx, |panel, _| panel.context_menu.as_ref().map(|(menu, _, _)| menu.clone()));
+        let menu = menu.unwrap();
+        cx.update(|window, cx| assert!(menu.focus_handle(cx).contains_focused(window, cx)));
+        dispatch(menu::Cancel, cx);
+        assert!(panel.read_with(cx, |panel, _| panel.context_menu.is_none()));
+        cx.update(|window, cx| assert!(panel.focus_handle(cx).contains_focused(window, cx)));
     }
 }

@@ -5,6 +5,7 @@ use crate::{
     ToggleHunkReviewed, ToggleSingleFileMode,
     commits::{TOP_BLOCK_COMMIT_LIMIT, first_parent_chain, resolve_commit_spec, validate_ref},
     diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
+    gitattributes::{FileAttributes, GitAttributes},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
     reviewed::paint_reviewed_hunks,
@@ -12,7 +13,7 @@ use crate::{
     target::{ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use git::{repository::RepoPath, status::FileStatus};
 use regex::{Regex, RegexBuilder};
 use editor::{
@@ -258,6 +259,7 @@ pub(crate) struct PanelFile {
     pub repo_path: RepoPath,
     pub status: FileStatus,
     pub reviewed: bool,
+    pub attributes: FileAttributes,
 }
 
 /// Which files a review tab shows. Per tab and not persisted (like tuicr's filters).
@@ -268,6 +270,9 @@ pub(crate) struct ReviewFilters {
     /// Paths matching this (case-insensitive) regex are hidden.
     pub exclude: Option<Regex>,
     pub hide_reviewed: bool,
+    /// Generated and vendored files (per `.gitattributes`) are hidden unless shown.
+    pub show_generated: bool,
+    pub show_vendored: bool,
 }
 
 impl ReviewFilters {
@@ -275,6 +280,11 @@ impl ReviewFilters {
         let path = repo_path.as_unix_str();
         self.include.as_ref().is_none_or(|include| include.is_match(path))
             && self.exclude.as_ref().is_none_or(|exclude| !exclude.is_match(path))
+    }
+
+    fn hides_attributes(&self, attributes: FileAttributes) -> bool {
+        (attributes.generated && !self.show_generated)
+            || (attributes.vendored && !self.show_vendored)
     }
 }
 
@@ -294,6 +304,10 @@ pub(crate) struct ReviewSummary {
     pub reviewed: usize,
     /// Files hidden by the include and exclude patterns.
     pub filtered_out: usize,
+    /// Generated files hidden by default (and not by the patterns).
+    pub generated_hidden: usize,
+    /// Vendored files hidden by default (and not by the patterns).
+    pub vendored_hidden: usize,
     /// Reviewed files hidden by "hide reviewed".
     pub reviewed_hidden: usize,
 }
@@ -314,11 +328,14 @@ pub struct ReviewView {
     /// Shared by every tab reviewing the same thing; replaced when the review key changes.
     session: Entity<ReviewSession>,
     filters: ReviewFilters,
+    /// The generated and vendored files among the review's files.
+    attributes: HashMap<RepoPath, FileAttributes>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     /// The left side is recreated on every split; its reviewed hunks are repainted then.
     lhs_editor_id: Option<EntityId>,
     _load_commits_task: Task<()>,
+    _attributes_task: Task<()>,
     _session_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
 }
@@ -465,10 +482,12 @@ impl ReviewView {
             line_cursor,
             session,
             filters: ReviewFilters::default(),
+            attributes: HashMap::default(),
             project,
             workspace: workspace.downgrade(),
             lhs_editor_id,
             _load_commits_task: load_commits_task,
+            _attributes_task: Task::ready(()),
             _session_subscription: session_subscription,
             _subscriptions: subscriptions,
         }
@@ -542,9 +561,11 @@ impl ReviewView {
         match event {
             // A file may need hiding before its excerpts appear, and the label for an entirely
             // hidden review depends on which files have hunks.
-            ReviewDiffEvent::FileListChanged | ReviewDiffEvent::FilesChanged => {
-                self.recompute_hidden(window, cx)
+            ReviewDiffEvent::FileListChanged => {
+                self.recompute_hidden(window, cx);
+                self.reload_attributes(window, cx);
             }
+            ReviewDiffEvent::FilesChanged => self.recompute_hidden(window, cx),
             ReviewDiffEvent::FileDiffChanged {
                 path_key,
                 newly_shown,
@@ -592,9 +613,46 @@ impl ReviewView {
         cx.notify();
     }
 
+    fn attributes(&self, repo_path: &RepoPath) -> FileAttributes {
+        self.attributes.get(repo_path).copied().unwrap_or_default()
+    }
+
+    /// Whether the include/exclude patterns or the generated/vendored defaults hide the file.
+    fn passes_filters_except_reviewed(&self, repo_path: &RepoPath) -> bool {
+        self.filters.passes_patterns(repo_path)
+            && !self.filters.hides_attributes(self.attributes(repo_path))
+    }
+
     fn is_hidden_by_filters(&self, repo_path: &RepoPath, cx: &App) -> bool {
-        !self.filters.passes_patterns(repo_path)
+        !self.passes_filters_except_reviewed(repo_path)
             || (self.filters.hide_reviewed && self.session.read(cx).is_file_reviewed(repo_path))
+    }
+
+    /// Reads the review's `.gitattributes` (from the working tree, for every target) and hides
+    /// generated and vendored files. Until they are read, such files show.
+    fn reload_attributes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.diff.read(cx).listed_paths().to_vec();
+        let repo = self.repo.read(cx);
+        let work_directory = repo.work_directory_abs_path.clone();
+        let common_directory = repo.common_dir_abs_path.clone();
+        let fs = self.project.read(cx).fs().clone();
+        self._attributes_task = cx.spawn_in(window, async move |this, cx| {
+            let git_attributes =
+                GitAttributes::load(fs.as_ref(), &work_directory, &common_directory, &paths).await;
+            let attributes = paths
+                .into_iter()
+                .filter_map(|path| {
+                    let attributes = git_attributes.attributes(&path);
+                    (attributes != FileAttributes::default()).then_some((path, attributes))
+                })
+                .collect();
+            this.update_in(cx, |this, window, cx| {
+                this.attributes = attributes;
+                this.recompute_hidden(window, cx);
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     /// Hides the files the filters exclude, in the diff and in the panel.
@@ -614,7 +672,7 @@ impl ReviewView {
             // reviewed file.
             let reviewed_hidden = files
                 .iter()
-                .any(|file| self.filters.passes_patterns(&file.repo_path));
+                .any(|file| self.passes_filters_except_reviewed(&file.repo_path));
             if self.filters.hide_reviewed && reviewed_hidden {
                 SharedString::from("All files reviewed")
             } else {
@@ -637,6 +695,15 @@ impl ReviewView {
         for file in self.diff.read(cx).files(cx) {
             if !self.filters.passes_patterns(&file.repo_path) {
                 summary.filtered_out += 1;
+                continue;
+            }
+            let attributes = self.attributes(&file.repo_path);
+            if self.filters.hides_attributes(attributes) {
+                if attributes.generated && !self.filters.show_generated {
+                    summary.generated_hidden += 1;
+                } else {
+                    summary.vendored_hidden += 1;
+                }
                 continue;
             }
             summary.total += 1;
@@ -886,6 +953,20 @@ impl ReviewView {
         &self.target
     }
 
+    /// The reviewed repository's current branch (`None` when HEAD is detached).
+    pub(crate) fn branch_name(&self, cx: &App) -> Option<SharedString> {
+        self.repo
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_owned()))
+    }
+
+    /// The project path of a file in the review (`None` for deleted files).
+    pub(crate) fn project_path(&self, repo_path: &RepoPath, cx: &App) -> Option<ProjectPath> {
+        self.repo.read(cx).repo_path_to_project_path(repo_path, cx)
+    }
+
     pub fn diff(&self) -> &Entity<ReviewDiff> {
         &self.diff
     }
@@ -918,6 +999,7 @@ impl ReviewView {
             .filter(|file| !diff.is_hidden(&file.path_key))
             .map(|file| PanelFile {
                 reviewed: session.is_file_reviewed(&file.repo_path),
+                attributes: self.attributes(&file.repo_path),
                 path_key: file.path_key,
                 repo_path: file.repo_path,
                 status: file.status,

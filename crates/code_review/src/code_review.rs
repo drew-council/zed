@@ -1,5 +1,6 @@
 mod commits;
 mod diff;
+mod gitattributes;
 mod line_cursor;
 mod panel;
 mod persistence;
@@ -90,6 +91,14 @@ actions!(
         ClearFilters,
         /// Hides or shows the files marked as reviewed.
         ToggleHideReviewed,
+        /// Shows or hides generated files (`linguist-generated` or `gitlab-generated` in
+        /// `.gitattributes`), which are hidden by default.
+        ToggleShowGenerated,
+        /// Shows or hides vendored files (`linguist-vendored` in `.gitattributes`), which are
+        /// hidden by default.
+        ToggleShowVendored,
+        /// Copies the name of the reviewed repository's current branch.
+        CopyBranchName,
         /// Searches the review panel's files by path.
         SearchPaths,
         /// Selects the next file matching the review panel's path search.
