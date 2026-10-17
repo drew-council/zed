@@ -49,10 +49,13 @@ pub(crate) enum DiffSource {
 }
 
 impl DiffSource {
+    /// A commit review's split clone shares its `commits` list, so both show the same mode (live
+    /// or snapshot) and the snapshot loads once.
     fn new(
         target: &ReviewTarget,
         repo: Entity<Repository>,
         project: Entity<Project>,
+        commits: Option<Entity<CommitDiffList>>,
         cx: &mut App,
     ) -> Self {
         let diff_base = match target {
@@ -62,7 +65,9 @@ impl DiffSource {
             },
             ReviewTarget::Commits(range) => {
                 let range = *range;
-                return Self::Commits(cx.new(|cx| CommitDiffList::new(range, repo, project, cx)));
+                return Self::Commits(commits.unwrap_or_else(|| {
+                    cx.new(|cx| CommitDiffList::new(range, repo, project, cx))
+                }));
             }
         };
         let git_store = project.read(cx).git_store().clone();
@@ -202,12 +207,13 @@ impl ReviewDiff {
         target: &ReviewTarget,
         repo: Entity<Repository>,
         project: Entity<Project>,
+        commits: Option<Entity<CommitDiffList>>,
         workspace: Entity<Workspace>,
         view: WeakEntity<ReviewView>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let source = DiffSource::new(target, repo, project.clone(), cx);
+        let source = DiffSource::new(target, repo, project.clone(), commits, cx);
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -304,6 +310,13 @@ impl ReviewDiff {
     #[cfg(test)]
     pub(crate) fn source(&self) -> &DiffSource {
         &self.source
+    }
+
+    pub(crate) fn commit_list(&self) -> Option<&Entity<CommitDiffList>> {
+        match &self.source {
+            DiffSource::BufferList(_) => None,
+            DiffSource::Commits(list) => Some(list),
+        }
     }
 
     /// Whether the review shows historic, read-only buffers of a commit range that doesn't end

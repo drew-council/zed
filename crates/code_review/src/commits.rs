@@ -37,6 +37,10 @@ const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b
 
 const BINARY_PLACEHOLDER: &str = "(binary file not shown)";
 
+/// A snapshot loads its files in jobs of this many, so that other git work (status refreshes, the
+/// git panel) runs in between, and closing the review stops before the remaining files.
+const SNAPSHOT_FILES_PER_JOB: usize = 32;
+
 /// Runs `job` on the repository's git job queue with its local backend.
 fn local_job<R, Fut>(
     repo: &Entity<Repository>,
@@ -410,11 +414,19 @@ impl CommitDiffList {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-        let texts = cx
-            .update(|cx| load_snapshot_texts(&repo, range, &entries, cx))
-            .await?;
-        let files =
-            build_snapshot_files(entries, texts, range.base.is_some(), &repo, &project, cx).await?;
+        let mut files = Vec::with_capacity(entries.len());
+        let mut remaining = entries;
+        while !remaining.is_empty() {
+            let rest = remaining.split_off(remaining.len().min(SNAPSHOT_FILES_PER_JOB));
+            let chunk = std::mem::replace(&mut remaining, rest);
+            let texts = cx
+                .update(|cx| load_snapshot_texts(&repo, range, &chunk, cx))
+                .await?;
+            files.extend(
+                build_snapshot_files(chunk, texts, range.base.is_some(), &repo, &project, cx)
+                    .await?,
+            );
+        }
         this.update(cx, |this, cx| {
             this.snapshot_statuses = files
                 .iter()
@@ -606,8 +618,8 @@ async fn build_snapshot_files(
             log::warn!("skipping {repo_path:?} in a commit review: it isn't a file on both sides");
             continue;
         }
-        let worktree_id = cx
-            .update(|cx| worktree_id_for_repo_path(repo.read(cx), project.read(cx), &repo_path, cx))
+        let (worktree_id, path) = cx
+            .update(|cx| project_path_for_repo_path(repo.read(cx), project.read(cx), &repo_path, cx))
             .context("the project has no worktrees")?;
         let is_deleted = texts.new.is_none();
         let is_binary = texts.old.as_deref().is_some_and(is_binary_content)
@@ -630,7 +642,8 @@ async fn build_snapshot_files(
             .map(ToString::to_string)
             .unwrap_or_else(|| repo_path.as_unix_str().to_string());
         let blob = Arc::new(GitBlob {
-            path: repo_path.clone(),
+            repo_path: repo_path.clone(),
+            path,
             worktree_id,
             is_deleted,
             is_binary,
@@ -648,8 +661,10 @@ async fn build_snapshot_files(
     Ok(files)
 }
 
+/// Git's heuristic. Text in other encodings (Latin-1, Shift-JIS) shows decoded lossily rather than
+/// hidden.
 fn is_binary_content(content: &[u8]) -> bool {
-    content.iter().take(8000).any(|byte| *byte == 0) || std::str::from_utf8(content).is_err()
+    content.iter().take(8000).any(|byte| *byte == 0)
 }
 
 fn lossy_string(content: Vec<u8>) -> String {
@@ -688,7 +703,10 @@ fn tree_status_to_file_status(status: &TreeDiffStatus) -> FileStatus {
 
 /// The file of a historic buffer. It isn't local, so no language server attaches to it.
 struct GitBlob {
-    path: RepoPath,
+    repo_path: RepoPath,
+    /// Relative to the worktree when the file is in one (the project may be a subdirectory of the
+    /// repository), else the repository path.
+    path: Arc<RelPath>,
     worktree_id: WorktreeId,
     is_deleted: bool,
     is_binary: bool,
@@ -711,11 +729,11 @@ impl File for GitBlob {
     }
 
     fn path(&self) -> &Arc<RelPath> {
-        self.path.as_ref()
+        &self.path
     }
 
     fn full_path(&self, _: &App) -> PathBuf {
-        self.path.as_std_path().to_path_buf()
+        self.repo_path.as_std_path().to_path_buf()
     }
 
     fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
@@ -746,25 +764,25 @@ impl File for GitBlob {
     }
 }
 
-fn worktree_id_for_repo_path(
+fn project_path_for_repo_path(
     repository: &Repository,
     project: &Project,
     path: &RepoPath,
     cx: &App,
-) -> Option<WorktreeId> {
-    repository
-        .repo_path_to_project_path(path, cx)
-        .map(|project_path| project_path.worktree_id)
-        .or_else(|| {
-            let (worktree, _) = project.find_worktree(&repository.work_directory_abs_path, cx)?;
-            Some(worktree.read(cx).id())
-        })
+) -> Option<(WorktreeId, Arc<RelPath>)> {
+    if let Some(project_path) = repository.repo_path_to_project_path(path, cx) {
+        return Some((project_path.worktree_id, project_path.path));
+    }
+    let worktree_id = project
+        .find_worktree(&repository.work_directory_abs_path, cx)
+        .map(|(worktree, _)| worktree.read(cx).id())
         .or_else(|| {
             project
                 .worktrees(cx)
                 .next()
                 .map(|worktree| worktree.read(cx).id())
-        })
+        })?;
+    Some((worktree_id, path.as_ref().clone()))
 }
 
 async fn build_buffer(
@@ -831,14 +849,16 @@ mod tests {
     };
     use editor::{Editor, test::editor_test_context::assert_state_with_diff};
     use fs::Fs as _;
+    use git::repository::RepoPath;
     use gpui::{Entity, TestAppContext, VisualContext as _, VisualTestContext};
     use language::{Capability, DiskState};
-    use project::FakeFs;
+    use project::{FakeFs, Project, ProjectPath};
     use serde_json::json;
     use settings::DiffViewStyle;
+    use std::path::Path;
     use unindent::Unindent as _;
-    use util::path;
-    use workspace::{Workspace, item::Item as _};
+    use util::{path, rel_path::RelPath};
+    use workspace::{MultiWorkspace, SplitDirection, Workspace, item::Item as _};
 
     const C1_LIB: &str = "fn a() {}\n";
     const C2_LIB: &str = "fn a() {}\nfn b() {}\n";
@@ -1040,6 +1060,112 @@ mod tests {
             assert_eq!(buffer.text(), WORKTREE_LIB);
         });
         assert_eq!(cursor_point(&opened, cx).row, 1);
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_shows_text_that_isnt_utf8(cx: &mut TestAppContext) {
+        crate::init_test(cx);
+        let (fs, workspace, cx) = history_fixture(cx).await;
+        let latin1 = b"caf\xe9\n".to_vec();
+        fs.with_git_state(dot_git(), true, |state| {
+            let path = RepoPath::new("latin1.txt").unwrap();
+            state.head_contents.insert(path.clone(), latin1.clone());
+            for snapshot in &mut state.commit_history {
+                if snapshot.sha == C2 {
+                    snapshot.head_contents.insert(path.clone(), latin1.clone());
+                }
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        review_commits(C2, cx);
+        let review = active_review(&workspace, cx);
+        assert!(is_snapshot(&review, cx));
+        assert_eq!(excerpt_paths(&review, cx), ["latin1.txt", "lib.rs", "x.txt"]);
+        let text = rhs_editor(&review, cx).read_with(cx, |editor, cx| editor.text(cx));
+        assert!(text.contains("caf\u{fffd}"), "{text:?}");
+        assert!(!text.contains("binary file"), "{text:?}");
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_paths_are_relative_to_the_worktree(cx: &mut TestAppContext) {
+        crate::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "sub": { "lib.rs": WORKTREE_LIB } }),
+        )
+        .await;
+        // The project is a subdirectory of the repository.
+        let project = Project::test(fs.clone(), [Path::new(path!("/project/sub"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        cx.focus(&workspace);
+        let repo = repository(&workspace, cx);
+        record_commit(&fs, &repo, &[("sub/lib.rs", C1_LIB.into())], C1, cx).await;
+        record_commit(&fs, &repo, &[("sub/lib.rs", C2_LIB.into())], C2, cx).await;
+        let c3 = [("sub/lib.rs", C3_LIB.into())];
+        fs.set_head_for_repo(dot_git(), &c3, C3);
+        fs.set_index_for_repo(dot_git(), &c3);
+        fs.set_merge_base_content_for_repo(dot_git(), &[("sub/lib.rs", C1_LIB.into())]);
+        fs.set_commit_data(
+            dot_git(),
+            [
+                (commit_data(C1, None, "Add a"), false),
+                (commit_data(C2, Some(C1), "Add b"), false),
+                (commit_data(C3, Some(C2), "Tweak b"), false),
+            ],
+        );
+        for sha in [C1, C2, C3] {
+            insert_commit_ref(&fs, sha, sha);
+        }
+        cx.run_until_parked();
+
+        review_commits(C2, cx);
+        let review = active_review(&workspace, cx);
+        assert!(is_snapshot(&review, cx));
+        assert_eq!(excerpt_paths(&review, cx), ["lib.rs"]);
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        assert_eq!(
+            review.read_with(cx, |review, cx| review.active_project_path(cx)),
+            Some(ProjectPath {
+                worktree_id,
+                path: RelPath::from_unix_str("lib.rs").unwrap().into_arc(),
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_split_keeps_a_live_review_live(cx: &mut TestAppContext) {
+        crate::init_test(cx);
+        let (fs, workspace, cx) = history_fixture(cx).await;
+        review_commits(&format!("{C1}..{C3}"), cx);
+        let review = active_review(&workspace, cx);
+        assert!(!is_snapshot(&review, cx));
+
+        // A commit moves HEAD past the reviewed range.
+        fs.set_head_for_repo(
+            dot_git(),
+            &[("lib.rs", WORKTREE_LIB.into()), ("x.txt", "x\ny\n".into())],
+            "4444444444444444444444444444444444444444",
+        );
+        cx.run_until_parked();
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let split = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.split_and_clone(pane, SplitDirection::Right, window, cx)
+        });
+        cx.run_until_parked();
+        split.await.unwrap();
+        let clone = active_review(&workspace, cx);
+        assert_ne!(clone, review);
+        assert!(!is_snapshot(&clone, cx));
+        assert_eq!(excerpt_paths(&clone, cx), excerpt_paths(&review, cx));
     }
 
     #[gpui::test]

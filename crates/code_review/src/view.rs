@@ -3,7 +3,10 @@ use crate::{
     PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
     ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
     ToggleHunkReviewed, ToggleSingleFileMode,
-    commits::{TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain, resolve_commit_spec},
+    commits::{
+        CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
+        resolve_commit_spec,
+    },
     diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
     gitattributes::{FileAttributes, GitAttributes},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
@@ -386,7 +389,8 @@ impl ReviewView {
 
         let project = workspace.project().clone();
         let workspace_handle = cx.entity();
-        let view = cx.new(|cx| Self::new(target, repo, project, workspace_handle, window, cx));
+        let view =
+            cx.new(|cx| Self::new(target, repo, project, None, workspace_handle, window, cx));
         workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
         view
     }
@@ -395,6 +399,7 @@ impl ReviewView {
         target: ReviewTarget,
         repo: Entity<Repository>,
         project: Entity<Project>,
+        commits: Option<Entity<CommitDiffList>>,
         workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -405,6 +410,7 @@ impl ReviewView {
                 &target,
                 repo.clone(),
                 project.clone(),
+                commits,
                 workspace.clone(),
                 view,
                 window,
@@ -1596,9 +1602,11 @@ impl Item for ReviewView {
         let repo = self.repo.clone();
         let target = self.target.clone();
         let project = self.project.clone();
-        Task::ready(Some(
-            cx.new(|cx| Self::new(target, repo, project, workspace, window, cx)),
-        ))
+        // Deciding live or snapshot again could disagree with this tab once HEAD has moved.
+        let commits = self.diff.read(cx).commit_list().cloned();
+        Task::ready(Some(cx.new(|cx| {
+            Self::new(target, repo, project, commits, workspace, window, cx)
+        })))
     }
 
     fn capability(&self, _cx: &App) -> Capability {
