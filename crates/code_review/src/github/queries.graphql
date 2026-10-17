@@ -1,0 +1,175 @@
+# Every GitHub GraphQL operation of `code_review`, sent whole with an `operationName`.
+
+query RepositoryContext($owner: String!, $name: String!) {
+  viewer {
+    login
+  }
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    url
+    sshUrl
+    isFork
+    parent {
+      nameWithOwner
+      url
+      sshUrl
+    }
+  }
+}
+
+query OpenPullRequests($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(
+      states: OPEN
+      first: 50
+      orderBy: { field: UPDATED_AT, direction: DESC }
+    ) {
+      nodes {
+        ...PullRequestSummary
+      }
+    }
+  }
+}
+
+query SearchPullRequests($query: String!) {
+  search(query: $query, type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        ...PullRequestSummary
+      }
+    }
+  }
+}
+
+fragment PullRequestSummary on PullRequest {
+  number
+  title
+  url
+  isDraft
+  isCrossRepository
+  headRefName
+  baseRefName
+  updatedAt
+  author {
+    __typename
+    login
+  }
+}
+
+query PullRequestDetails($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id
+      number
+      title
+      url
+      body
+      state
+      isDraft
+      author {
+        __typename
+        login
+      }
+      baseRefName
+      baseRefOid
+      headRefName
+      headRefOid
+      isCrossRepository
+      headRepository {
+        nameWithOwner
+      }
+      reviewDecision
+      viewerDidAuthor
+      ...PendingReview
+    }
+  }
+}
+
+query PullRequestHead($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      state
+      ...PendingReview
+    }
+  }
+}
+
+# Only the viewer's own pending review is visible to them.
+fragment PendingReview on PullRequest {
+  pendingReviews: reviews(states: [PENDING], first: 1) {
+    nodes {
+      id
+      databaseId
+      viewerDidAuthor
+    }
+  }
+}
+
+query ReviewThreads($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          subjectType
+          path
+          line
+          startLine
+          originalLine
+          originalStartLine
+          diffSide
+          startDiffSide
+          comments(first: 100) {
+            totalCount
+            nodes {
+              id
+              databaseId
+              body
+              createdAt
+              url
+              state
+              commit {
+                oid
+              }
+              author {
+                __typename
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+query ReviewSummaries($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          state
+          body
+          submittedAt
+          url
+          author {
+            __typename
+            login
+          }
+        }
+      }
+    }
+  }
+}

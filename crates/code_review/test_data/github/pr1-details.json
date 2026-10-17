@@ -1,0 +1,32 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR_kwDOVM9_N88AAAABI92VhA",
+        "number": 1,
+        "title": "Add template filters and retire the legacy renderer",
+        "url": "https://github.com/drew-council/code-review-sandbox/pull/1",
+        "body": "## Summary\n\nAdds `|` filters to template variables and retires the deprecated `$name` renderer.\n\n### Changes\n\n- New `src/filters.rs` with `upper`, `lower`, `title`, `kebab`, `squash` and `truncate(n)`\n- `Token::Variable` / `Node::Variable` now carry a filter chain; unknown filters fail parsing with `UnknownFilter`\n- Conditions treat `\"0\"` as false, via a new `is_truthy` helper\n- Removed `src/legacy.rs` (deprecated since 0.0.9)\n- Renamed `src/format.rs` to `src/render.rs`; `fence` no longer doubles a trailing newline\n- Regenerated `gen/schema.rs` (adds `default_filters`) and bumped vendored escape-lite to 1.3.0\n\n### Example\n\n```rust\nlet template = Template::parse(\"{{name | squash | title}}\")?;\nassert_eq!(template.render(&[(\"name\", \"ada   lovelace\")])?, \"Ada Lovelace\");\n```\n\n> **Note:** callers of `legacy::render_simple` must migrate to `{{name}}` placeholders.\n",
+        "state": "OPEN",
+        "isDraft": false,
+        "author": {
+          "__typename": "User",
+          "login": "drew-council"
+        },
+        "baseRefName": "main",
+        "baseRefOid": "deea36cf8fa38276ef75801d05773c4c35c48d45",
+        "headRefName": "feature/template-filters",
+        "headRefOid": "3f22f1b3bd52ed79a655a055209707e356fa8253",
+        "isCrossRepository": false,
+        "headRepository": {
+          "nameWithOwner": "drew-council/code-review-sandbox"
+        },
+        "reviewDecision": null,
+        "viewerDidAuthor": true,
+        "pendingReviews": {
+          "nodes": []
+        }
+      }
+    }
+  }
+}

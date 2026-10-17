@@ -1,0 +1,50 @@
+[
+  {
+    "filename": "README.md",
+    "previous_filename": null,
+    "status": "modified",
+    "patch": "@@ -7,7 +7,8 @@ exercising code review tooling, so expect pull requests here to be synthetic.\n \n - `src/engine.rs` — template tokenizer, tree builder and renderer\n - `src/util/strings.rs` — string helpers shared by the engine\n-- `src/config.rs` — engine configuration parsing\n+- `src/settings.rs` — engine configuration parsing\n+- `src/cache.rs` — cache of parsed templates\n - `gen/schema.rs` — generated from `schema/textkit.toml`, do not edit by hand\n - `vendor/lib.js` — vendored third-party HTML escaping helper\n "
+  },
+  {
+    "filename": "docs/design-notes.md",
+    "previous_filename": "docs/notes.md",
+    "status": "renamed",
+    "patch": null
+  },
+  {
+    "filename": "docs/guide.md",
+    "previous_filename": null,
+    "status": "modified",
+    "patch": "@@ -25,7 +25,7 @@ other than `false`. Blocks can nest up to 16 levels deep.\n \n ## Configuration\n \n-`config.rs` reads `key = value` lines:\n+`settings.rs` reads `key = value` lines:\n \n | Key                | Default   | Meaning                                  |\n |--------------------|-----------|------------------------------------------|"
+  },
+  {
+    "filename": "src/cache.rs",
+    "previous_filename": null,
+    "status": "added",
+    "patch": "@@ -0,0 +1,60 @@\n+//! A small cache of parsed templates keyed by their source text.\n+\n+use std::collections::hash_map::Entry;\n+use std::collections::HashMap;\n+\n+use crate::engine::{Template, TemplateError};\n+\n+/// Caches parsed templates so repeated renders skip tokenizing.\n+#[derive(Debug, Default)]\n+pub struct TemplateCache {\n+    entries: HashMap<String, Template>,\n+    hits: u64,\n+    misses: u64,\n+}\n+\n+impl TemplateCache {\n+    pub fn new() -> Self {\n+        Self::default()\n+    }\n+\n+    /// Returns the parsed template for `source`, parsing it on first use.\n+    pub fn get_or_parse(&mut self, source: &str) -> Result<&Template, TemplateError> {\n+        match self.entries.entry(source.to_string()) {\n+            Entry::Occupied(entry) => {\n+                self.hits += 1;\n+                Ok(entry.into_mut())\n+            }\n+            Entry::Vacant(entry) => {\n+                self.misses += 1;\n+                Ok(entry.insert(Template::parse(source)?))\n+            }\n+        }\n+    }\n+\n+    /// Fraction of lookups served from the cache, or `None` before the first lookup.\n+    pub fn hit_rate(&self) -> Option<f64> {\n+        let total = self.hits + self.misses;\n+        (total > 0).then(|| self.hits as f64 / total as f64)\n+    }\n+\n+    /// Drops every cached template and resets the hit statistics.\n+    pub fn clear(&mut self) {\n+        self.entries.clear();\n+        self.hits = 0;\n+        self.misses = 0;\n+    }\n+}\n+\n+#[cfg(test)]\n+mod tests {\n+    use super::*;\n+\n+    #[test]\n+    fn reuses_parsed_templates() {\n+        let mut cache = TemplateCache::new();\n+        cache.get_or_parse(\"{{a}}\").unwrap();\n+        cache.get_or_parse(\"{{a}}\").unwrap();\n+        assert_eq!(cache.hit_rate(), Some(0.5));\n+    }\n+}"
+  },
+  {
+    "filename": "src/engine.rs",
+    "previous_filename": null,
+    "status": "modified",
+    "patch": "@@ -3,8 +3,9 @@ use std::fmt;\n \n use crate::util::strings::is_identifier;\n \n-/// Maximum nesting depth accepted for `{{#if}}` blocks.\n-const MAX_DEPTH: usize = 16;\n+/// Maximum nesting depth accepted for `{{#if}}` blocks. Deeper templates are almost\n+/// always generated, and generators are fine with 32 levels.\n+const MAX_DEPTH: usize = 32;\n \n /// Errors produced while parsing or rendering a template.\n #[derive(Debug, Clone, PartialEq, Eq)]\n@@ -188,9 +189,10 @@ fn render_nodes(\n                 condition,\n                 children,\n             } => {\n-                let enabled = lookup\n-                    .get(condition.as_str())\n-                    .is_some_and(|value| !value.is_empty() && *value != \"false\");\n+                let enabled = match lookup.get(condition.as_str()) {\n+                    Some(value) => !value.is_empty() && !value.eq_ignore_ascii_case(\"false\"),\n+                    None => false,\n+                };\n                 if enabled {\n                     render_nodes(children, lookup, output)?;\n                 }\n@@ -266,4 +268,19 @@ mod tests {\n         let template = Template::parse(\"{{a}}{{#if b}}{{a}}{{c}}{{/if}}\").unwrap();\n         assert_eq!(template.variables(), vec![\"a\", \"b\", \"c\"]);\n     }\n+\n+    #[test]\n+    fn treats_false_case_insensitively() {\n+        let template = Template::parse(\"{{#if on}}yes{{/if}}\").unwrap();\n+        assert_eq!(template.render(&[(\"on\", \"FALSE\")]).unwrap(), \"\");\n+        assert_eq!(template.render(&[(\"on\", \"yes\")]).unwrap(), \"yes\");\n+    }\n+\n+    #[test]\n+    fn rejects_unbalanced_blocks() {\n+        assert!(matches!(\n+            Template::parse(\"{{/if}}\"),\n+            Err(TemplateError::UnbalancedBlock { offset: 0 })\n+        ));\n+    }\n }"
+  },
+  {
+    "filename": "src/lib.rs",
+    "previous_filename": null,
+    "status": "modified",
+    "patch": "@@ -1,7 +1,8 @@\n-pub mod config;\n+pub mod cache;\n pub mod engine;\n pub mod format;\n pub mod legacy;\n+pub mod settings;\n pub mod util;\n \n pub use engine::{Template, TemplateError};"
+  },
+  {
+    "filename": "src/settings.rs",
+    "previous_filename": "src/config.rs",
+    "status": "renamed",
+    "patch": "@@ -37,7 +37,9 @@ pub fn parse_config(source: &str) -> Config {\n         config.strict_variables = value == \"true\";\n     }\n     if let Some(value) = values.get(\"max_output_bytes\") {\n-        config.max_output_bytes = value.parse().unwrap_or(config.max_output_bytes);\n+        if let Ok(max_output_bytes) = value.parse() {\n+            config.max_output_bytes = max_output_bytes;\n+        }\n     }\n     if let Some(value) = values.get(\"trim_blocks\") {\n         config.trim_blocks = value == \"true\";"
+  },
+  {
+    "filename": "src/util/strings.rs",
+    "previous_filename": null,
+    "status": "modified",
+    "patch": "@@ -26,22 +26,6 @@ pub fn truncate(input: &str, max_chars: usize) -> String {\n     output\n }\n \n-/// Converts `snake_case` identifiers to `Title Case`.\n-pub fn title_case(input: &str) -> String {\n-    input\n-        .split('_')\n-        .filter(|word| !word.is_empty())\n-        .map(|word| {\n-            let mut characters = word.chars();\n-            match characters.next() {\n-                Some(first) => first.to_uppercase().chain(characters).collect::<String>(),\n-                None => String::new(),\n-            }\n-        })\n-        .collect::<Vec<_>>()\n-        .join(\" \")\n-}\n-\n /// Returns true when `input` contains only ASCII letters, digits and underscores.\n pub fn is_identifier(input: &str) -> bool {\n     !input.is_empty()\n@@ -64,9 +48,4 @@ mod tests {\n         assert_eq!(truncate(\"abcdef\", 4), \"abcd...\");\n         assert_eq!(truncate(\"abc\", 4), \"abc\");\n     }\n-\n-    #[test]\n-    fn title_cases_identifiers() {\n-        assert_eq!(title_case(\"hello_big_world\"), \"Hello Big World\");\n-    }\n }"
+  }
+]

@@ -1,0 +1,262 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xN1QwMzowMTowM1rOrXCjNw=="
+          },
+          "nodes": [
+            {
+              "id": "PRRT_kwDOVM9_N86tcJxI",
+              "isResolved": false,
+              "isOutdated": false,
+              "subjectType": "LINE",
+              "path": "src/engine.rs",
+              "line": 134,
+              "startLine": 134,
+              "originalLine": 134,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "comments": {
+                "totalCount": 2,
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFw78g",
+                    "databaseId": 4301011954,
+                    "body": "Splitting on `|` means a literal pipe can never appear in a variable name. That's fine today since names are identifiers, but worth a doc comment so nobody adds quoted names later.",
+                    "createdAt": "2026-10-17T02:59:56Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301011954",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "author": {
+                      "__typename": "User",
+                      "login": "drew-council"
+                    }
+                  },
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFw96Q",
+                    "databaseId": 4301012457,
+                    "body": "Good call — I will add a doc comment on `classify_tag` in a follow-up.",
+                    "createdAt": "2026-10-17T03:00:07Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301012457",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "author": {
+                      "__typename": "User",
+                      "login": "drew-council"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOVM9_N86tcJxN",
+              "isResolved": false,
+              "isOutdated": false,
+              "subjectType": "LINE",
+              "path": "src/filters.rs",
+              "line": 25,
+              "startLine": 20,
+              "originalLine": 25,
+              "originalStartLine": 20,
+              "diffSide": "RIGHT",
+              "startDiffSide": "RIGHT",
+              "comments": {
+                "totalCount": 1,
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFw79g",
+                    "databaseId": 4301011958,
+                    "body": "This accepts `truncate( 8 )` but silently returns `None` for `truncate(-1)` and `truncate(8` — could we surface *why* parsing failed?\n\n```rust\nFilter::parse(\"truncate(8\") // None, reported as UnknownFilter\n```",
+                    "createdAt": "2026-10-17T02:59:56Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301011958",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "author": {
+                      "__typename": "User",
+                      "login": "drew-council"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOVM9_N86tcJxO",
+              "isResolved": true,
+              "isOutdated": false,
+              "subjectType": "LINE",
+              "path": "src/util/strings.rs",
+              "line": 48,
+              "startLine": 48,
+              "originalLine": 48,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "comments": {
+                "totalCount": 1,
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFw79w",
+                    "databaseId": 4301011959,
+                    "body": "Should hyphens in the input be treated as separators too? `kebab_case(\"a-b c\")` currently gives `a-b-c`, which happens to be right, but `kebab_case(\"a--b\")` keeps the double hyphen.",
+                    "createdAt": "2026-10-17T02:59:56Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301011959",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "author": {
+                      "__typename": "User",
+                      "login": "drew-council"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOVM9_N86tcJxR",
+              "isResolved": false,
+              "isOutdated": true,
+              "subjectType": "LINE",
+              "path": "src/engine.rs",
+              "line": null,
+              "startLine": null,
+              "originalLine": 223,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "comments": {
+                "totalCount": 1,
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFw7-w",
+                    "databaseId": 4301011963,
+                    "body": "Treating `\"0\"` as false is a behaviour change for existing templates. Can we call it out in the changelog, or gate it behind a setting?",
+                    "createdAt": "2026-10-17T02:59:56Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301011963",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "5c5cdf448832bafac6e57e6dc7ece99b69ada5ce"
+                    },
+                    "author": {
+                      "__typename": "User",
+                      "login": "drew-council"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOVM9_N86tcJxU",
+              "isResolved": false,
+              "isOutdated": false,
+              "subjectType": "LINE",
+              "path": "src/engine.rs",
+              "line": 193,
+              "startLine": 193,
+              "originalLine": 193,
+              "originalStartLine": null,
+              "diffSide": "LEFT",
+              "startDiffSide": null,
+              "comments": {
+                "totalCount": 1,
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFw8AA",
+                    "databaseId": 4301011968,
+                    "body": "The old check was case-sensitive (`FALSE` was truthy). The new `is_truthy` keeps that — intentional?",
+                    "createdAt": "2026-10-17T02:59:56Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301011968",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "author": {
+                      "__typename": "User",
+                      "login": "drew-council"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOVM9_N86tcJ3I",
+              "isResolved": false,
+              "isOutdated": false,
+              "subjectType": "FILE",
+              "path": "docs/guide.md",
+              "line": 1,
+              "startLine": null,
+              "originalLine": 1,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "comments": {
+                "totalCount": 1,
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFw-SQ",
+                    "databaseId": 4301012553,
+                    "body": "The filters table should say that filter arguments are integers only for now (`truncate(n)`), otherwise people will try `{{date | format(\"%Y\")}}`.",
+                    "createdAt": "2026-10-17T03:00:08Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301012553",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "author": {
+                      "__typename": "User",
+                      "login": "drew-council"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOVM9_N86tcKM3",
+              "isResolved": false,
+              "isOutdated": false,
+              "subjectType": "LINE",
+              "path": "src/filters.rs",
+              "line": 38,
+              "startLine": 38,
+              "originalLine": 38,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "comments": {
+                "totalCount": 1,
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOVM9_N88AAAABAFxHVw",
+                    "databaseId": 4301014871,
+                    "body": "`to_uppercase` allocates and handles full Unicode case mapping; if templates are ASCII-only, `to_ascii_uppercase` is cheaper.\n\n```suggestion\n            Filter::Upper => value.to_ascii_uppercase(),\n```",
+                    "createdAt": "2026-10-17T03:01:03Z",
+                    "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r4301014871",
+                    "state": "SUBMITTED",
+                    "commit": {
+                      "oid": "3f22f1b3bd52ed79a655a055209707e356fa8253"
+                    },
+                    "author": {
+                      "__typename": "Bot",
+                      "login": "github-actions"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

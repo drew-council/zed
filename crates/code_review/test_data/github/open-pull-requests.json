@@ -1,0 +1,66 @@
+{
+  "data": {
+    "repository": {
+      "pullRequests": {
+        "nodes": [
+          {
+            "number": 4,
+            "title": "[probe] Harden settings parsing and add a template cache",
+            "url": "https://github.com/drew-council/code-review-sandbox/pull/4",
+            "isDraft": false,
+            "isCrossRepository": false,
+            "headRefName": "bot/api-probe",
+            "baseRefName": "main",
+            "updatedAt": "2026-10-17T03:11:20Z",
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            }
+          },
+          {
+            "number": 1,
+            "title": "Add template filters and retire the legacy renderer",
+            "url": "https://github.com/drew-council/code-review-sandbox/pull/1",
+            "isDraft": false,
+            "isCrossRepository": false,
+            "headRefName": "feature/template-filters",
+            "baseRefName": "main",
+            "updatedAt": "2026-10-17T03:01:03Z",
+            "author": {
+              "__typename": "User",
+              "login": "drew-council"
+            }
+          },
+          {
+            "number": 3,
+            "title": "Harden settings parsing and add a template cache",
+            "url": "https://github.com/drew-council/code-review-sandbox/pull/3",
+            "isDraft": false,
+            "isCrossRepository": false,
+            "headRefName": "bot/harden-settings",
+            "baseRefName": "main",
+            "updatedAt": "2026-10-17T02:58:29Z",
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            }
+          },
+          {
+            "number": 2,
+            "title": "Fix truncate overflowing the requested width",
+            "url": "https://github.com/drew-council/code-review-sandbox/pull/2",
+            "isDraft": false,
+            "isCrossRepository": false,
+            "headRefName": "fix/truncate-ellipsis",
+            "baseRefName": "main",
+            "updatedAt": "2026-10-17T02:57:30Z",
+            "author": {
+              "__typename": "User",
+              "login": "drew-council"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

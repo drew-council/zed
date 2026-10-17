@@ -1,0 +1,13 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "3f22f1b3bd52ed79a655a055209707e356fa8253",
+        "state": "OPEN",
+        "pendingReviews": {
+          "nodes": []
+        }
+      }
+    }
+  }
+}

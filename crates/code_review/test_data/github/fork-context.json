@@ -1,0 +1,18 @@
+{
+  "data": {
+    "viewer": {
+      "login": "drew-council"
+    },
+    "repository": {
+      "nameWithOwner": "drew-council/zed",
+      "url": "https://github.com/drew-council/zed",
+      "sshUrl": "git@github.com:drew-council/zed.git",
+      "isFork": true,
+      "parent": {
+        "nameWithOwner": "zed-industries/zed",
+        "url": "https://github.com/zed-industries/zed",
+        "sshUrl": "git@github.com:zed-industries/zed.git"
+      }
+    }
+  }
+}
