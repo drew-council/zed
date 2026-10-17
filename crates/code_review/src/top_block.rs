@@ -12,20 +12,25 @@ use crate::{
 };
 use anyhow::Result;
 use collections::HashMap;
-use editor::hover_markdown_style;
+use editor::{
+    Anchor,
+    display_map::{BlockPlacement, BlockProperties, BlockStyle},
+    hover_markdown_style,
+};
 use git::repository::CommitData;
-use gpui::{Entity, FontWeight, ScrollHandle, Subscription, WeakEntity};
+use gpui::{AnyView, Entity, FontWeight, Subscription, WeakEntity};
 use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
-use ui::{Checkbox, Disclosure, ToggleState, Tooltip, WithScrollbar as _, prelude::*};
+use ui::{Checkbox, Disclosure, ToggleState, Tooltip, prelude::*};
 use util::{ResultExt as _, truncate_and_trailoff};
 
-/// The fixed header above a review's diff: the commit messages of a commit review, the base of a
-/// branch review, or a pull request's description and reviews, then the review-level comments.
-/// It sits outside the editor because a custom block can't go above the first file header, and
-/// editor blocks are lost whenever the left side of a split diff is recreated.
+/// The review's overview, at the top of the diff: the commit messages of a commit review, the
+/// base of a branch review, or a pull request's description and reviews, then the review-level
+/// comments. It is a block above the first file (in the right side's editor, drawn across both
+/// sides of a split diff), so it scrolls away with the diff like the rest of the document.
+/// Nothing in it scrolls on its own.
 pub(crate) struct ReviewTopBlock {
     content: TopBlockContent,
     expanded: bool,
@@ -35,11 +40,7 @@ pub(crate) struct ReviewTopBlock {
     language_registry: Arc<LanguageRegistry>,
     /// A pull request's description and review summaries, rendered.
     markdown: HashMap<SharedString, Entity<Markdown>>,
-    scroll_handle: ScrollHandle,
-    comments_scroll_handle: ScrollHandle,
     hovered_link: HoveredLink,
-    /// The URL of the review posted from Zed that the description block last scrolled to.
-    revealed_review: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -93,18 +94,14 @@ impl ReviewTopBlock {
             cx.observe(&diff, |_, _, cx| cx.notify()),
             cx.observe(&comments, |_, _, cx| cx.notify()),
         ];
-        let mut revealed_review = None;
         if let TopBlockContent::PullRequest {
             state: Some(state), ..
         } = &content
         {
             subscriptions.push(cx.observe(state, |this, _, cx| {
                 this.sync_pull_request_markdown(cx);
-                this.reveal_posted_review(cx);
                 cx.notify();
             }));
-            // A tab opened after a review was posted starts at the description.
-            revealed_review = state.read(cx).posted_review_url().cloned();
         }
         // A pull request's description is what the review is about; commit messages stay out
         // of the way until asked for.
@@ -117,10 +114,7 @@ impl ReviewTopBlock {
             comments,
             language_registry,
             markdown: HashMap::default(),
-            scroll_handle: ScrollHandle::new(),
-            comments_scroll_handle: ScrollHandle::new(),
             hovered_link: HoveredLink::default(),
-            revealed_review,
             _subscriptions: subscriptions,
         };
         this.sync_pull_request_markdown(cx);
@@ -164,38 +158,6 @@ impl ReviewTopBlock {
         }
     }
 
-    /// Once the review just posted from Zed is loaded, scrolls the description block to its
-    /// summary: it comes last, below a description that can fill the block's 8 lines.
-    fn reveal_posted_review(&mut self, cx: &mut Context<Self>) {
-        let TopBlockContent::PullRequest {
-            state: Some(state), ..
-        } = &self.content
-        else {
-            return;
-        };
-        let state = state.read(cx);
-        let Some(url) = state.posted_review_url() else {
-            return;
-        };
-        if self.revealed_review.as_ref() == Some(url) {
-            return;
-        }
-        let Some(index) = state
-            .visible_summaries()
-            .position(|summary| &summary.url == url)
-        else {
-            return;
-        };
-        // After the description and the "Reviews" label.
-        self.scroll_handle.scroll_to_item(2 + index);
-        self.revealed_review = Some(url.clone());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn description_scroll_offset(&self) -> Pixels {
-        self.scroll_handle.offset().y
-    }
-
     #[cfg(test)]
     pub(crate) fn markdown_source(&self, key: &str, cx: &App) -> Option<SharedString> {
         self.markdown
@@ -217,6 +179,36 @@ impl ReviewTopBlock {
 
     pub(crate) fn has_content(&self) -> bool {
         !matches!(self.content, TopBlockContent::None)
+    }
+
+    /// Whether there's nothing to show: an uncommitted review without review-level comments.
+    /// The diff then starts with its first file.
+    pub(crate) fn is_empty(&self, cx: &App) -> bool {
+        !self.has_content() && self.comments.read(cx).review_comment_views(cx).is_empty()
+    }
+
+    /// The block that shows the overview above the first file of the diff's right side, drawn
+    /// across both sides of a split diff (`Editor::set_full_width_block`). It takes the height
+    /// of its content once rendered.
+    pub(crate) fn block_properties(top_block: &Entity<Self>) -> BlockProperties<Anchor> {
+        // Weak: the overview holds the diff, whose editor holds the block.
+        let view = AnyView::from(top_block.clone()).downgrade();
+        BlockProperties {
+            placement: BlockPlacement::Above(Anchor::Min),
+            height: Some(1),
+            // Not moved by the diff's horizontal scroll.
+            style: BlockStyle::Sticky,
+            priority: 0,
+            render: Arc::new(move |cx| {
+                // Opaque over the whole block: the left side's spacer is under it.
+                div()
+                    .size_full()
+                    .bg(cx.theme().colors().editor_background)
+                    .block_mouse_except_scroll()
+                    .children(view.upgrade())
+                    .into_any_element()
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -416,13 +408,17 @@ impl ReviewTopBlock {
             .gap_1()
             .min_w_0()
             .child(
-                Disclosure::new("review-pull-request-description", self.expanded)
-                    .tooltip(Tooltip::text(if self.expanded {
-                        "Hide Description"
-                    } else {
-                        "Show Description"
-                    }))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
+                div()
+                    .debug_selector(|| "review-pull-request-disclosure".into())
+                    .child(
+                        Disclosure::new("review-pull-request-description", self.expanded)
+                            .tooltip(Tooltip::text(if self.expanded {
+                                "Hide Description"
+                            } else {
+                                "Show Description"
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
+                    ),
             )
             .child(
                 Label::new(details.title.clone())
@@ -520,55 +516,47 @@ impl ReviewTopBlock {
                         }),
                 )
                 .child(
-                    div()
-                        .relative()
+                    v_flex()
+                        .id("review-pull-request-description-text")
+                        .debug_selector(|| "review-pull-request-description-text".into())
                         .w_full()
-                        .child(
-                            v_flex()
-                                .id("review-pull-request-description-text")
+                        .gap_1()
+                        .child(match description {
+                            Some(description) => div()
                                 .w_full()
-                                .gap_1()
-                                .max_h(window.line_height() * 8.)
-                                .overflow_y_scroll()
-                                .track_scroll(&self.scroll_handle)
-                                .child(match description {
-                                    Some(description) => div()
-                                        .w_full()
-                                        .text_sm()
-                                        .child(untrusted_markdown(
-                                            description,
-                                            markdown_style,
-                                            DESCRIPTION_KEY,
-                                            |this: &mut Self| &mut this.hovered_link,
-                                            cx,
-                                        ))
-                                        .into_any_element(),
-                                    None => Label::new("No description provided.")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .into_any_element(),
+                                .text_sm()
+                                .child(untrusted_markdown(
+                                    description,
+                                    markdown_style,
+                                    DESCRIPTION_KEY,
+                                    |this: &mut Self| &mut this.hovered_link,
+                                    cx,
+                                ))
+                                .into_any_element(),
+                            None => Label::new("No description provided.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .into_any_element(),
+                        })
+                        .when(!summaries.is_empty(), |list| {
+                            list.child(
+                                Label::new("Reviews")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .children(summaries)
+                        })
+                        .when(hidden_bot_summaries > 0, |list| {
+                            list.child(
+                                Label::new(if hidden_bot_summaries == 1 {
+                                    "1 bot review hidden".to_string()
+                                } else {
+                                    format!("{hidden_bot_summaries} bot reviews hidden")
                                 })
-                                .when(!summaries.is_empty(), |list| {
-                                    list.child(
-                                        Label::new("Reviews")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .children(summaries)
-                                })
-                                .when(hidden_bot_summaries > 0, |list| {
-                                    list.child(
-                                        Label::new(if hidden_bot_summaries == 1 {
-                                            "1 bot review hidden".to_string()
-                                        } else {
-                                            format!("{hidden_bot_summaries} bot reviews hidden")
-                                        })
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    )
-                                }),
-                        )
-                        .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                        }),
                 )
                 .child(self.render_thread_filters(state, cx))
                 .children(load_errors.iter().map(|error| {
@@ -701,37 +689,28 @@ impl ReviewTopBlock {
             CommitsState::Loaded { commits, truncated } => {
                 let timezone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
                 let markdown_style = hover_markdown_style(window, cx);
-                div()
-                    .relative()
+                v_flex()
+                    .id("review-commit-messages-list")
                     .w_full()
-                    .child(
-                        v_flex()
-                            .id("review-commit-messages-list")
-                            .w_full()
-                            .max_h(window.line_height() * 16.)
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                            .children(commits.iter().map(|commit| {
-                                let body = commit.body.clone().map(|body| {
-                                    untrusted_markdown(
-                                        body,
-                                        markdown_style.clone(),
-                                        SharedString::from(commit.data.sha.to_string()),
-                                        |this: &mut Self| &mut this.hovered_link,
-                                        cx,
-                                    )
-                                });
-                                render_commit(commit, body, timezone, cx)
-                            }))
-                            .when(*truncated, |list| {
-                                list.child(
-                                    Label::new("…and more commits")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                            }),
-                    )
-                    .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+                    .children(commits.iter().map(|commit| {
+                        let body = commit.body.clone().map(|body| {
+                            untrusted_markdown(
+                                body,
+                                markdown_style.clone(),
+                                SharedString::from(commit.data.sha.to_string()),
+                                |this: &mut Self| &mut this.hovered_link,
+                                cx,
+                            )
+                        });
+                        render_commit(commit, body, timezone, cx)
+                    }))
+                    .when(*truncated, |list| {
+                        list.child(
+                            Label::new("…and more commits")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
                     .into_any_element()
             }
         });
@@ -877,6 +856,8 @@ impl Render for ReviewTopBlock {
         // The bottom of the block has the thread toggles and the review comments.
         let hovered_link = self.hovered_link.render_below(cx);
         v_flex()
+            .id("review-overview")
+            .debug_selector(|| "review-overview".into())
             .relative()
             .w_full()
             .flex_none()
@@ -890,28 +871,15 @@ impl Render for ReviewTopBlock {
             .when(!review_comments.is_empty(), |top_block| {
                 top_block.child(
                     v_flex()
+                        .id("review-comments-list")
+                        .w_full()
                         .gap_1()
                         .child(
                             Label::new("Review comments")
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         )
-                        .child(
-                            div()
-                                .relative()
-                                .w_full()
-                                .child(
-                                    v_flex()
-                                        .id("review-comments-list")
-                                        .w_full()
-                                        .gap_1()
-                                        .max_h(window.line_height() * 16.)
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.comments_scroll_handle)
-                                        .children(review_comments),
-                                )
-                                .vertical_scrollbar_for(&self.comments_scroll_handle, window, cx),
-                        ),
+                        .children(review_comments),
                 )
             })
             .children(hovered_link)

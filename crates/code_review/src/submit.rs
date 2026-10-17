@@ -1518,10 +1518,12 @@ mod review_tests {
         let mut outcome = session.update(cx, |session, _| session.wait_for_outcome());
         let threads_loaded = requests_of(&requests, "ReviewThreads");
         let top_block = review.read_with(cx, |review, _| review.top_block().clone());
-        let description_scroll_offset = |cx: &mut VisualTestContext| {
-            top_block.read_with(cx, |top_block, _| top_block.description_scroll_offset())
+        let shows_posted_review = |cx: &mut VisualTestContext| {
+            top_block.read_with(cx, |top_block, _| {
+                top_block.markdown_keys().contains(&"PRR_9".into())
+            })
         };
-        assert_eq!(description_scroll_offset(cx), px(0.));
+        assert!(!shows_posted_review(cx));
 
         cx.simulate_keystrokes("; s");
         let modal = modal(&review, cx).expect("the submit modal opens");
@@ -1616,9 +1618,9 @@ mod review_tests {
         let rows = review.read_with(cx, |review, cx| review.panel_comments(cx));
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|row| row.remote), "{:?}", rows.len());
-        // The description block, capped below the long description, scrolls to the posted
-        // review's summary (R2).
-        assert!(description_scroll_offset(cx) < px(0.));
+        // The posted review's summary is in the overview, after the description (which
+        // doesn't scroll on its own any more: the overview scrolls with the diff).
+        assert!(shows_posted_review(cx));
 
         // Nothing is left to submit: a comment review then needs a body.
         cx.simulate_keystrokes("; s");

@@ -76,8 +76,6 @@ pub struct PullRequestState {
     review_event: ReviewEvent,
     /// The threads loaded since the last review was posted: the posted drafts are among them.
     threads_include_submitted: bool,
-    /// The URL of the last review posted from Zed, whose summary the top block scrolls to.
-    posted_review_url: Option<SharedString>,
     _load_task: Task<()>,
     /// Owned here, not by the submit modal: closing the modal (or every tab) mustn't cancel a
     /// review GitHub may already be making.
@@ -205,7 +203,6 @@ impl PullRequestState {
                 uncertain_submit: None,
                 review_event: ReviewEvent::Comment,
                 threads_include_submitted: false,
-                posted_review_url: None,
                 _load_task: Task::ready(()),
                 _submit_task: Task::ready(()),
             };
@@ -324,10 +321,6 @@ impl PullRequestState {
     /// drafts needn't be listed next to them.
     pub(crate) fn threads_include_submitted(&self) -> bool {
         self.threads_include_submitted
-    }
-
-    pub(crate) fn posted_review_url(&self) -> Option<&SharedString> {
-        self.posted_review_url.as_ref()
     }
 
     /// Loads the details, threads, summaries and GitHub's diff again (on request, after a
@@ -648,7 +641,6 @@ impl PullRequestState {
         });
         self.review_event = ReviewEvent::Comment;
         self.threads_include_submitted = false;
-        self.posted_review_url = Some(url.clone());
         self.reload(cx);
         let toast = Toast::new(
             NotificationId::unique::<ReviewSubmittedToast>(),
@@ -3375,6 +3367,252 @@ pub(crate) mod tests {
             assert!(remote_keys(&review, cx).contains(&thread("PRRT_file")));
             let (scroll_top, header_row) = scroll_and_header_rows(cx);
             assert_eq!(scroll_top, header_row);
+        }
+
+        /// The first blocks of a side: (display row, id, height, whether it's a spacer).
+        fn first_blocks(
+            editor: &Entity<Editor>,
+            cx: &mut VisualTestContext,
+        ) -> Vec<(u32, editor::display_map::BlockId, u32, bool)> {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                snapshot
+                    .blocks_in_range(editor::display_map::DisplayRow(0)..snapshot.max_point().row())
+                    .take(2)
+                    .map(|(row, block)| {
+                        (
+                            row.0,
+                            block.id(),
+                            block.height(),
+                            block.style() == editor::display_map::BlockStyle::Spacer,
+                        )
+                    })
+                    .collect()
+            })
+        }
+
+        fn draw(cx: &mut VisualTestContext) {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
+
+        /// The overview (the description, the reviews, the thread toggles, the review comments)
+        /// is a block above the first file: it scrolls away with the diff like the rest of the
+        /// document, nothing in it scrolls on its own, it collapses to its header line, and
+        /// `g g` puts the first file's header at the top with the overview just above it (tuicr).
+        #[gpui::test]
+        async fn test_overview_scrolls_with_the_diff(cx: &mut TestAppContext) {
+            use editor::display_map::BlockId;
+
+            let (_fs, _workspace, review, _requests, cx) =
+                open_review(Fixture::default(), cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let overview = review
+                .read_with(cx, |review, _| review.top_block_id())
+                .expect("the overview has a block");
+            let blocks = first_blocks(&rhs, cx);
+            assert_eq!(blocks[0].0, 0);
+            assert_eq!(blocks[0].1, BlockId::Custom(overview));
+            let overview_rows = blocks[0].2;
+            assert!(
+                matches!(blocks[1].1, BlockId::ExcerptBoundary(_)),
+                "the first file's header follows: {blocks:?}"
+            );
+            assert_eq!(blocks[1].0, overview_rows);
+
+            let scroll_top = |cx: &mut VisualTestContext| {
+                rhs.update(cx, |editor, cx| editor.scroll_position(cx).y)
+            };
+            let scroll_to = |y: f64, cx: &mut VisualTestContext| {
+                rhs.update_in(cx, |editor, window, cx| {
+                    editor.set_scroll_position(gpui::point(0., y), window, cx)
+                });
+                cx.run_until_parked();
+                draw(cx);
+            };
+            let has_sticky_header = |cx: &mut VisualTestContext| {
+                rhs.update_in(cx, |editor, window, cx| {
+                    let snapshot = editor.snapshot(window, cx);
+                    snapshot
+                        .sticky_header_excerpt(snapshot.scroll_position().y)
+                        .is_some()
+                })
+            };
+
+            // Opened at the top, the description in full (it scrolled after 8 lines).
+            assert_eq!(scroll_top(cx), 0.);
+            assert_eq!(
+                path_at_cursor(&review, cx).as_deref(),
+                Some("docs/guide.md")
+            );
+            draw(cx);
+            let line_height = rhs.update_in(cx, |editor, window, cx| {
+                editor
+                    .style(cx)
+                    .text
+                    .line_height_in_pixels(window.rem_size())
+            });
+            let description = cx
+                .debug_bounds("review-pull-request-description-text")
+                .expect("the description shows");
+            assert!(
+                description.size.height > line_height * 8.,
+                "{description:?}, {line_height:?}"
+            );
+            assert!(!has_sticky_header(cx));
+
+            // Scrolled past it, it's gone with the rows above, and the first file's header is
+            // the sticky one; scrolled back, it shows again.
+            scroll_to(f64::from(overview_rows) + 1., cx);
+            assert!(cx.debug_bounds("review-overview").is_none());
+            assert!(has_sticky_header(cx));
+            scroll_to(f64::from(overview_rows) - 2., cx);
+            assert!(cx.debug_bounds("review-overview").is_some());
+            assert!(!has_sticky_header(cx));
+
+            // `g g` from the end: the first file's header at the top.
+            cx.simulate_keystrokes("shift-g");
+            assert!(scroll_top(cx) > f64::from(overview_rows));
+            cx.simulate_keystrokes("g g");
+            assert_eq!(
+                path_at_cursor(&review, cx).as_deref(),
+                Some("docs/guide.md")
+            );
+            assert_eq!(scroll_top(cx), f64::from(overview_rows));
+
+            // Its disclosure collapses it to the header line, which `; t`'s action expands.
+            scroll_to(0., cx);
+            let disclosure = cx
+                .debug_bounds("review-pull-request-disclosure")
+                .expect("the disclosure shows");
+            cx.simulate_click(disclosure.center(), gpui::Modifiers::none());
+            draw(cx);
+            cx.run_until_parked();
+            let collapsed_rows = first_blocks(&rhs, cx)[0].2;
+            assert!(collapsed_rows < 4, "{collapsed_rows} rows");
+            assert!(
+                cx.debug_bounds("review-pull-request-description-text")
+                    .is_none()
+            );
+            cx.dispatch_action(crate::ToggleHeader);
+            draw(cx);
+            cx.run_until_parked();
+            assert_eq!(first_blocks(&rhs, cx)[0].2, overview_rows);
+
+            // Too tall for the view, the overview shows its bottom for `; c`: the new review
+            // comment's editor, measured once it's rendered.
+            cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(500.)));
+            cx.run_until_parked();
+            cx.simulate_keystrokes("shift-g ; c");
+            draw(cx);
+            cx.run_until_parked();
+            draw(cx);
+            cx.run_until_parked();
+            let overview_rows = first_blocks(&rhs, cx)[0].2;
+            let visible_lines = rhs.update(cx, |editor, _| editor.visible_line_count().unwrap());
+            assert!(f64::from(overview_rows) > visible_lines);
+            assert_eq!(
+                scroll_top(cx),
+                f64::from(overview_rows) - visible_lines.floor()
+            );
+            assert!(has_open_comment_editor(&review, cx));
+        }
+
+        /// In split view the overview is drawn across both sides, over the left side's spacer
+        /// for it (rows stay aligned), also once the left side is recreated (a split toggle, a
+        /// pane too narrow and wide again); a review comment being written in it keeps its text
+        /// and the focus meanwhile.
+        #[gpui::test]
+        async fn test_overview_in_split_view(cx: &mut TestAppContext) {
+            use editor::{ToggleSplitDiff, display_map::BlockId};
+
+            let fixture = Fixture {
+                split: true,
+                ..Fixture::default()
+            };
+            let (_fs, _workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1000.)));
+            cx.run_until_parked();
+            let overview = review
+                .read_with(cx, |review, _| review.top_block_id())
+                .expect("the overview has a block");
+            let check_sides = |cx: &mut VisualTestContext| {
+                assert!(splittable(&review, cx).read_with(cx, |editor, _| editor.is_split()));
+                let rhs_blocks = first_blocks(&rhs_editor(&review, cx), cx);
+                let lhs_blocks = first_blocks(&lhs_editor(&review, cx), cx);
+                assert_eq!(rhs_blocks[0].0, 0);
+                assert_eq!(rhs_blocks[0].1, BlockId::Custom(overview));
+                assert_eq!(
+                    (lhs_blocks[0].0, lhs_blocks[0].2, lhs_blocks[0].3),
+                    (0, rhs_blocks[0].2, true),
+                    "the left side starts with the overview's spacer: {lhs_blocks:?}"
+                );
+                assert_eq!(
+                    lhs_blocks[1].0, rhs_blocks[1].0,
+                    "the headers face each other"
+                );
+                draw(cx);
+                let viewport = cx.update(|window, _| window.viewport_size());
+                let shown = cx
+                    .debug_bounds("review-overview")
+                    .expect("the overview shows");
+                assert!(
+                    shown.size.width > viewport.width * 0.75,
+                    "across both sides: {shown:?} in {viewport:?}"
+                );
+            };
+            check_sides(cx);
+
+            cx.simulate_keystrokes("; c");
+            cx.simulate_input("overall");
+            let unsaved = |cx: &mut VisualTestContext| {
+                review.read_with(cx, |review, cx| {
+                    review
+                        .comments()
+                        .read(cx)
+                        .unsaved_bodies(cx)
+                        .into_values()
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert_eq!(unsaved(cx), ["overall"]);
+
+            let toggle_split = |cx: &mut VisualTestContext| {
+                splittable(&review, cx).update_in(cx, |editor, window, cx| {
+                    editor.toggle_split(&ToggleSplitDiff, window, cx)
+                });
+                cx.run_until_parked();
+                draw(cx);
+                cx.run_until_parked();
+            };
+            toggle_split(cx);
+            assert!(!splittable(&review, cx).read_with(cx, |editor, _| editor.is_split()));
+            assert_eq!(
+                first_blocks(&rhs_editor(&review, cx), cx)[0].1,
+                BlockId::Custom(overview)
+            );
+            cx.simulate_input(" one");
+            toggle_split(cx);
+            check_sides(cx);
+            cx.simulate_input(" two");
+            assert_eq!(unsaved(cx), ["overall one two"]);
+
+            // Too narrow for two sides, then wide again.
+            cx.simulate_resize(gpui::size(gpui::px(500.), gpui::px(1000.)));
+            cx.run_until_parked();
+            draw(cx);
+            cx.run_until_parked();
+            assert!(!splittable(&review, cx).read_with(cx, |editor, _| editor.is_split()));
+            cx.simulate_input(" three");
+            cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1000.)));
+            cx.run_until_parked();
+            draw(cx);
+            cx.run_until_parked();
+            check_sides(cx);
+            cx.simulate_input(" four");
+            assert_eq!(unsaved(cx), ["overall one two three four"]);
         }
     }
 }

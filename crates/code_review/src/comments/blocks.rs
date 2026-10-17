@@ -13,7 +13,10 @@ use collections::{HashMap, HashSet};
 use command_palette_hooks::GlobalCommandPaletteInterceptor;
 use editor::{
     Anchor, Bias, DisplayPoint, Editor, EditorEvent, EditorMode, SelectionEffects,
-    display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
+    display_map::{
+        BlockContext, BlockId, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId,
+        DisplayRow,
+    },
     scroll::{Autoscroll, ScrollAnchor},
 };
 use futures::FutureExt as _;
@@ -75,6 +78,11 @@ pub(crate) struct CommentBlocks {
     /// diff, or lines this tab's checkout numbers differently).
     gate: Option<CommentGate>,
     focus_guard: Option<Subscription>,
+    /// The block showing the review's overview at the top of the right side, with the
+    /// review-level comments in it, while it has something to show.
+    overview_block: Option<CustomBlockId>,
+    /// A review-level comment opened before the overview got its block.
+    reveal_overview_pending: bool,
     _session_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
 }
@@ -284,6 +292,8 @@ impl CommentBlocks {
             targeted: None,
             gate: None,
             focus_guard: None,
+            overview_block: None,
+            reveal_overview_pending: false,
             _session_subscription: session_subscription,
             _subscriptions: subscriptions,
         };
@@ -531,6 +541,52 @@ impl CommentBlocks {
                 return;
             }
         }
+        // The overview sits above the first file like its file blocks (tuicr's `gg`: the first
+        // file's header at the top, the overview just above it).
+        if self.overview_block.is_some() {
+            self.focused_diff_editor(cx).update(cx, |editor, cx| {
+                let first_row = editor
+                    .buffer()
+                    .read(cx)
+                    .snapshot(cx)
+                    .anchor_before(Point::zero());
+                show_file_start(editor, first_row, cx);
+            });
+        }
+    }
+
+    /// The overview's block, hosted by the review tab while the overview has something to show.
+    pub(crate) fn set_overview_block(
+        &mut self,
+        block: Option<CustomBlockId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.overview_block = block;
+        if block.is_some() && std::mem::take(&mut self.reveal_overview_pending) {
+            self.reveal_overview(window, cx);
+        }
+    }
+
+    /// Scrolls the overview (with the review-level comments at its bottom) into view: all of it
+    /// when it fits, else its bottom at the bottom of the view. A comment editor opening in it
+    /// changes its height once rendered, so it's scrolled again after the next frame.
+    fn reveal_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = self.overview_block else {
+            self.reveal_overview_pending = true;
+            return;
+        };
+        let rhs = self.rhs_editor(cx);
+        rhs.update(cx, |editor, cx| {
+            scroll_to_overview(editor, block, window, cx)
+        });
+        let rhs = rhs.downgrade();
+        window.on_next_frame(move |window, cx| {
+            rhs.update(cx, |editor, cx| {
+                scroll_to_overview(editor, block, window, cx)
+            })
+            .log_err();
+        });
     }
 
     /// The pull request's threads this tab shows, in the order they were given.
@@ -1196,7 +1252,7 @@ impl CommentBlocks {
                 view.update(cx, |view, _| view.set_return_to(return_to.downgrade()));
             }
             window.focus(&editor.focus_handle(cx), cx);
-            self.reveal(id, cx);
+            self.reveal(id, window, cx);
             return;
         }
         let Some(comment) = self.session.read(cx).comments().get(id) else {
@@ -1277,7 +1333,7 @@ impl CommentBlocks {
         // A new comment, still empty, only gets its block once it is being edited.
         self.reconcile(window, cx);
         window.focus(&editor.focus_handle(cx), cx);
-        self.reveal(id, cx);
+        self.reveal(id, window, cx);
         cx.emit(CommentBlocksEvent::EditingChanged);
         cx.notify();
     }
@@ -1301,8 +1357,19 @@ impl CommentBlocks {
         }
     }
 
-    /// Scrolls the diff so that the comment's block shows.
-    fn reveal(&self, id: CommentId, cx: &mut Context<Self>) {
+    /// Scrolls the diff so that the comment's block (or the overview, for a review-level
+    /// comment) shows.
+    fn reveal(&mut self, id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .session
+            .read(cx)
+            .comments()
+            .get(id)
+            .is_some_and(|comment| comment.target == CommentTarget::Review)
+        {
+            self.reveal_overview(window, cx);
+            return;
+        }
         let Some(hosted) = self.hosted.get(&ItemKey::Comment(id)) else {
             return;
         };
@@ -2123,6 +2190,11 @@ fn save_text(
 /// (`row`, which the file's blocks sit above) and the header isn't there already. Returns whether
 /// it scrolls.
 fn show_file_start(editor: &mut Editor, row: Anchor, cx: &mut Context<Editor>) -> bool {
+    // The very top shows the overview, or the first file's header already: nothing is under a
+    // sticky header there.
+    if editor.scroll_position(cx).y == 0. {
+        return false;
+    }
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let cursor_row = editor
         .selections
@@ -2165,6 +2237,34 @@ pub(crate) fn keep_scroll_at_start(
             != Anchor::Min
     {
         anchor_scroll_at_start(editor, position.x, window, cx);
+    }
+}
+
+/// Shows the overview block at the top of the right side: from its top when it fits in the
+/// view, else with its bottom at the bottom of the view.
+fn scroll_to_overview(
+    editor: &mut Editor,
+    block: CustomBlockId,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let Some(visible_lines) = editor.visible_line_count() else {
+        return;
+    };
+    let snapshot = editor.display_snapshot(cx);
+    let Some(height) = snapshot
+        .blocks_in_range(DisplayRow(0)..DisplayRow(1))
+        .find(|(_, overview)| overview.id() == BlockId::Custom(block))
+        .map(|(_, overview)| overview.height())
+    else {
+        return;
+    };
+    let scroll_x = editor.scroll_position(cx).x;
+    let top = f64::from(height) - visible_lines.floor();
+    if top <= 0. {
+        anchor_scroll_at_start(editor, scroll_x, window, cx);
+    } else {
+        editor.set_scroll_position(gpui::point(scroll_x, top), window, cx);
     }
 }
 

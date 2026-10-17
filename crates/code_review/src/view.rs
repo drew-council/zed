@@ -35,6 +35,7 @@ use editor::ToPoint as _;
 use editor::{
     Editor, EditorEvent, PathKey, SelectionEffects, SplittableEditor,
     actions::{OpenExcerpts, ReloadFile, ToggleSoftWrap},
+    display_map::CustomBlockId,
     scroll::Autoscroll,
 };
 use git::{Oid, repository::RepoPath, status::FileStatus};
@@ -607,6 +608,9 @@ pub struct ReviewView {
     repo: Entity<Repository>,
     diff: Entity<ReviewDiff>,
     top_block: Entity<ReviewTopBlock>,
+    /// The overview's block at the top of the diff's right side, while the overview has
+    /// something to show.
+    top_block_id: Option<CustomBlockId>,
     line_cursor: Entity<LineCursor>,
     /// Shared by every tab reviewing the same thing; replaced when the review key changes.
     session: Entity<ReviewSession>,
@@ -776,6 +780,9 @@ impl ReviewView {
 
         let git_store = project.read(cx).git_store().clone();
         let mut subscriptions = vec![
+            cx.observe_in(&top_block, window, |this, _, window, cx| {
+                this.sync_top_block_host(window, cx)
+            }),
             // `zed --review --wait` ends once no tab shows the review.
             cx.on_release(|this, cx| this.session.update(cx, |session, _| session.hide(None))),
             cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
@@ -916,11 +923,12 @@ impl ReviewView {
         let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
         let line_cursor = cx.new(|cx| LineCursor::new(splittable, cx));
         let session_subscription = cx.subscribe_in(&session, window, Self::handle_session_event);
-        Self {
+        let mut this = Self {
             target,
             repo,
             diff,
             top_block,
+            top_block_id: None,
             line_cursor,
             session,
             previous_sessions: HashMap::default(),
@@ -937,6 +945,42 @@ impl ReviewView {
             _attributes_task: Task::ready(()),
             _session_subscription: session_subscription,
             _subscriptions: subscriptions,
+        };
+        this.sync_top_block_host(window, cx);
+        this
+    }
+
+    /// Hosts the overview in a block above the diff's first file while it has something to show
+    /// (not in an uncommitted review without review-level comments). The block is on the right
+    /// side, whose editor stays when the diff is split (drawn across both sides then).
+    fn sync_top_block_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let is_empty = self.top_block.read(cx).is_empty(cx);
+        let rhs = self.diff.read(cx).editor().read(cx).rhs_editor().clone();
+        let block = match (is_empty, self.top_block_id) {
+            (false, None) => {
+                let properties = ReviewTopBlock::block_properties(&self.top_block);
+                Some(rhs.update(cx, |editor, cx| {
+                    let ids = editor.insert_blocks([properties], None, cx);
+                    let id = ids.first().copied();
+                    editor.set_full_width_block(id, cx);
+                    id
+                }))
+            }
+            (true, Some(id)) => {
+                rhs.update(cx, |editor, cx| {
+                    editor.set_full_width_block(None, cx);
+                    editor.remove_blocks(HashSet::from_iter([id]), None, cx);
+                });
+                Some(None)
+            }
+            (false, Some(_)) | (true, None) => None,
+        };
+        if let Some(block) = block {
+            self.top_block_id = block;
+            self.comments.update(cx, |comments, cx| {
+                comments.set_overview_block(block, window, cx)
+            });
+            cx.notify();
         }
     }
 
@@ -1593,6 +1637,11 @@ impl ReviewView {
     #[cfg(test)]
     pub(crate) fn top_block(&self) -> &Entity<ReviewTopBlock> {
         &self.top_block
+    }
+
+    #[cfg(test)]
+    pub(crate) fn top_block_id(&self) -> Option<CustomBlockId> {
+        self.top_block_id
     }
 
     pub fn title(&self, cx: &App) -> SharedString {
@@ -2429,6 +2478,10 @@ impl Render for ReviewView {
         let is_branch_review = matches!(self.target, ReviewTarget::Branch { .. });
         let has_top_block = self.top_block.read(cx).has_content();
         let single_file = self.diff.read(cx).single_file().cloned();
+        // Without rows (loading, no changes, every file hidden) the diff shows a placeholder
+        // instead of its editor, which hosts the overview otherwise.
+        let overview_above_placeholder =
+            self.top_block_id.is_some() && self.diff.read(cx).multibuffer().read(cx).is_empty();
         v_flex()
             .key_context("CodeReview")
             .capture_action(|_: &git::ToggleStaged, window, cx| block_write_action(window, cx))
@@ -2464,11 +2517,26 @@ impl Render for ReviewView {
                 view.on_action(cx.listener(Self::toggle_header))
             })
             .size_full()
-            .child(self.top_block.clone())
             .when_some(single_file, |view, path_key| {
                 view.child(self.render_single_file_bar(&path_key, cx))
             })
-            .child(div().flex_1().min_h_0().child(self.diff.clone()))
+            .map(|view| {
+                if overview_above_placeholder {
+                    // One scroll for both, as in the diff.
+                    view.child(
+                        v_flex()
+                            .id("review-overview-without-diff")
+                            .debug_selector(|| "review-overview-without-diff".into())
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(self.top_block.clone())
+                            .child(div().flex_1().min_h(rems(12.)).child(self.diff.clone())),
+                    )
+                } else {
+                    view.child(div().flex_1().min_h_0().child(self.diff.clone()))
+                }
+            })
     }
 }
 
@@ -2990,9 +3058,8 @@ mod tests {
             &[("a.txt", "a\n".into())],
         );
         let project = Project::test(fs, [Path::new(path!("/root/one"))], cx).await;
-        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
-            MultiWorkspace::test_new(project.clone(), window, cx)
-        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace =
             multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
         cx.run_until_parked();
@@ -3604,6 +3671,79 @@ mod tests {
             }
             assert_eq!(review_count(&workspace, cx), 2);
         }
+
+        /// A branch review's overview (its base line) is the diff's first block: it stays
+        /// above the first file when `r` folds that file, and while the filters hide every file
+        /// it's drawn above the diff's placeholder, in one scroll, until they show again.
+        #[gpui::test]
+        async fn test_overview_above_folded_and_hidden_files(cx: &mut TestAppContext) {
+            use crate::test_support::{init_vim_test, is_folded, rhs_editor};
+            use editor::display_map::{Block, DisplayRow};
+
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, workspace, cx) = branch_fixture(cx).await;
+            dispatch(ReviewBranch::default(), cx);
+            let review = active_review(&workspace, cx);
+            cx.focus(&review);
+            cx.run_until_parked();
+            let overview = review
+                .read_with(cx, |review, _| review.top_block_id())
+                .expect("the overview has a block");
+            let rhs = rhs_editor(&review, cx);
+            let first_blocks = |cx: &mut VisualTestContext| {
+                rhs.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    snapshot
+                        .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+                        .take(2)
+                        .map(|(_, block)| match block {
+                            Block::Custom(block) if block.id == overview => "overview",
+                            Block::BufferHeader { .. } => "header",
+                            Block::FoldedBuffer { .. } => "folded",
+                            _ => "other",
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
+            let draw = |cx: &mut VisualTestContext| {
+                cx.run_until_parked();
+                cx.update(|window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                });
+            };
+            assert_eq!(first_blocks(cx), ["overview", "header"]);
+
+            cx.simulate_keystrokes("g g r");
+            assert!(is_folded(&review, "both.txt", cx));
+            assert_eq!(first_blocks(cx), ["overview", "folded"]);
+            assert_eq!(
+                rhs.update(cx, |editor, cx| editor.scroll_position(cx).y),
+                0.
+            );
+
+            let set_exclude = |pattern: &str, cx: &mut VisualTestContext| {
+                review.update_in(cx, |review, window, cx| {
+                    let filters = ReviewFilters {
+                        exclude: filter_regex(pattern).unwrap(),
+                        ..ReviewFilters::default()
+                    };
+                    review.set_filters(filters, window, cx);
+                });
+                draw(cx);
+            };
+            set_exclude(".", cx);
+            assert!(review.read_with(cx, |review, cx| {
+                review.diff().read(cx).multibuffer().read(cx).is_empty()
+            }));
+            assert!(cx.debug_bounds("review-overview").is_some());
+            assert!(cx.debug_bounds("review-overview-without-diff").is_some());
+
+            set_exclude("", cx);
+            assert_eq!(first_blocks(cx)[0], "overview");
+            assert!(cx.debug_bounds("review-overview").is_some());
+            assert!(cx.debug_bounds("review-overview-without-diff").is_none());
+        }
     }
 
     mod read_only {
@@ -3987,6 +4127,86 @@ mod tests {
                 workspace.active_item_as::<Editor>(cx).unwrap()
             });
             assert_eq!(cursor_point(&opened, cx).row, 2);
+        }
+
+        /// Without review comments an uncommitted review has no overview: the diff starts with
+        /// its first file. `; c` brings the overview with the comment's editor, scrolled into
+        /// view from the end of the review, in insert mode; a new comment left empty takes it
+        /// away again. Editing a review comment (the review panel's row) scrolls it into view
+        /// too.
+        #[gpui::test]
+        async fn test_review_comments_bring_the_overview(cx: &mut TestAppContext) {
+            use editor::display_map::DisplayRow;
+
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            // Short enough to scroll.
+            cx.simulate_resize(gpui::size(px(800.), px(400.)));
+            cx.run_until_parked();
+            let rhs = rhs_editor(&review, cx);
+            let overview = |cx: &mut VisualTestContext| {
+                review.read_with(cx, |review, _| review.top_block_id())
+            };
+            let starts_with_a_header = |cx: &mut VisualTestContext| {
+                rhs.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    snapshot
+                        .blocks_in_range(DisplayRow(0)..DisplayRow(1))
+                        .next()
+                        .is_some_and(|(row, block)| row.0 == 0 && block.is_buffer_header())
+                })
+            };
+            let scroll_top = |cx: &mut VisualTestContext| {
+                rhs.update(cx, |editor, cx| editor.scroll_position(cx).y)
+            };
+            let review_comments = |cx: &mut VisualTestContext| {
+                review.read_with(cx, |review, cx| {
+                    review
+                        .session()
+                        .read(cx)
+                        .comments()
+                        .iter()
+                        .filter(|comment| comment.target == CommentTarget::Review)
+                        .map(|comment| comment.body.clone())
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert_eq!(overview(cx), None);
+            assert!(starts_with_a_header(cx));
+
+            cx.simulate_keystrokes("; c");
+            assert!(overview(cx).is_some());
+            cx.simulate_keystrokes("ctrl-enter");
+            assert_eq!(overview(cx), None);
+            assert!(starts_with_a_header(cx));
+
+            cx.simulate_keystrokes("shift-g");
+            assert!(scroll_top(cx) > 0.);
+            cx.simulate_keystrokes("; c");
+            assert!(overview(cx).is_some());
+            assert_eq!(scroll_top(cx), 0.);
+            cx.simulate_input("overall");
+            cx.simulate_keystrokes("ctrl-enter");
+            assert_eq!(review_comments(cx), ["overall"]);
+            assert!(overview(cx).is_some());
+            // The diff's cursor is still at the end, out of view: the next motion goes back.
+            cx.simulate_keystrokes("k");
+            assert!(scroll_top(cx) > 0.);
+            let id = review.read_with(cx, |review, cx| {
+                review
+                    .session()
+                    .read(cx)
+                    .comments()
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .id
+            });
+            let comments = review.read_with(cx, |review, _| review.comments().clone());
+            comments.update_in(cx, |comments, window, cx| comments.edit(id, window, cx));
+            cx.run_until_parked();
+            assert_eq!(scroll_top(cx), 0.);
+            assert!(comments.read_with(cx, |comments, cx| comments.is_editing(cx)));
         }
     }
 }
