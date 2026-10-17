@@ -26,7 +26,7 @@ use crate::{
     reviewed::paint_reviewed_hunks,
     session::{ReviewKey, ReviewSession, ReviewSessionEvent},
     submit::{SubmitReviewModal, finish_local_review},
-    target::{BranchBase, ReviewTarget, parse_commit_spec},
+    target::{BranchBase, CommitRange, ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
 use collections::{HashMap, HashSet};
@@ -354,6 +354,33 @@ fn find_review(
     workspace
         .items_of_type::<ReviewView>(cx)
         .find(|view| view.read(cx).reviews(target, repo))
+}
+
+/// The export's line about a commit review: its commits (tuicr's), or for a long range (or one
+/// whose commits aren't all loaded) how many there are and its ends.
+fn commits_banner(shas: Option<&[String]>, range: &CommitRange) -> String {
+    const MAX_LISTED: usize = 10;
+    let ends = || match range.base {
+        Some(base) => format!("{}..{}", base.display_short(), range.head.display_short()),
+        None => format!("up to {}", range.head.display_short()),
+    };
+    match shas {
+        Some([commit]) => format!("Reviewing commit: {commit}"),
+        Some(commits) if commits.len() <= MAX_LISTED => {
+            format!("Reviewing commits: {}", commits.join(", "))
+        }
+        Some(commits) => format!("Reviewing {} commits: {}", commits.len(), ends()),
+        None => match range.base {
+            Some(_) => format!("Reviewing commits: {}", ends()),
+            None => format!("Reviewing commits {}", ends()),
+        },
+    }
+}
+fn with_repository_name(name: Option<SharedString>, text: SharedString) -> SharedString {
+    match name {
+        Some(name) => format!("{name} \u{b7} {text}").into(),
+        None => text,
+    }
 }
 
 fn branch_name(repo: &Entity<Repository>, cx: &App) -> SharedString {
@@ -1563,6 +1590,24 @@ impl ReviewView {
         }
     }
 
+    /// The repository's name, when the project has several: their reviews' tabs would look the
+    /// same otherwise.
+    fn repository_name(&self, cx: &App) -> Option<SharedString> {
+        let repositories = self
+            .project
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repositories()
+            .len();
+        (repositories > 1).then(|| self.repo.read(cx).display_name())
+    }
+
+    /// [`Self::title`], after the repository's name when the project has several.
+    pub(crate) fn title_with_repository(&self, cx: &App) -> SharedString {
+        with_repository_name(self.repository_name(cx), self.title(cx))
+    }
+
     /// The pull request a pull request review is of.
     pub(crate) fn pull_request(&self) -> Option<&Entity<PullRequestState>> {
         self.pull_request.as_ref()
@@ -2105,24 +2150,13 @@ impl ReviewView {
                     scope: format!("branch {branch} vs {base}"),
                 }
             }
-            ReviewTarget::Commits(range) => {
-                let banner = match self.top_block.read(cx).commit_shas().as_deref() {
-                    Some([commit]) => format!("Reviewing commit: {commit}"),
-                    Some(commits) => format!("Reviewing commits: {}", commits.join(", ")),
-                    None => match range.base {
-                        Some(base) => format!(
-                            "Reviewing commits: {}..{}",
-                            base.display_short(),
-                            range.head.display_short()
-                        ),
-                        None => format!("Reviewing commits up to {}", range.head.display_short()),
-                    },
-                };
-                ExportPreamble {
-                    banner: vec![banner],
-                    scope: "selected commit range".into(),
-                }
-            }
+            ReviewTarget::Commits(range) => ExportPreamble {
+                banner: vec![commits_banner(
+                    self.top_block.read(cx).commit_shas().as_deref(),
+                    range,
+                )],
+                scope: "selected commit range".into(),
+            },
             ReviewTarget::PullRequest(target) => {
                 let name = format!("{}#{}", target.repo, target.number);
                 let mut banner = Vec::new();
@@ -2412,24 +2446,32 @@ impl Item for ReviewView {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        match &self.target {
+        let text: SharedString = match &self.target {
             // "PR #N: …" already says what the tab is.
             ReviewTarget::PullRequest(_) => truncate_and_trailoff(&self.title(cx), 64).into(),
             ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
                 format!("Review: {}", self.title(cx)).into()
             }
-        }
+        };
+        with_repository_name(self.repository_name(cx), text)
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
-        let title = match &self.target {
+        let mut title = match &self.target {
             ReviewTarget::PullRequest(target) => {
-                format!("Review: {} ({})", self.title(cx), target.repo).into()
+                format!("Review: {} ({})", self.title(cx), target.repo)
             }
             ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
-                self.tab_content_text(0, cx)
+                format!("Review: {}", self.title(cx))
             }
         };
+        if self.repository_name(cx).is_some() {
+            title.push_str(&format!(
+                "\n{}",
+                self.repo.read(cx).work_directory_abs_path.display()
+            ));
+        }
+        let title = SharedString::from(title);
         Some(if self.diff.read(cx).is_snapshot(cx) {
             format!("{title}\nRead-only snapshot (no language server)").into()
         } else {
@@ -2587,6 +2629,41 @@ mod tests {
     use unindent::Unindent as _;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_commits_banner() {
+        use crate::test_support::{C1, C2, oid};
+        let range = CommitRange {
+            base: Some(oid(C1)),
+            head: oid(C2),
+        };
+        let shas = |count: usize| (1..=count).map(|n| format!("c{n}")).collect::<Vec<_>>();
+        assert_eq!(
+            commits_banner(Some(shas(1).as_slice()), &range),
+            "Reviewing commit: c1"
+        );
+        assert_eq!(
+            commits_banner(Some(shas(10).as_slice()), &range),
+            "Reviewing commits: c1, c2, c3, c4, c5, c6, c7, c8, c9, c10"
+        );
+        let ends = format!("{}..{}", oid(C1).display_short(), oid(C2).display_short());
+        assert_eq!(
+            commits_banner(Some(shas(100).as_slice()), &range),
+            format!("Reviewing 100 commits: {ends}")
+        );
+        assert_eq!(
+            commits_banner(None, &range),
+            format!("Reviewing commits: {ends}")
+        );
+        let from_root = CommitRange {
+            base: None,
+            head: oid(C2),
+        };
+        assert_eq!(
+            commits_banner(None, &from_root),
+            format!("Reviewing commits up to {}", oid(C2).display_short())
+        );
+    }
 
     #[gpui::test]
     async fn test_review_uncommitted_shows_head_to_working_tree(cx: &mut TestAppContext) {
@@ -2794,6 +2871,67 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             assert_eq!(workspace.items_of_type::<ReviewView>(cx).count(), 0);
             assert!(workspace.active_item(cx).is_none());
+        });
+    }
+
+    /// With several repositories in the project, review tabs say which one they review.
+    #[gpui::test]
+    async fn test_titles_name_the_repository_among_several(cx: &mut TestAppContext) {
+        use workspace::item::Item as _;
+
+        crate::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "one": { ".git": {}, "a.txt": "A\n" },
+                "two": { ".git": {}, "b.txt": "B\n" },
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/root/one/.git")),
+            &[("a.txt", "a\n".into())],
+        );
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/root/two/.git")),
+            &[("b.txt", "b\n".into())],
+        );
+        let project = Project::test(
+            fs,
+            [Path::new(path!("/root/one")), Path::new(path!("/root/two"))],
+            cx,
+        )
+        .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        cx.focus(&workspace);
+        cx.update(|window, cx| window.dispatch_action(ReviewUncommitted.boxed_clone(), cx));
+        cx.run_until_parked();
+
+        let review = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ReviewView>(cx).unwrap()
+        });
+        review.read_with(cx, |review, cx| {
+            let name = review.repo.read(cx).display_name();
+            assert!(name == "one" || name == "two", "{name}");
+            assert_eq!(
+                review.tab_content_text(0, cx),
+                format!("{name} \u{b7} Review: Uncommitted changes")
+            );
+            assert_eq!(
+                review.title_with_repository(cx),
+                format!("{name} \u{b7} Uncommitted changes")
+            );
+            assert!(
+                review
+                    .tab_tooltip_text(cx)
+                    .unwrap()
+                    .ends_with(&format!("{name}"))
+            );
         });
     }
 

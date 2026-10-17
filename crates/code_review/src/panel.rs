@@ -13,7 +13,10 @@ use crate::{
 };
 use anyhow::Result;
 use collections::HashSet;
-use editor::{Editor, EditorEvent, PathKey, actions::MoveToEnd};
+use editor::{
+    Editor, EditorEvent, PathKey,
+    actions::{MoveToEnd, SelectAll},
+};
 use file_icons::FileIcons;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
@@ -756,7 +759,13 @@ impl ReviewPanel {
                 cx,
             );
             editor.set_text(text, window, cx);
-            editor.move_to_end(&MoveToEnd, window, cx);
+            // Typing replaces the last search; a filter's pattern is usually refined.
+            match kind {
+                PromptKind::Search => editor.select_all(&SelectAll, window, cx),
+                PromptKind::Include | PromptKind::Exclude => {
+                    editor.move_to_end(&MoveToEnd, window, cx)
+                }
+            }
             editor
         });
         window.focus(&editor.focus_handle(cx), cx);
@@ -806,6 +815,14 @@ impl ReviewPanel {
                 self.close_prompt(window, cx);
             }
             PromptKind::Search => {
+                if !text.is_empty() && !self.has_match(&text, cx) {
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt.error =
+                            Some(format!("No file path contains \u{201c}{text}\u{201d}").into());
+                    }
+                    cx.notify();
+                    return;
+                }
                 self.search = (!text.is_empty()).then_some(text);
                 self.close_prompt(window, cx);
                 self.select_match(true, window, cx);
@@ -813,11 +830,21 @@ impl ReviewPanel {
         }
     }
 
+    fn has_match(&self, search: &str, cx: &App) -> bool {
+        let search = search.to_lowercase();
+        self.files(cx).iter().any(|file| {
+            file.repo_path
+                .as_unix_str()
+                .to_lowercase()
+                .contains(&search)
+        })
+    }
+
     /// Selects the next (or previous) file whose path contains the search, wrapping around and
-    /// expanding the directories around it.
-    fn select_match(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// expanding the directories around it. Returns whether a file matches.
+    fn select_match(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(search) = self.search.as_ref().map(|search| search.to_lowercase()) else {
-            return;
+            return false;
         };
         let files = self.files(cx);
         let matches = files
@@ -854,7 +881,7 @@ impl ReviewPanel {
                 .or_else(|| matches.last())
         };
         let Some(target) = target.map(|file| (*file).clone()) else {
-            return;
+            return false;
         };
         if let Some(review_id) = self.active_review.as_ref().map(|review| review.entity_id()) {
             self.collapsed.retain(|(id, directory)| {
@@ -867,6 +894,7 @@ impl ReviewPanel {
         ) {
             self.select(index, window, cx);
         }
+        true
     }
 
     fn select_next_match(
@@ -875,7 +903,7 @@ impl ReviewPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_match(true, window, cx);
+        self.select_match_or_say_none(true, window, cx);
     }
 
     fn select_previous_match(
@@ -884,7 +912,19 @@ impl ReviewPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_match(false, window, cx);
+        self.select_match_or_say_none(false, window, cx);
+    }
+
+    /// `n`/`N`: the files may have changed since the search.
+    fn select_match_or_say_none(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search.is_some() && !self.select_match(forward, window, cx) {
+            self.show_toast("No file path contains the search", cx);
+        }
     }
 
     fn cancel_editor(
@@ -1311,7 +1351,7 @@ impl ReviewPanel {
 
     fn render_header(&self, review: &Entity<ReviewView>, cx: &Context<Self>) -> impl IntoElement {
         let review = review.read(cx);
-        let title = review.title(cx);
+        let title = review.title_with_repository(cx);
         let summary = review.summary(cx);
         let status = status_line(
             review.filters(),
@@ -1349,12 +1389,12 @@ impl ReviewPanel {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+            // It wraps: it says what hides files, and has no other place to be read in full.
             .when_some(status, |header, status| {
                 header.child(
                     Label::new(status)
                         .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
+                        .color(Color::Muted),
                 )
             })
     }
@@ -1950,7 +1990,13 @@ mod tests {
         );
 
         // Path search expands collapsed directories, and `n`/`N` wrap.
-        cx.simulate_keystrokes("g g j j space");
+        cx.simulate_keystrokes("g g j j");
+        assert_eq!(selected(&panel, cx), "src/");
+        // `; h` in the panel stays there, and doesn't collapse the directory as `h` would.
+        cx.simulate_keystrokes("; h");
+        assert_eq!(selected(&panel, cx), "src/");
+        assert!(panel_focused(cx));
+        cx.simulate_keystrokes("space");
         assert_eq!(selected(&panel, cx), "src/ ▸");
         cx.simulate_keystrokes("/");
         cx.simulate_input(".RS");
@@ -1962,9 +2008,25 @@ mod tests {
         assert_eq!(selected(&panel, cx), "c.rs A");
         cx.simulate_keystrokes("shift-n");
         assert_eq!(selected(&panel, cx), "mod_b.rs M");
+        // The prompt starts with the last search, selected: typing replaces it.
         cx.simulate_keystrokes("/");
         assert_eq!(prompt(&panel, cx), Some((".RS".into(), None)));
+        cx.simulate_input("lib");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(prompt(&panel, cx), None);
+        assert_eq!(selected(&panel, cx), "lib.rs M");
+        // A search nothing matches keeps the prompt open, and says so.
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("nothing");
+        cx.simulate_keystrokes("enter");
+        let (text, error) = prompt(&panel, cx).unwrap();
+        assert_eq!(text, "nothing");
+        assert_eq!(
+            error.as_deref(),
+            Some("No file path contains \u{201c}nothing\u{201d}")
+        );
         cx.simulate_keystrokes("escape");
+        assert_eq!(selected(&panel, cx), "lib.rs M");
 
         // With everything hidden, the generated and vendored files (hidden anyway) aren't
         // counted among the changed files.
@@ -1972,7 +2034,9 @@ mod tests {
         cx.simulate_input("nothing matches");
         cx.simulate_keystrokes("enter");
         let empty_label = |cx: &mut VisualTestContext| {
-            review.read_with(cx, |review, cx| review.diff().read(cx).empty_label(cx).to_string())
+            review.read_with(cx, |review, cx| {
+                review.diff().read(cx).empty_label(cx).to_string()
+            })
         };
         assert_eq!(empty_label(cx), "All 5 changed files are hidden");
         dispatch(crate::ToggleShowGenerated, cx);

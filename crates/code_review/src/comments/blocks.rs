@@ -1043,7 +1043,7 @@ impl CommentBlocks {
     }
 
     /// Visual `y`: the text of the selected lines, of the side `c` would comment on, and how many
-    /// lines that is. Leaves visual mode, like a yank.
+    /// lines that is. Leaves visual mode on the selection's first row, like a yank.
     pub(crate) fn selected_text(
         &mut self,
         window: &mut Window,
@@ -1051,7 +1051,7 @@ impl CommentBlocks {
     ) -> Option<(String, usize)> {
         let editor = self.focused_diff_editor(cx);
         let selected = self.selected_lines(cx);
-        collapse_selection(&editor, window, cx);
+        collapse_selection_to_start(&editor, window, cx);
         let SelectedLines::Lines {
             side,
             buffer_id,
@@ -2391,6 +2391,22 @@ fn collapse_selection(editor: &Entity<Editor>, window: &mut Window, cx: &mut App
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
             selections.select_ranges([point..point])
         });
+    });
+}
+
+/// Collapses the selection onto its first row's start, where vim leaves the cursor after a
+/// yank.
+fn collapse_selection_to_start(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let start = editor.selections.newest_anchor().start.to_point(&snapshot);
+        let point = Point::new(start.row, 0);
+        editor.change_selections(
+            SelectionEffects::scroll(Autoscroll::fit()),
+            window,
+            cx,
+            |selections| selections.select_ranges([point..point]),
+        );
     });
 }
 
@@ -4355,10 +4371,17 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         cx.simulate_keystrokes("v j y");
         assert_eq!(clipboard(cx), "line 4\nline 5");
         assert_back_in_diff(&rhs, cx);
+        // Like vim's yank, it leaves the cursor at the selection's start.
+        assert_eq!(cursor_line(&rhs, cx), "line 4");
+        move_to_row_with_text(&rhs, "line 5", cx);
+        cx.simulate_keystrokes("shift-v k y");
+        assert_eq!(clipboard(cx), "line 4\nline 5");
+        assert_eq!(cursor_line(&rhs, cx), "line 4");
         // Over removed and added lines, the added lines (and unchanged ones) count.
         move_to_row_with_text(&rhs, "line 1", cx);
         cx.simulate_keystrokes("shift-v j j y");
         assert_eq!(clipboard(cx), "line 1\nLINE 2");
+        assert_eq!(cursor_line(&rhs, cx), "line 1");
         move_to_row_with_text(&rhs, "gone 1", cx);
         cx.simulate_keystrokes("v j y");
         assert_eq!(clipboard(cx), "gone 1\ngone 2");

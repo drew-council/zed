@@ -626,23 +626,24 @@ impl StartReviewDelegate {
             }
             PullRequestList::Loaded(_) => None,
         };
-        // A URL doesn't fuzzy-match its pull request's row.
+        // The named pull request comes first, above rows that only fuzzy-match the query (`1`
+        // matches #17's title, say). A URL doesn't fuzzy-match its pull request's row at all.
         if let Some(number) = listed_reference
             && let Some(index) = self
                 .loaded_pull_requests()
                 .iter()
                 .position(|pull_request| pull_request.number == number)
-            && !pull_request_entries.iter().any(
-                |entry| matches!(entry, Entry::PullRequest { index: shown, .. } if *shown == index),
-            )
         {
-            pull_request_entries.insert(
-                0,
-                Entry::PullRequest {
+            let entry = match pull_request_entries.iter().position(
+                |entry| matches!(entry, Entry::PullRequest { index: shown, .. } if *shown == index),
+            ) {
+                Some(position) => pull_request_entries.remove(position),
+                None => Entry::PullRequest {
                     index,
                     positions: Vec::new(),
                 },
-            );
+            };
+            pull_request_entries.insert(0, entry);
         }
         if !matches!(self.pull_requests, PullRequestList::Unsupported) {
             let open_reference = reference
@@ -1545,6 +1546,20 @@ mod tests {
         // A number selects the pull request; one that isn't listed gets its own row.
         picker.update_in(cx, |picker, window, cx| picker.set_query("#1", window, cx));
         cx.run_until_parked();
+        assert_eq!(selected_key(&picker, cx), Some(EntryKey::PullRequest(1)));
+        // It comes first, above pull requests listed before it that match the query too (as if
+        // #4's title had a "1").
+        picker.update(cx, |picker, _| {
+            picker.delegate.set_matches(
+                "1".into(),
+                vec![
+                    (FIRST_PULL_REQUEST_CANDIDATE, Vec::new()),
+                    (FIRST_PULL_REQUEST_CANDIDATE + 1, vec![1]),
+                ],
+            )
+        });
+        let keys = entry_keys(&picker, cx);
+        assert_eq!(keys[keys.len() - 2..], pull_request_keys(&[1, 4]));
         assert_eq!(selected_key(&picker, cx), Some(EntryKey::PullRequest(1)));
         picker.update_in(cx, |picker, window, cx| {
             picker.set_query("drew-council/code-review-sandbox#77", window, cx)
