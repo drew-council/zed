@@ -256,7 +256,32 @@ impl ReviewDiff {
             editor
         });
 
-        let mut subscriptions = vec![cx.subscribe_in(&editor, window, Self::handle_editor_event)];
+        // The container takes the focus only while the diff is empty, but can end up with it
+        // later: a pane remembers it as the tab's focus when the tab got the focus while
+        // loading and focuses it again (closing a split clone does), and GPUI restores the
+        // focus to it when the focused left side of a split diff is dropped. The diff takes it
+        // over, or no key would reach an editor.
+        let focus_handle = cx.focus_handle();
+        let mut subscriptions = vec![
+            cx.subscribe_in(&editor, window, Self::handle_editor_event),
+            cx.on_focus(&focus_handle, window, |this, window, cx| {
+                if !this.multibuffer.read(cx).is_empty() {
+                    this.editor.focus_handle(cx).focus(window, cx);
+                }
+            }),
+            // Runs after the workspace's focus-lost listener, which focuses the container.
+            cx.on_focus_lost(window, |this, window, cx| {
+                let restores_container = window
+                    .focus_lost_restore_target(cx)
+                    .is_some_and(|target| target == this.focus_handle);
+                if restores_container && !this.multibuffer.read(cx).is_empty() {
+                    this.editor.focus_handle(cx).focus(window, cx);
+                    // GPUI doesn't redraw for focus moved by focus-lost listeners, and the
+                    // editors (vim's mode indicator) only learn of the focus on a redraw.
+                    cx.on_next_frame(window, |_, _, cx| cx.notify());
+                }
+            }),
+        ];
         match &source {
             DiffSource::BufferList(list) => subscriptions.extend([
                 cx.subscribe_in(list, window, |this, _, _: &BranchDiffEvent, window, cx| {
@@ -295,7 +320,7 @@ impl ReviewDiff {
             single_file: None,
             hidden: HashSet::default(),
             listed_paths: Vec::new(),
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             empty_label: target.empty_label(),
             all_hidden_label: None,
             workspace: workspace_handle,

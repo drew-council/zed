@@ -1409,12 +1409,15 @@ impl CommentBlocks {
         // When a comment editor lost the focus to a modal (the command palette for `:w`) or to
         // the other side of the diff, the diff editor remembers it as its last focused
         // descendant and focuses it again as soon as it gets the focus itself. This listener
-        // runs after the editor's own and takes the focus back.
+        // runs after the editor's own and takes the focus back. It holds the handle weakly: a
+        // left side dropped before that would otherwise stay focusable, unrendered.
         self.focus_guard = Some(cx.on_focus(&focus_handle, window, {
-            let focus_handle = focus_handle.clone();
+            let focus_handle = focus_handle.downgrade();
             move |this, window, cx| {
                 this.focus_guard = None;
-                window.focus(&focus_handle, cx);
+                if let Some(focus_handle) = focus_handle.upgrade() {
+                    window.focus(&focus_handle, cx);
+                }
             }
         }));
     }
@@ -2326,8 +2329,9 @@ mod tests {
     use crate::{
         ReviewView,
         test_support::{
-            cursor_line, cursor_point, excerpt_paths, init_vim_test, lhs_editor,
-            move_to_row_with_text, open_review_fixture, path_at_cursor, rhs_editor, splittable,
+            active_review, add_review_panel, cursor_line, cursor_point, dispatch, excerpt_paths,
+            init_vim_test, is_folded, lhs_editor, move_to_row_with_text, open_review_fixture,
+            path_at_cursor, review_count, rhs_editor, splittable,
         },
     };
     use fs::Fs as _;
@@ -3277,6 +3281,101 @@ mod tests {
         rhs.update(cx, |editor, cx| editor.unfold_buffer(buffer_id, cx));
         cx.run_until_parked();
         assert_eq!(on_sides(cx), [true]);
+    }
+
+    /// A review opened from outside its pane (the panel here, or the palette) gets the focus
+    /// while it is still loading, so the pane remembers the diff's loading placeholder as the
+    /// tab's focus. Closing a split clone focuses that pane again, which must end in the diff
+    /// (V2.15+; the fold the validation saw is incidental).
+    async fn close_split_clone(fold: bool, cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        cx.simulate_keystrokes(": q enter");
+        cx.run_until_parked();
+        assert_eq!(review_count(&workspace, cx), 0);
+        drop(review);
+        cx.focus(&panel);
+        dispatch(crate::ReviewUncommitted, cx);
+        let review = active_review(&workspace, cx);
+        let rhs = rhs_editor(&review, cx);
+        assert!(is_focused(&rhs, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let split = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.split_and_clone(pane, workspace::SplitDirection::Right, window, cx)
+        });
+        cx.run_until_parked();
+        split.await.unwrap();
+        let clone = active_review(&workspace, cx);
+        assert_ne!(clone, review);
+        assert!(is_focused(&rhs_editor(&clone, cx), cx));
+
+        if fold {
+            cx.simulate_keystrokes("g g r");
+            assert!(is_folded(&review, "a.rs", cx));
+        }
+        cx.simulate_keystrokes(": q enter");
+        cx.run_until_parked();
+        assert_eq!(active_review(&workspace, cx), review);
+        assert!(is_focused(&rhs, cx), "fold: {fold}");
+        assert_eq!(vim_mode(&rhs, cx).as_deref(), Some("normal"), "fold: {fold}");
+        let before = cursor_point(&rhs, cx);
+        cx.simulate_keystrokes("j");
+        assert_ne!(cursor_point(&rhs, cx), before, "fold: {fold}");
+    }
+
+    #[gpui::test]
+    async fn test_closing_a_split_clone_keeps_focus(cx: &mut TestAppContext) {
+        close_split_clone(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_closing_a_split_clone_after_a_fold_keeps_focus(cx: &mut TestAppContext) {
+        close_split_clone(true, cx).await;
+    }
+
+    /// Unsplitting while the left side has the focus (a pane too narrow for a split diff, or
+    /// `ToggleSplitDiff`) drops that editor: the right side takes the focus (V7.X1).
+    #[gpui::test]
+    async fn test_dropping_the_focused_left_side_focuses_the_right_side(
+        cx: &mut TestAppContext,
+    ) {
+        init(cx, DiffViewStyle::Split);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let is_split = |cx: &mut VisualTestContext| {
+            splittable(&review, cx).read_with(cx, |editor, _| editor.is_split())
+        };
+        let assert_keys_work = |cx: &mut VisualTestContext| {
+            assert_back_in_diff(&rhs, cx);
+            let before = cursor_point(&rhs, cx);
+            cx.simulate_keystrokes("j");
+            assert_ne!(cursor_point(&rhs, cx), before);
+            cx.simulate_keystrokes("k");
+        };
+
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("ctrl-w h");
+        assert!(is_focused(&lhs_editor(&review, cx), cx));
+        let wide = cx.update(|window, _| window.bounds().size);
+        cx.simulate_resize(gpui::size(px(300.), wide.height));
+        cx.run_until_parked();
+        assert!(!is_split(cx));
+        assert_keys_work(cx);
+
+        cx.simulate_resize(wide);
+        cx.run_until_parked();
+        assert!(is_split(cx));
+        cx.simulate_keystrokes("ctrl-w h");
+        let lhs = lhs_editor(&review, cx);
+        assert!(is_focused(&lhs, cx));
+        cx.update(|window, cx| {
+            lhs.focus_handle(cx)
+                .dispatch_action(&editor::ToggleSplitDiff, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!is_split(cx));
+        assert_keys_work(cx);
     }
 
     #[gpui::test]
