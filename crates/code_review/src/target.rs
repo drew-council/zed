@@ -1,6 +1,8 @@
+use crate::session::ReviewKey;
 use anyhow::{Result, bail};
 use git::Oid;
 use gpui::SharedString;
+use project::git_store::RepositorySnapshot;
 
 /// What a review covers. Pull request targets will be added alongside these.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +30,32 @@ impl ReviewTarget {
     /// Whether a review of `other` is the same review as one of `self`, so its tab can be reused.
     pub fn is_same_review(&self, other: &Self) -> bool {
         self == other
+    }
+
+    /// The key review state (reviewed marks, later drafts) is stored under. Paths come last, and
+    /// git ref names can't contain `:`, so keys can't collide.
+    pub fn review_key(&self, repo: &RepositorySnapshot) -> ReviewKey {
+        let key = match self {
+            ReviewTarget::Uncommitted => {
+                format!("uncommitted:{}", repo.work_directory_abs_path.display())
+            }
+            ReviewTarget::Branch { base } => {
+                let branch = repo.branch.as_ref().map_or("HEAD", |branch| branch.name());
+                format!(
+                    "branch:{base}:{branch}:{}",
+                    repo.common_dir_abs_path.display()
+                )
+            }
+            ReviewTarget::Commits(range) => {
+                let base = range.base.map(|base| base.to_string()).unwrap_or_default();
+                format!(
+                    "commits:{base}..{}:{}",
+                    range.head,
+                    repo.common_dir_abs_path.display()
+                )
+            }
+        };
+        ReviewKey(key.into())
     }
 
     pub fn empty_label(&self) -> SharedString {

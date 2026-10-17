@@ -1,4 +1,10 @@
-use crate::{commits::CommitDiffList, target::ReviewTarget};
+use crate::{
+    ReviewView,
+    commits::CommitDiffList,
+    reviewed::render_file_checkbox,
+    session::{FileDigest, file_digest},
+    target::ReviewTarget,
+};
 use anyhow::Result;
 use buffer_diff::{BufferDiff, BufferDiffEvent};
 use collections::{HashMap, HashSet};
@@ -14,10 +20,10 @@ use gpui::{
     WeakEntity,
 };
 use language::{
-    Anchor, Buffer, BufferId, Capability, OffsetRangeExt as _, Point,
+    Anchor, Buffer, BufferId, BufferSnapshot, Capability, OffsetRangeExt as _, Point,
     language_settings::SoftWrap,
 };
-use multi_buffer::{MultiBuffer, PathKey};
+use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
     git_store::{
@@ -88,9 +94,11 @@ impl DiffSource {
 }
 
 /// Shows each file header's status against the review's base (merge base, commit range base)
-/// rather than against HEAD.
+/// rather than against HEAD, and the file's reviewed checkbox. Headers render the controls of
+/// only one addon, so every header control of the review lives here.
 struct ReviewAddon {
     source: DiffSource,
+    view: WeakEntity<ReviewView>,
 }
 
 impl Addon for ReviewAddon {
@@ -100,6 +108,16 @@ impl Addon for ReviewAddon {
 
     fn override_status_for_buffer_id(&self, buffer_id: BufferId, cx: &App) -> Option<FileStatus> {
         self.source.status_for_buffer_id(buffer_id, cx)
+    }
+
+    fn render_buffer_header_controls(
+        &self,
+        _: &ExcerptBoundaryInfo,
+        buffer: &BufferSnapshot,
+        _: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        render_file_checkbox(&self.view.upgrade()?, buffer.remote_id(), cx)
     }
 }
 
@@ -111,6 +129,10 @@ struct BufferSubscriptions {
     /// against the review base once the buffer is known.
     status: FileStatus,
     has_hunks: bool,
+    /// Whether the file's excerpts are in the multibuffer.
+    shown: bool,
+    /// The diff as of the last time the buffer had no unsaved edits.
+    digest: Option<FileDigest>,
     _diff_subscription: Subscription,
 }
 
@@ -126,6 +148,15 @@ pub(crate) struct ReviewFile {
 pub(crate) enum ReviewDiffEvent {
     /// Files came or went, or gained or lost their hunks.
     FilesChanged,
+    /// A file's digest changed, or its excerpts were just inserted (`newly_shown`).
+    FileDiffChanged {
+        path_key: PathKey,
+        newly_shown: bool,
+    },
+    SingleFileChanged {
+        previous: Option<PathKey>,
+        current: Option<PathKey>,
+    },
 }
 
 /// The diff of a review: a read-only multibuffer with one excerpt group per changed file, over
@@ -149,11 +180,12 @@ pub struct ReviewDiff {
 }
 
 impl ReviewDiff {
-    pub fn new(
+    pub(crate) fn new(
         target: &ReviewTarget,
         repo: Entity<Repository>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
+        view: WeakEntity<ReviewView>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -179,6 +211,7 @@ impl ReviewDiff {
                 editor.set_read_only(true);
                 editor.register_addon(ReviewAddon {
                     source: source.clone(),
+                    view,
                 });
                 // Long lines scroll horizontally instead of wrapping, like tuicr. Without an
                 // override the first file's language settings would decide for the whole
@@ -354,6 +387,8 @@ impl ReviewDiff {
                 diff,
                 status,
                 has_hunks: false,
+                shown: false,
+                digest: None,
                 _diff_subscription: diff_subscription,
             },
         );
@@ -366,10 +401,8 @@ impl ReviewDiff {
             return;
         };
         let snapshot = entry.display_buffer.read(cx).snapshot();
-        let excerpt_ranges = entry
-            .diff
-            .read(cx)
-            .snapshot(cx)
+        let diff_snapshot = entry.diff.read(cx).snapshot(cx);
+        let excerpt_ranges = diff_snapshot
             .hunks_intersecting_range(
                 Anchor::min_max_range_for_buffer(snapshot.remote_id()),
                 &snapshot,
@@ -378,24 +411,38 @@ impl ReviewDiff {
             .collect::<Vec<_>>();
         let had_hunks = entry.has_hunks;
         entry.has_hunks = !excerpt_ranges.is_empty();
-        if had_hunks != entry.has_hunks {
-            cx.emit(ReviewDiffEvent::FilesChanged);
+        // Unsaved edits made in another editor must not clear reviewed marks; the digest
+        // catches up when they are saved.
+        let mut digest_changed = false;
+        if !entry.display_buffer.read(cx).is_dirty() {
+            let digest = file_digest(&diff_snapshot, &snapshot);
+            digest_changed = entry.digest.as_ref() != Some(&digest);
+            entry.digest = Some(digest);
         }
+        let has_hunks = entry.has_hunks;
+        let was_shown = entry.shown;
         let path_key = entry.path_key.clone();
         let display_buffer = entry.display_buffer.clone();
         let diff = entry.diff.clone();
+        if had_hunks != has_hunks {
+            cx.emit(ReviewDiffEvent::FilesChanged);
+        }
 
-        if !entry.has_hunks && self.single_file.as_ref() == Some(&path_key) {
+        if !has_hunks && self.single_file.as_ref() == Some(&path_key) {
             self.set_single_file(None, window, cx);
             return;
         }
 
         let is_visible = self.is_visible(&path_key);
+        let shown = is_visible && has_hunks;
+        if let Some(entry) = self.buffer_subscriptions.get_mut(repo_path) {
+            entry.shown = shown;
+        }
         let was_empty = self.multibuffer.read(cx).is_empty();
         self.editor.update(cx, |editor, cx| {
             if is_visible {
                 editor.update_excerpts_for_path(
-                    path_key,
+                    path_key.clone(),
                     display_buffer,
                     excerpt_ranges,
                     multibuffer_context_lines(cx),
@@ -403,7 +450,7 @@ impl ReviewDiff {
                     cx,
                 );
             } else {
-                editor.remove_excerpts_for_path(path_key, cx);
+                editor.remove_excerpts_for_path(path_key.clone(), cx);
             }
             if was_empty {
                 editor.rhs_editor().update(cx, |editor, cx| {
@@ -419,6 +466,14 @@ impl ReviewDiff {
             self.focus_handle.focus(window, cx);
         } else if !is_empty && self.focus_handle.is_focused(window) {
             self.editor.focus_handle(cx).focus(window, cx);
+        }
+
+        let newly_shown = shown && !was_shown;
+        if digest_changed || newly_shown {
+            cx.emit(ReviewDiffEvent::FileDiffChanged {
+                path_key,
+                newly_shown,
+            });
         }
     }
 
@@ -463,6 +518,33 @@ impl ReviewDiff {
         files
     }
 
+    pub(crate) fn digest(&self, path_key: &PathKey) -> Option<&FileDigest> {
+        self.entry(path_key)?.digest.as_ref()
+    }
+
+    /// Whether the file's excerpts are in the multibuffer.
+    pub(crate) fn is_shown(&self, path_key: &PathKey) -> bool {
+        self.entry(path_key).is_some_and(|entry| entry.shown)
+    }
+
+    /// The (right-hand side) buffer showing the file.
+    pub(crate) fn buffer_id_for(&self, path_key: &PathKey, cx: &App) -> Option<BufferId> {
+        Some(self.entry(path_key)?.display_buffer.read(cx).remote_id())
+    }
+
+    pub(crate) fn repo_path_for_buffer(&self, buffer_id: BufferId, cx: &App) -> Option<RepoPath> {
+        self.buffer_subscriptions
+            .iter()
+            .find(|(_, entry)| entry.display_buffer.read(cx).remote_id() == buffer_id)
+            .map(|(repo_path, _)| repo_path.clone())
+    }
+
+    fn entry(&self, path_key: &PathKey) -> Option<&BufferSubscriptions> {
+        self.buffer_subscriptions
+            .values()
+            .find(|entry| &entry.path_key == path_key)
+    }
+
     /// Whether the file list is still being computed or loaded.
     pub(crate) fn is_loading(&self, cx: &App) -> bool {
         !self.refresh_task.is_ready() || self.is_source_loading(cx)
@@ -505,7 +587,12 @@ impl ReviewDiff {
         }
     }
 
-    fn select_path_start(&mut self, path_key: &PathKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_path_start(
+        &mut self,
+        path_key: &PathKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.editor.update(cx, |splittable, cx| {
             // Both sides have an excerpt for every path, under the same keys.
             let focused = splittable.focused_editor().clone();
@@ -538,7 +625,13 @@ impl ReviewDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.single_file = path_key.clone();
+        let previous = std::mem::replace(&mut self.single_file, path_key.clone());
+        if previous != path_key {
+            cx.emit(ReviewDiffEvent::SingleFileChanged {
+                previous,
+                current: path_key.clone(),
+            });
+        }
         let repo_paths = self
             .buffer_subscriptions
             .iter()
@@ -622,7 +715,11 @@ impl ReviewDiff {
                 .as_ref()
                 .is_some_and(|single_file| !entries.contains_key(single_file))
             {
-                this.single_file = None;
+                let previous = this.single_file.take();
+                cx.emit(ReviewDiffEvent::SingleFileChanged {
+                    previous,
+                    current: None,
+                });
             }
 
             entries
@@ -830,9 +927,9 @@ impl Render for ReviewDiff {
 }
 
 /// Orders files like Zed's git panel tree view (directories before files at each level), which
-/// the review panel's file tree will mirror. The path only orders and identifies excerpts;
-/// headers show the buffer's own path.
-fn review_path_key(repo_path: &RepoPath) -> PathKey {
+/// the review panel's file tree mirrors. The path only orders and identifies excerpts; headers
+/// show the buffer's own path.
+pub(crate) fn review_path_key(repo_path: &RepoPath) -> PathKey {
     PathKey::with_sort_prefix(0, tree_sort_path(repo_path))
 }
 

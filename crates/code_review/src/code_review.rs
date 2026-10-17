@@ -2,7 +2,10 @@ mod commits;
 mod diff;
 mod line_cursor;
 mod panel;
+mod persistence;
 mod picker;
+mod reviewed;
+mod session;
 mod target;
 mod top_block;
 mod view;
@@ -18,6 +21,7 @@ use workspace::Workspace;
 pub use diff::ReviewDiff;
 pub use panel::ReviewPanel;
 pub use picker::StartReviewModal;
+pub use session::ReviewKey;
 pub use target::{CommitRange, ReviewTarget};
 pub use view::ReviewView;
 
@@ -65,6 +69,13 @@ actions!(
         CollapseSelectedEntry,
         /// In the review panel: expands or collapses the selected directory.
         ToggleSelectedDirectory,
+        /// Marks the file at the cursor (or selected in the review panel) as reviewed, or not.
+        /// In the diff, marking also moves to the next file.
+        ToggleFileReviewed,
+        /// Moves to the next hunk, skipping files folded as reviewed.
+        NextHunk,
+        /// Moves to the previous hunk, skipping files folded as reviewed.
+        PreviousHunk,
     ]
 );
 
@@ -143,6 +154,8 @@ pub(crate) fn init_test(cx: &mut gpui::TestAppContext) {
     use gpui::BorrowAppContext as _;
 
     cx.update(|cx| {
+        // A fresh database per test, so stored review state doesn't leak between tests.
+        cx.set_global(db::AppDatabase::test_new());
         let store = settings::SettingsStore::test(cx);
         cx.set_global(store);
         cx.update_global::<settings::SettingsStore, _>(|store, cx| {
@@ -277,6 +290,29 @@ pub(crate) mod test_support {
             let diff = review.diff().read(cx);
             let path_key = diff.path_at_cursor(cx)?;
             Some(diff.repo_path_for(&path_key)?.as_unix_str().to_string())
+        })
+    }
+
+    /// Whether the file's buffer is folded on the right side of the diff.
+    pub(crate) fn is_folded(review: &Entity<ReviewView>, path: &str, cx: &mut VisualTestContext) -> bool {
+        review.read_with(cx, |review, cx| {
+            let diff = review.diff().read(cx);
+            let repo_path = git::repository::RepoPath::new(path).unwrap();
+            let buffer_id = diff
+                .buffer_id_for(&crate::diff::review_path_key(&repo_path), cx)
+                .unwrap();
+            diff.editor()
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .is_buffer_folded(buffer_id, cx)
+        })
+    }
+
+    pub(crate) fn is_reviewed(review: &Entity<ReviewView>, path: &str, cx: &mut VisualTestContext) -> bool {
+        review.read_with(cx, |review, cx| {
+            let repo_path = git::repository::RepoPath::new(path).unwrap();
+            review.session().read(cx).is_file_reviewed(&repo_path)
         })
     }
 

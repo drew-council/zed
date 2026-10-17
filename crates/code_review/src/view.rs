@@ -1,14 +1,18 @@
 use crate::{
-    FocusDiff, FocusPanel, NextFile, NextUnreviewedFile, OpenFileAtCursor, PreviousFile,
-    PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel, ReviewUncommitted,
-    ScrollLeft, ScrollRight, ChangeBase, ToggleHeader, ToggleSingleFileMode,
+    ChangeBase, FocusDiff, FocusPanel, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
+    PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
+    ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
+    ToggleSingleFileMode,
     commits::{TOP_BLOCK_COMMIT_LIMIT, first_parent_chain, resolve_commit_spec, validate_ref},
-    diff::{ReviewDiff, ReviewDiffEvent, ReviewFile},
+    diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
+    session::{ReviewSession, ReviewSessionEvent},
     target::{ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
+use collections::HashSet;
+use git::{repository::RepoPath, status::FileStatus};
 use editor::{
     Editor, EditorEvent, PathKey, SelectionEffects, SplittableEditor,
     actions::{OpenExcerpts, ToggleSoftWrap},
@@ -239,6 +243,21 @@ fn discard_vim_count(window: &mut Window, cx: &mut App) {
     }
 }
 
+/// A file as the review panel lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PanelFile {
+    pub path_key: PathKey,
+    pub repo_path: RepoPath,
+    pub status: FileStatus,
+    pub reviewed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Next,
+    Previous,
+}
+
 /// The review tab: a read-only diff of a [`ReviewTarget`] in one repository.
 pub struct ReviewView {
     target: ReviewTarget,
@@ -246,9 +265,12 @@ pub struct ReviewView {
     diff: Entity<ReviewDiff>,
     top_block: Entity<ReviewTopBlock>,
     line_cursor: Entity<LineCursor>,
+    /// Shared by every tab reviewing the same thing; replaced when the review key changes.
+    session: Entity<ReviewSession>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     _load_commits_task: Task<()>,
+    _session_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -293,12 +315,14 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let view = cx.weak_entity();
         let diff = cx.new(|cx| {
             ReviewDiff::new(
                 &target,
                 repo.clone(),
                 project.clone(),
                 workspace.clone(),
+                view,
                 window,
                 cx,
             )
@@ -346,10 +370,10 @@ impl ReviewView {
 
         let subscriptions = vec![
             cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| cx.emit(event.clone())),
-            cx.subscribe(&diff, |_, _, _: &ReviewDiffEvent, cx| cx.notify()),
+            cx.subscribe_in(&diff, window, Self::handle_diff_event),
             // The review panel shows the diff's loading state.
             cx.observe(&diff, |_, _, cx| cx.notify()),
-            // A branch review is titled after the checked-out branch.
+            // A branch review is titled and keyed after the checked-out branch.
             cx.subscribe(&repo, |this, repo, event: &RepositoryEvent, cx| {
                 if let (RepositoryEvent::HeadChanged, ReviewTarget::Branch { base }) =
                     (event, &this.target)
@@ -358,23 +382,239 @@ impl ReviewView {
                     let base = base.clone();
                     this.top_block
                         .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
+                    this.update_session(cx);
                     cx.emit(EditorEvent::TitleChanged);
                     cx.notify();
                 }
             }),
         ];
         let line_cursor = cx.new(|cx| LineCursor::new(diff.read(cx).editor().clone(), cx));
+        let session = ReviewSession::for_key(target.review_key(&repo.read(cx)), cx);
+        let session_subscription = cx.subscribe(&session, Self::handle_session_event);
         Self {
             target,
             repo,
             diff,
             top_block,
             line_cursor,
+            session,
             project,
             workspace: workspace.downgrade(),
             _load_commits_task: load_commits_task,
+            _session_subscription: session_subscription,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub(crate) fn session(&self) -> &Entity<ReviewSession> {
+        &self.session
+    }
+
+    /// Switches to the session of the review's current key (the base or branch changed).
+    fn update_session(&mut self, cx: &mut Context<Self>) {
+        let key = self.target.review_key(&self.repo.read(cx));
+        if self.session.read(cx).key() == &key {
+            return;
+        }
+        self.session = ReviewSession::for_key(key, cx);
+        self._session_subscription = cx.subscribe(&self.session, Self::handle_session_event);
+        if self.session.read(cx).is_loaded() {
+            self.apply_session(cx);
+        }
+        cx.notify();
+    }
+
+    /// Brings the folds and marks of every file in line with a newly loaded session.
+    fn apply_session(&mut self, cx: &mut Context<Self>) {
+        let files = self.diff.read(cx).files(cx);
+        for file in &files {
+            if let Some(digest) = self.diff.read(cx).digest(&file.path_key).cloned() {
+                self.session
+                    .update(cx, |session, cx| session.reconcile(&file.repo_path, &digest, cx));
+            }
+            self.sync_fold(&file.path_key, cx);
+        }
+    }
+
+    fn handle_session_event(
+        &mut self,
+        _: Entity<ReviewSession>,
+        event: &ReviewSessionEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ReviewSessionEvent::Loaded => self.apply_session(cx),
+            ReviewSessionEvent::FilesChanged(changes) => {
+                for (repo_path, _) in changes {
+                    self.sync_fold(&review_path_key(repo_path), cx);
+                }
+            }
+            ReviewSessionEvent::HunksChanged(_) => {}
+        }
+        cx.notify();
+    }
+
+    fn handle_diff_event(
+        &mut self,
+        _: &Entity<ReviewDiff>,
+        event: &ReviewDiffEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ReviewDiffEvent::FilesChanged => {}
+            ReviewDiffEvent::FileDiffChanged {
+                path_key,
+                newly_shown,
+            } => {
+                let diff = self.diff.read(cx);
+                if let Some(repo_path) = diff.repo_path_for(path_key)
+                    && let Some(digest) = diff.digest(path_key).cloned()
+                {
+                    self.session
+                        .update(cx, |session, cx| session.reconcile(&repo_path, &digest, cx));
+                }
+                // Reviewed files fold when they appear, but stay open once the user opens them.
+                if *newly_shown {
+                    self.sync_fold(path_key, cx);
+                }
+            }
+            ReviewDiffEvent::SingleFileChanged { previous, current } => {
+                match current {
+                    Some(current) => self.sync_fold(current, cx),
+                    // The other files fold as they reappear.
+                    None => {
+                        if let Some(previous) = previous {
+                            self.sync_fold(previous, cx);
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Folds a shown file to its header when it is reviewed and unfolds it otherwise. Single-file
+    /// mode always shows its file unfolded.
+    fn sync_fold(&self, path_key: &PathKey, cx: &mut App) {
+        let diff = self.diff.read(cx);
+        if !diff.is_shown(path_key) {
+            return;
+        }
+        let Some(buffer_id) = diff.buffer_id_for(path_key, cx) else {
+            return;
+        };
+        let reviewed = diff
+            .repo_path_for(path_key)
+            .is_some_and(|repo_path| self.session.read(cx).is_file_reviewed(&repo_path));
+        let fold = reviewed && diff.single_file() != Some(path_key);
+        // Folding the right side folds the left side too.
+        let editor = diff.editor().read(cx).rhs_editor().clone();
+        editor.update(cx, |editor, cx| {
+            if fold {
+                editor.fold_buffer(buffer_id, cx);
+            } else {
+                editor.unfold_buffer(buffer_id, cx);
+            }
+        });
+    }
+
+    /// Toggles a file's reviewed mark without moving the cursor (header checkbox, panel `r`).
+    pub(crate) fn toggle_file(&mut self, repo_path: &RepoPath, cx: &mut Context<Self>) {
+        let path_key = review_path_key(repo_path);
+        let content_hash = self
+            .diff
+            .read(cx)
+            .digest(&path_key)
+            .map(|digest| digest.content_hash);
+        self.session.update(cx, |session, cx| {
+            session.toggle_file(repo_path, content_hash, cx);
+        });
+        self.sync_fold(&path_key, cx);
+    }
+
+    /// `r`: marks the file at the cursor reviewed and moves to the next file, or unmarks it and
+    /// moves to its first row.
+    fn toggle_file_reviewed(
+        &mut self,
+        _: &ToggleFileReviewed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        discard_vim_count(window, cx);
+        if !self.session.read(cx).is_loaded() {
+            return;
+        }
+        let diff = self.diff.read(cx);
+        let Some(path_key) = diff.path_at_cursor(cx) else {
+            return;
+        };
+        let Some(repo_path) = diff.repo_path_for(&path_key) else {
+            return;
+        };
+        let content_hash = diff.digest(&path_key).map(|digest| digest.content_hash);
+        let next = diff.file_order().into_iter().find(|key| key > &path_key);
+        let reviewed = !self.session.read(cx).is_file_reviewed(&repo_path);
+        // Move first, so folding the file doesn't drag the cursor onto its header.
+        if reviewed && let Some(next) = next {
+            self.diff
+                .update(cx, |diff, cx| diff.move_to_path(next, window, cx));
+        }
+        self.session.update(cx, |session, cx| {
+            session.set_file_reviewed(&repo_path, reviewed, content_hash, cx)
+        });
+        self.sync_fold(&path_key, cx);
+        if !reviewed {
+            self.diff
+                .update(cx, |diff, cx| diff.select_path_start(&path_key, window, cx));
+        }
+    }
+
+    fn next_hunk(&mut self, _: &NextHunk, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_hunk(Direction::Next, window, cx);
+    }
+
+    fn previous_hunk(&mut self, _: &PreviousHunk, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_hunk(Direction::Previous, window, cx);
+    }
+
+    /// Zed's `GoToHunk` (wrapping, centered), except that the hunks of folded files are skipped:
+    /// the cursor would be stuck on their header.
+    fn go_to_hunk(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
+        editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let head = editor.selections.newest::<Point>(&display_snapshot).head();
+            let buffer = display_snapshot.buffer_snapshot();
+            let folded = editor.folded_buffers(cx);
+            let starts = buffer
+                .diff_hunks_in_range(Point::zero()..buffer.max_point())
+                .filter(|hunk| !folded.contains(&hunk.buffer_id))
+                .map(|hunk| hunk.row_range.start.0)
+                .collect::<Vec<_>>();
+            let row = match direction {
+                Direction::Next => starts
+                    .iter()
+                    .find(|row| **row > head.row)
+                    .or_else(|| starts.first()),
+                Direction::Previous => starts
+                    .iter()
+                    .rev()
+                    .find(|row| **row < head.row)
+                    .or_else(|| starts.last()),
+            }
+            .copied();
+            if let Some(row) = row {
+                let point = Point::new(row, 0);
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([point..point]),
+                );
+            }
+        });
+        discard_vim_count(window, cx);
     }
 
     pub fn target(&self) -> &ReviewTarget {
@@ -405,8 +645,19 @@ impl ReviewView {
     }
 
     /// The files the review panel lists, in review order.
-    pub(crate) fn panel_files(&self, cx: &App) -> Vec<ReviewFile> {
-        self.diff.read(cx).files(cx)
+    pub(crate) fn panel_files(&self, cx: &App) -> Vec<PanelFile> {
+        let session = self.session.read(cx);
+        self.diff
+            .read(cx)
+            .files(cx)
+            .into_iter()
+            .map(|file| PanelFile {
+                reviewed: session.is_file_reviewed(&file.repo_path),
+                path_key: file.path_key,
+                repo_path: file.repo_path,
+                status: file.status,
+            })
+            .collect()
     }
 
     /// Moves the diff to the first row of the file (showing only that file in single-file mode).
@@ -484,6 +735,7 @@ impl ReviewView {
         self.target = target;
         self.diff
             .update(cx, |diff, cx| diff.set_branch_base(base.clone(), cx));
+        self.update_session(cx);
         let branch = branch_name(&self.repo, cx);
         self.top_block
             .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
@@ -568,19 +820,26 @@ impl ReviewView {
         cx: &mut Context<Self>,
         target: impl FnOnce(&[PathKey], Option<&PathKey>) -> Option<PathKey>,
     ) {
+        let reviewed = self.reviewed_files(cx);
         self.move_to_file(window, cx, |order, current| {
             let unreviewed = order
                 .iter()
-                .filter(|key| !Self::is_file_reviewed(key))
+                .filter(|key| !reviewed.contains(*key))
                 .cloned()
                 .collect::<Vec<_>>();
             target(&unreviewed, current)
         });
     }
 
-    // Reviewed marks arrive with the review panel's file tree (milestone 4).
-    fn is_file_reviewed(_path_key: &PathKey) -> bool {
-        false
+    fn reviewed_files(&self, cx: &App) -> HashSet<PathKey> {
+        let session = self.session.read(cx);
+        self.diff
+            .read(cx)
+            .files(cx)
+            .into_iter()
+            .filter(|file| session.is_file_reviewed(&file.repo_path))
+            .map(|file| file.path_key)
+            .collect()
     }
 
     fn move_to_file(
@@ -733,6 +992,9 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::previous_unreviewed_file))
             .on_action(cx.listener(Self::toggle_single_file_mode))
             .on_action(cx.listener(Self::open_file_at_cursor))
+            .on_action(cx.listener(Self::toggle_file_reviewed))
+            .on_action(cx.listener(Self::next_hunk))
+            .on_action(cx.listener(Self::previous_hunk))
             .when(is_branch_review, |view| {
                 view.on_action(cx.listener(Self::change_base_action))
             })

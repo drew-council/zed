@@ -18,6 +18,7 @@
       "l": "code_review::ExpandSelectedEntry",
       "right": "code_review::ExpandSelectedEntry",
       "space": "code_review::ToggleSelectedDirectory",
+      "r": "code_review::ToggleFileReviewed",
       "g g": "menu::SelectFirst",
       "shift-g": "menu::SelectLast",
     },

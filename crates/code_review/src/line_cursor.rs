@@ -426,9 +426,10 @@ mod tests {
         let editor = rhs_editor(&review, cx);
         let text = editor.read_with(cx, |editor, cx| editor.text(cx));
 
+        // `r` and `shift-r` are the review's reviewed marks.
         for keystrokes in [
             "i", "a", "shift-i", "shift-a", "o", "shift-o", "s", "shift-s", "c c", "shift-c",
-            "r x", "shift-r", "g i", "insert",
+            "g i", "insert",
         ] {
             let row = cursor_point(&editor, cx).row;
             cx.simulate_keystrokes(keystrokes);

@@ -1,6 +1,7 @@
 use crate::{
     CollapseSelectedEntry, ExpandSelectedEntry, FocusPanel, ReviewUncommitted, ReviewView,
-    ToggleFocus, TogglePanel, ToggleSelectedDirectory, diff::ReviewFile, view::focus_diff,
+    ToggleFileReviewed, ToggleFocus, TogglePanel, ToggleSelectedDirectory,
+    view::{PanelFile, focus_diff},
 };
 use anyhow::Result;
 use collections::HashSet;
@@ -63,7 +64,7 @@ enum TreeEntry {
         expanded: bool,
     },
     File {
-        file: ReviewFile,
+        file: PanelFile,
         name: SharedString,
         depth: usize,
     },
@@ -95,7 +96,7 @@ struct TreeNode {
     name: SharedString,
     path: Option<RepoPath>,
     children: BTreeMap<SharedString, TreeNode>,
-    files: Vec<ReviewFile>,
+    files: Vec<PanelFile>,
 }
 
 /// The review panel in the left dock: the file tree of the active review tab.
@@ -214,7 +215,7 @@ impl ReviewPanel {
         }
     }
 
-    fn files(&self, cx: &App) -> Vec<ReviewFile> {
+    fn files(&self, cx: &App) -> Vec<PanelFile> {
         self.active_review()
             .map(|review| review.read(cx).panel_files(cx))
             .unwrap_or_default()
@@ -485,6 +486,21 @@ impl ReviewPanel {
         }
     }
 
+    /// `r`: toggles the selected file's mark, without moving on (unlike `r` in the diff).
+    fn toggle_file_reviewed(
+        &mut self,
+        _: &ToggleFileReviewed,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(TreeEntry::File { file, .. }) = self.selected_entry().cloned() else {
+            return;
+        };
+        if let Some(review) = self.active_review() {
+            review.update(cx, |review, cx| review.toggle_file(&file.repo_path, cx));
+        }
+    }
+
     fn toggle_selected_directory(
         &mut self,
         _: &ToggleSelectedDirectory,
@@ -564,6 +580,15 @@ impl ReviewPanel {
                     .end_slot(
                         h_flex()
                             .gap_1()
+                            .child(
+                                h_flex()
+                                    .child(
+                                        Icon::new(IconName::Check)
+                                            .size(IconSize::Small)
+                                            .color(Color::Success),
+                                    )
+                                    .when(!file.reviewed, |slot| slot.invisible()),
+                            )
                             .child(Label::new(letter).size(LabelSize::Small).color(color)),
                     )
                     .tooltip({
@@ -592,11 +617,8 @@ impl ReviewPanel {
     fn render_header(&self, review: &Entity<ReviewView>, cx: &Context<Self>) -> impl IntoElement {
         let review = review.read(cx);
         let title = review.title(cx);
-        let total = self
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry, TreeEntry::File { .. }))
-            .count();
+        let files = review.panel_files(cx);
+        let reviewed = files.iter().filter(|file| file.reviewed).count();
         v_flex()
             .px_2()
             .py_1()
@@ -605,12 +627,9 @@ impl ReviewPanel {
             .border_color(cx.theme().colors().border_variant)
             .child(Label::new(title).truncate())
             .child(
-                Label::new(format!(
-                    "{total} changed file{}",
-                    if total == 1 { "" } else { "s" }
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+                Label::new(format!("{reviewed}/{} reviewed", files.len()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             )
     }
 
@@ -654,7 +673,7 @@ impl ReviewPanel {
 #[cfg(test)]
 impl ReviewPanel {
     /// The rows as text: two spaces per level, `/` after directories (`▸` when collapsed), the
-    /// status letter after files. The selected row starts with `>`.
+    /// status letter (and `✓` when reviewed) after files. The selected row starts with `>`.
     pub(crate) fn rows_for_test(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -669,7 +688,8 @@ impl ReviewPanel {
                     }
                     TreeEntry::File { file, name, .. } => {
                         let (letter, _) = status_letter(file.status);
-                        format!("{marker}{indent}{name} {letter}")
+                        let reviewed = if file.reviewed { " ✓" } else { "" };
+                        format!("{marker}{indent}{name} {letter}{reviewed}")
                     }
                 }
             })
@@ -717,6 +737,7 @@ impl Render for ReviewPanel {
             .on_action(cx.listener(Self::expand_selected_entry))
             .on_action(cx.listener(Self::collapse_selected_entry))
             .on_action(cx.listener(Self::toggle_selected_directory))
+            .on_action(cx.listener(Self::toggle_file_reviewed))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .when_some(review.as_ref(), |panel, review| {

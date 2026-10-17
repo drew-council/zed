@@ -47,6 +47,7 @@ workspace.workspace = true
 
 [dev-dependencies]
 askpass.workspace = true
+buffer_diff = { workspace = true, features = ["test-support"] }
 ctor.workspace = true
 db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
