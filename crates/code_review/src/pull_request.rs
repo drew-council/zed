@@ -2,7 +2,7 @@
 //! in a new worktree), and the state the review tabs of one pull request share.
 
 use crate::{
-    checkout::{self, CheckoutStep, canonical_source, plan_checkout, run_checkout},
+    checkout::{self, CheckoutStep, canonical_source, head_remote, plan_checkout, run_checkout},
     forge::{self, Forge, PullRequestDetails, RepositoryContext},
     github::{self, GitHubRemote},
     session::ReviewKey,
@@ -142,6 +142,9 @@ pub(crate) fn open_pull_request_and_notify(
                 })
                 .log_err();
         }
+        Err(error) if error.downcast_ref::<ShownByWorktreeService>().is_some() => {
+            log::error!("opening a pull request: {error:#}");
+        }
         Err(error) => {
             let shown = workspace.update(cx, |workspace, cx| {
                 forge::show_error_toast(workspace, &error, cx)
@@ -152,6 +155,16 @@ pub(crate) fn open_pull_request_and_notify(
         }
     })
     .detach();
+}
+
+/// Zed's worktree service shows its errors itself.
+#[derive(Debug)]
+struct ShownByWorktreeService;
+
+impl std::fmt::Display for ShownByWorktreeService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Couldn't create the worktree")
+    }
 }
 
 struct LoadedPullRequest {
@@ -240,15 +253,7 @@ pub(crate) fn plan_worktree(
     validate_branch_name(&details.head_ref).context("The pull request's head branch")?;
     validate_branch_name(&details.base_ref).context("The pull request's base branch")?;
     let base_refspec = format!("refs/heads/{}", details.base_ref);
-    let head_remote = details
-        .head_repository
-        .as_ref()
-        .and_then(|head_repository| {
-            remotes
-                .iter()
-                .find(|remote| remote.repo.is_same_repo(head_repository))
-        });
-    Ok(match head_remote {
+    Ok(match head_remote(details, remotes) {
         Some(head_remote) => WorktreePlan {
             steps: if head_remote.repo.is_same_repo(&context.canonical) {
                 Vec::new()
@@ -325,7 +330,8 @@ async fn open_in_new_worktree(
                     workspace, &action, window, None, cx,
                 )
             })?
-            .await?;
+            .await
+            .context(ShownByWorktreeService)?;
         // It opens in the background.
         let multi_workspace =
             workspace.read_with(cx, |workspace, _| workspace.multi_workspace().cloned())?;

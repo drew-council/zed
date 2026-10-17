@@ -4,7 +4,7 @@
 //! stashed: with uncommitted changes git carries them over or refuses, and the error is shown.
 
 use crate::{
-    forge::{PullRequestDetails, RepositoryContext},
+    forge::{PullRequestDetails, PullRequestStatus, RepositoryContext},
     github::GitHubRemote,
     target::validate_branch_name,
 };
@@ -70,15 +70,7 @@ pub(crate) fn plan_checkout(
     let base_source = canonical_source(context, remotes);
     let base_refspec = format!("refs/heads/{}", details.base_ref);
 
-    let head_remote = details
-        .head_repository
-        .as_ref()
-        .and_then(|head_repository| {
-            remotes
-                .iter()
-                .find(|remote| remote.repo.is_same_repo(head_repository))
-        });
-    if let Some(head_remote) = head_remote {
+    if let Some(head_remote) = head_remote(details, remotes) {
         let mut steps = vec![
             CheckoutStep::FetchRemote {
                 remote: head_remote.name.clone(),
@@ -121,6 +113,26 @@ pub(crate) fn plan_checkout(
             fast_forward,
         ])
     }
+}
+
+/// The remote a pull request's head branch is checked out from: one pointing at its head
+/// repository (the canonical one, or the user's fork). Not for a pull request that is no longer
+/// open, whose branch is often deleted (GitHub keeps `refs/pull/N/head`), nor for a fork's pull
+/// request from a branch named like its base (a fork's `main` into `main`), which would make the
+/// local base branch track the fork.
+pub(crate) fn head_remote<'a>(
+    details: &PullRequestDetails,
+    remotes: &'a [GitHubRemote],
+) -> Option<&'a GitHubRemote> {
+    if details.state != PullRequestStatus::Open
+        || (details.is_cross_repository && details.head_ref == details.base_ref)
+    {
+        return None;
+    }
+    let head_repository = details.head_repository.as_ref()?;
+    remotes
+        .iter()
+        .find(|remote| remote.repo.is_same_repo(head_repository))
 }
 
 /// Where the canonical repository's refs are fetched from: a remote pointing at it, else its URL
@@ -410,7 +422,7 @@ fn askpass_delegate_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge::{Actor, ForgeRepo, PullRequestStatus};
+    use crate::forge::{Actor, ForgeRepo};
     use futures::executor::block_on;
     use std::path::Path;
 
@@ -618,7 +630,7 @@ mod tests {
                 fast_forward(),
             ]
         );
-        let https_fork_checkout = context(fork.clone(), canonical.clone(), false);
+        let https_fork_checkout = context(fork.clone(), canonical, false);
         assert_eq!(
             plan(
                 &third_party_pull_request,
@@ -648,6 +660,49 @@ mod tests {
             ),
             [
                 fetch_refspec("upstream", &["refs/pull/7/head", "refs/heads/main"]),
+                fast_forward(),
+            ]
+        );
+
+        // A closed pull request's branch may be gone; refs/pull stays.
+        let mut closed = same_repo.clone();
+        closed.state = PullRequestStatus::Merged;
+        assert_eq!(
+            plan(
+                &closed,
+                &origin_canonical,
+                &canonical_remotes,
+                Some("main"),
+                None
+            ),
+            [
+                fetch_refspec(
+                    "origin",
+                    &["refs/pull/7/head:refs/heads/pr/7", "refs/heads/main"]
+                ),
+                change_branch("pr/7"),
+                fast_forward(),
+            ]
+        );
+
+        // The user's fork's `main` into `main`: switching to `origin/main` would make the local
+        // `main` track the fork.
+        let mut from_fork_main = details(Some(fork));
+        from_fork_main.head_ref = "main".into();
+        assert_eq!(
+            plan(
+                &from_fork_main,
+                &fork_checkout,
+                &fork_remotes,
+                Some("main"),
+                None
+            ),
+            [
+                fetch_refspec(
+                    "upstream",
+                    &["refs/pull/7/head:refs/heads/pr/7", "refs/heads/main"]
+                ),
+                change_branch("pr/7"),
                 fast_forward(),
             ]
         );
@@ -685,6 +740,7 @@ mod tests {
     }
 
     /// Runs git from PATH in `dir` for test setup.
+    #[allow(clippy::disallowed_methods)]
     fn git(dir: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .current_dir(dir)
