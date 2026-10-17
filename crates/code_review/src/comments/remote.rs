@@ -98,6 +98,15 @@ impl HoveredLink {
     }
 }
 
+/// How review comments and pull request text render: as on GitHub, where a line break in the
+/// text is a line break (CommonMark would join the lines into one paragraph line).
+pub(crate) fn comment_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    MarkdownStyle {
+        soft_break_as_hard_break: true,
+        ..hover_markdown_style(window, cx)
+    }
+}
+
 /// Markdown someone else wrote: its links show where they go while hovered (in the view's
 /// [`HoveredLink`], under `key`) and only open web pages.
 pub(crate) fn untrusted_markdown<V: 'static>(
@@ -237,7 +246,7 @@ impl RemoteThreadView {
             .filter(|url| !url.is_empty());
         let timezone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
         let now = OffsetDateTime::now_utc();
-        let markdown_style = hover_markdown_style(window, cx);
+        let markdown_style = comment_markdown_style(window, cx);
         let more = (thread.total_comments as usize).saturating_sub(thread.comments.len());
         let header = h_flex()
             .gap_2()

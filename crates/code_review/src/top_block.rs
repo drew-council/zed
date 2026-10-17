@@ -1,5 +1,7 @@
 use crate::{
-    comments::{CommentBlocks, HoveredLink, open_web_link, untrusted_markdown},
+    comments::{
+        CommentBlocks, HoveredLink, comment_markdown_style, open_web_link, untrusted_markdown,
+    },
     commits::CommitChain,
     diff::ReviewDiff,
     forge::{ForgeRepo, PullRequestStatus, RemoteReviewSummary, ReviewDecision, ReviewState},
@@ -444,7 +446,7 @@ impl ReviewTopBlock {
             .collect::<Vec<_>>();
 
         let body = self.expanded.then(|| {
-            let markdown_style = hover_markdown_style(window, cx);
+            let markdown_style = comment_markdown_style(window, cx);
             let timezone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
             let description = self
                 .markdown

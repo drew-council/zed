@@ -1,6 +1,9 @@
-use super::{Comment, CommentBlocks, CommentId, CommentTarget, CommentType, Side};
+use super::{
+    Comment, CommentBlocks, CommentId, CommentTarget, CommentType, Side,
+    remote::comment_markdown_style,
+};
 use crate::{CycleCommentType, CycleCommentTypeBackward, DiscardCommentChanges, SaveComment};
-use editor::{Editor, hover_markdown_style};
+use editor::Editor;
 use gpui::{Entity, Subscription, WeakEntity};
 use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement};
@@ -307,7 +310,7 @@ impl Render for CommentView {
                 .w_full()
                 .child(MarkdownElement::new(
                     self.markdown.clone(),
-                    hover_markdown_style(window, cx),
+                    comment_markdown_style(window, cx),
                 ))
                 .into_any_element(),
         };

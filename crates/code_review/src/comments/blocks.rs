@@ -3336,6 +3336,32 @@ mod tests {
         assert_eq!(on_sides(cx), [true]);
     }
 
+    /// A line break in a comment is a line break in its card, as on GitHub (V3.02).
+    #[gpui::test]
+    async fn test_comment_lines_render_as_lines(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let card_height = |line: usize, body: &str, cx: &mut VisualTestContext| {
+            move_to_row_with_text(&rhs, &format!("line {line}"), cx);
+            cx.simulate_keystrokes("c");
+            cx.simulate_input(body);
+            cx.simulate_keystrokes("ctrl-enter");
+            cx.run_until_parked();
+            let id = *comment_ids(&review, cx).last().unwrap();
+            let block_row = hosted_rows(&review, cx)
+                .into_iter()
+                .find(|(hosted, _)| *hosted == id)
+                .unwrap()
+                .1;
+            let next_row = move_to_row_with_text(&rhs, &format!("line {}", line + 1), cx);
+            display_row(&rhs, next_row, cx) - block_row
+        };
+        let one_line = card_height(3, "one", cx);
+        let three_lines = card_height(36, "one\ntwo\nthree", cx);
+        assert_eq!(three_lines, one_line + 2);
+    }
+
     /// In a unified diff, an old-side comment on the unchanged row right after a pure deletion
     /// sits below that row, not below the removed row facing the same place in the new file,
     /// and `]t` visits it after the removed row's comment (V7.X3).

@@ -3,7 +3,10 @@
 //! it; a local review is finished as Markdown.
 
 use crate::{
-    comments::{Comment, CommentId, CommentState, CommentTarget, Side, open_web_link},
+    comments::{
+        Comment, CommentId, CommentState, CommentTarget, Side, comment_markdown_style,
+        open_web_link,
+    },
     forge::{
         self, CommentableLines, DiffSide, HeadStatus, PullRequestStatus, ReviewEvent,
         ReviewFileComment, ReviewLineComment, ReviewSubmission,
@@ -15,7 +18,6 @@ use crate::{
     session::{ReviewOutcome, ReviewSession, ReviewSessionEvent},
     view::{ReviewView, head_oid},
 };
-use editor::hover_markdown_style;
 use futures::channel::oneshot;
 use git::{Oid, repository::RepoPath};
 use gpui::{
@@ -906,7 +908,7 @@ impl Render for SubmitReviewModal {
                 .text_sm()
                 .child(MarkdownElement::new(
                     body.clone(),
-                    hover_markdown_style(window, cx),
+                    comment_markdown_style(window, cx),
                 ))
                 .into_any_element(),
             None => Label::new("No review comment")
