@@ -9,8 +9,8 @@ use anyhow::Result;
 use buffer_diff::{BufferDiff, BufferDiffEvent};
 use collections::{HashMap, HashSet};
 use editor::{
-    Addon, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
-    multibuffer_context_lines, scroll::Autoscroll,
+    Addon, Bias, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    ToPoint as _, display_map::DisplayRow, multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
@@ -832,8 +832,9 @@ impl ReviewDiff {
                     else {
                         return false;
                     };
+                    let autoscroll = file_start_autoscroll(editor, position, cx);
                     editor.change_selections(
-                        SelectionEffects::scroll(Autoscroll::focused()),
+                        SelectionEffects::scroll(autoscroll),
                         window,
                         cx,
                         |selections| selections.select_ranges([position..position]),
@@ -1230,4 +1231,32 @@ fn tree_sort_path(repo_path: &RelPath) -> Arc<RelPath> {
     RelPath::from_unix_str(&synthetic)
         .map(|path| path.into_arc())
         .unwrap_or_else(|_| repo_path.into_arc())
+}
+
+/// Scrolls the first row of a file into view with the file's header at the top, so that what
+/// sits between them (file comments and threads, the moved threads) isn't left under the sticky
+/// header. When that doesn't fit, the row goes near the top as usual.
+fn file_start_autoscroll(
+    editor: &mut Editor,
+    position: editor::Anchor,
+    cx: &mut Context<Editor>,
+) -> Autoscroll {
+    // The row itself and the scroll margin below it.
+    const ROWS_BELOW_BLOCKS: u32 = 4;
+    let Some(visible_lines) = editor.visible_line_count() else {
+        return Autoscroll::focused();
+    };
+    let snapshot = editor.display_snapshot(cx);
+    let point = position.to_point(snapshot.buffer_snapshot());
+    let row = snapshot.point_to_display_point(point, Bias::Left).row();
+    let room = (visible_lines as u32).saturating_sub(ROWS_BELOW_BLOCKS);
+    let header_row = snapshot
+        .blocks_in_range(DisplayRow(row.0.saturating_sub(room))..row)
+        .filter(|(_, block)| block.is_buffer_header())
+        .map(|(header_row, _)| header_row)
+        .last();
+    match header_row {
+        Some(header_row) => Autoscroll::top_relative(f64::from(row.0 - header_row.0)),
+        None => Autoscroll::focused(),
+    }
 }

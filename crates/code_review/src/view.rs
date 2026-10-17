@@ -3531,6 +3531,50 @@ mod tests {
             assert_eq!(cursor_line(&editor, cx), "gone 2");
         }
 
+        /// `]f` scrolls the file's header to the top, so the blocks between it and the file's
+        /// first row (a file comment here) aren't left under the sticky header.
+        #[gpui::test]
+        async fn test_file_navigation_shows_the_file_header(cx: &mut TestAppContext) {
+            use editor::{Bias, display_map::DisplayRow};
+            use language::Point;
+
+            init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let editor = rhs_editor(&review, cx);
+            move_to_row_with_text(&editor, "short", cx);
+            cx.simulate_keystrokes("shift-c");
+            cx.simulate_input("a file comment\nover\nseveral\nlines");
+            cx.simulate_keystrokes("ctrl-enter");
+            cx.simulate_keystrokes("g g");
+
+            cx.simulate_keystrokes("] f ] f ] f");
+            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("long.txt"));
+            let (scroll_top, header_row, cursor_row) = editor.update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                let cursor = editor.selections.newest::<Point>(&snapshot).head();
+                let cursor_row = snapshot.point_to_display_point(cursor, Bias::Left).row();
+                let header_row = snapshot
+                    .blocks_in_range(DisplayRow(0)..cursor_row)
+                    .filter(|(_, block)| block.is_buffer_header())
+                    .map(|(row, _)| row)
+                    .last()
+                    .unwrap();
+                (editor.scroll_position(cx).y, header_row.0, cursor_row.0)
+            });
+            assert_eq!(scroll_top, f64::from(header_row));
+            let comment_rows = review.update(cx, |review, cx| {
+                review
+                    .comments()
+                    .update(cx, |comments, cx| comments.hosted_rows(cx))
+            });
+            assert_eq!(comment_rows.len(), 1);
+            let comment_row = comment_rows[0].1;
+            assert!(
+                header_row < comment_row && comment_row < cursor_row,
+                "header {header_row}, comment {comment_row}, cursor {cursor_row}"
+            );
+        }
+
         #[gpui::test]
         async fn test_file_navigation_on_the_old_side(cx: &mut TestAppContext) {
             init_vim_test(cx, DiffViewStyle::Split);
