@@ -18,8 +18,9 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 **Status: milestones 1–6 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
 persistence, panel list" with the M5 part 1 review fixes) and M6 (export, see "Milestone 6"); M7 in
-progress: slice (a), the GitHub client (see "Milestone 7, slice (a)"), is done; slices (b) PR
-picker + checkout, (c) description + threads and (d) submit are next.** The
+progress: slice (a), the GitHub client (see "Milestone 7, slice (a)"), is done, followed by a second
+hardening pass over the M5 part 2 + M6 review (see "Hardening 2"); slices (b) PR picker + checkout,
+(c) description + threads and (d) submit are next.** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
@@ -53,7 +54,7 @@ What exists:
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
 | `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
 | `crates/code_review/src/comments.rs` | Comment model: `CommentId`, `Side`, `CommentType` (cycle, labels, colors, legend definitions), `CommentTarget` (`Review`/`File`/`Lines`), `CommentState`, `Comment` (`location()`, JSON for the DB), `CommentStore`, `CommentEvent`; unit tests |
-| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment blocks on both sides of the diff (`reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), anchors for stored comments + the outdated check (`resolve_anchors`), live line numbers (`sync_positions`), comment editors (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
+| `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment blocks on both sides of the diff (`reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch) with the outdated check, deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`), comment at cursor, `Y`/visual `y` text; comment GPUI tests |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
 | `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`), the `Forge` trait, `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
@@ -382,9 +383,9 @@ state dir):**
   (`None` = untyped), `CommentTarget::{Review, File { path }, Lines { path, side, lines }}` (1-based,
   numbers when made), `CommentState::{Draft, Outdated, Submitted { review_id }}` (the last two are
   unused yet), `body` (trimmed), `line_text` (the lines' text when made, for part 2's outdated check),
-  `anchor` (runtime buffer anchors: `anchor_after` the first line's start, `anchor_before` the last
-  line's end, so text typed before the first line or after the last stays outside). Stored in the DB
-  since part 2.
+  anchors (runtime buffer anchors: `anchor_after` the first line's start, `anchor_before` the last
+  line's end, so text typed before the first line or after the last stays outside; per tab since
+  "Hardening 2", no longer on the comment). Stored in the DB since part 2.
 - **Hosting** (`CommentBlocks`, one per tab; `CommentView` per comment): right side only, one
   `BlockStyle::Sticky` block per comment (not moved by `h`/`l`), priority = id, opaque card and
   wrapper (covers the empty-row bleed). File comments sit `Above` the file's first row (below its
@@ -468,28 +469,34 @@ state dir):**
   side's row facing it); comments on the focused side win. `]t` orders by the new file's row (old rows at
   the new row they face, `base_text_point_to_buffer_point`), old before new at the same place; a
   left-side row facing a spacer positions by its own base row.
-- **Positions**: on every reconcile and buffer edit, line comments' `lines` and `line_text` follow their
-  anchors (in memory; an outdated comment keeps the text it was about), and so does the card's label. A
-  range whose start passed its end (typing on an empty commented line) collapses onto its end, where the
-  block is. Saved with the comment's next change, when its tabs close (`on_release`) and on quit
-  (`on_app_quit`, awaiting a DB barrier; live: an editor open at quit came back).
+- **Positions**: on every reconcile and buffer edit, line comments' `lines` and `line_text` follow the
+  tab's anchors (in memory; an outdated comment keeps the text it was about), and so does the card's
+  label. A range whose start passed its end (typing on an empty commented line) collapses onto its end,
+  where the block is; one whose lines were deleted doesn't (see "Hardening 2"). Saved with the
+  comment's next change, when its tabs close (`on_release`) and on quit (`on_app_quit`, awaiting a DB
+  barrier; live: an editor open at quit came back).
 - **Persistence**: migration 1 `code_review_comments(review_key FK → sessions ON DELETE/UPDATE CASCADE,
   comment_id, data TEXT, PRIMARY KEY(review_key, comment_id)) STRICT`; `data` is JSON `{target: {kind:
   review|file|lines, path, side, start, end}, comment_type, body, line_text, state: draft|outdated|
   {submitted: {review_id}}}` with serde defaults, so fields can be added without a migration. Loaded with
   the marks (`open_review`); nothing can be added until then (toast). A comment is stored once it has
   text: a new one starts empty, and a type set before that stays in memory until the text comes. Ids
-  continue after the stored maximum (a deleted id may be reused after a restart; rows are per id).
-- **Outdated**: a stored line comment gets its anchors once its file's buffer (old side: the diff base,
-  which must exist) is loaded in the review: the rows of `lines` must exist and their text equal
-  `line_text`, else the comment becomes `Outdated` (stored; sticky until `dd`) on the clamped rows: an
-  OUTDATED badge with a tooltip, "outdated" in the panel, ` (outdated)` in the export, still navigable.
-  An anchor into a buffer that was replaced (the file left the review and came back, a snapshot rebuilt)
-  is resolved again the same way; anchors are never resolved against another buffer. Comments on files
-  not in the review stay unanchored (panel and export only).
-- **Pruning**: once per run, when the first review opens, reviews not opened for **90 days** are deleted
-  with their marks and comments (`ON DELETE CASCADE`). Hunk keys inside a live review aren't pruned
-  (that would need a per-key timestamp).
+  continue after the largest stored id, also of rows that can't be read (a newer build wrote them):
+  those are skipped (logged) and never overwritten. A deleted id may be reused after a restart (rows
+  are per id).
+- **Outdated**: a stored line comment's lines are compared with its file once per run, by the first tab
+  that has the file loaded (its buffer; old side: the diff base, which must exist): the rows of `lines` must
+  exist and their text equal `line_text`, else the comment becomes `Outdated` (stored; sticky until `dd`)
+  on the clamped rows: an OUTDATED badge with a tooltip, "outdated" in the panel, ` (outdated)` in the
+  export, still navigable. Other tabs anchor it on its lines without comparing. A comment whose lines
+  were deleted while the review is open, or whose buffer was replaced (the file left the review and
+  came back, a snapshot or diff base rebuilt), is anchored on its line numbers again and compared the
+  same way. Anchors are never resolved against another buffer. Comments on files not in the review stay
+  unanchored (panel and export only).
+- **Pruning**: once per run, after the first review has loaded (so never that one), reviews not opened
+  for **90 days** are deleted with their marks and comments (`ON DELETE CASCADE`). Every write and every
+  closed tab or quit (`flush`) counts as opening the review (`ensure_session` upserts
+  `last_opened_at`). Hunk keys inside a live review aren't pruned (that would need a per-key timestamp).
 - **Panel list**: below the tree in the same `uniform_list`: a "Comments (N)" heading (skipped by the
   selection), then per comment the type, `path:line` (`~` = old side) or "Review", the body's first line
   and the outdated/submitted state. Enter/click: a line or file comment lands like `]t` (activating the
@@ -530,7 +537,8 @@ state dir):**
   `path:L`, `path:S-E`, `path:~L`, `path:~S-~E` (old side), `path`, and `Review Comment (scope: …)`.
   Order as tuicr's: review comments, files by path string, file comments, then line comments by last
   line (sides interleaved), creation order. Submitted (M7) and empty comments are left out; outdated ones
-  get ` (outdated)` after the location (where tuicr writes ` (commit sha)`).
+  get ` (outdated)` after the location (where tuicr writes ` (commit sha)`). Comment editors open in the
+  exporting tab count with their current text (as leaving them would save it); other tabs' don't.
 - Banners/scopes: uncommitted "Reviewing staged + unstaged changes" / "staged + unstaged changes"
   (tuicr's staged + unstaged source); commits "Reviewing commit: abc1234" or "Reviewing commits: a, b"
   (oldest first, from the top block's commits; "Reviewing commits: base..head" while they load or past
@@ -627,34 +635,82 @@ state dir):**
   Run it by hand with `cargo test -p code_review live_github -- --ignored`.
 - Tests: 21 new (110 total + 1 ignored live test). Clippy clean.
 
+**Hardening 2 (M5 part 2 + M6 review findings, `reviews/M5b.md` in the orchestrator's state dir):**
+
+- **H1, two projects reviewing one key** (a repository's root and a subfolder in two windows, `zed -n`,
+  worktrees reviewing one commit range): anchors are per tab (`CommentBlocks::anchors: TabAnchors`, a
+  `LineAnchor` per line comment: the range in this tab's buffer of the side plus the lines and text this
+  tab last saw), no longer on the shared `Comment`. A tab reports only its own moves
+  (`ReviewSession::set_comment_positions`, one `CommentEvent::Moved(ids)` per batch, which other tabs
+  only use to relabel their cards: no reconcile), so tabs whose buffers differ never undo each other.
+  The outdated check runs once per run (`ReviewSession::unchecked`, `needs_check`, `check_comment`, which
+  only emits when the state changes). Key switches park the tab's anchors per session
+  (`parked_anchors`) and restore them on the way back. Last writer wins for the stored `lines` when
+  windows disagree (unsaved edits in one): each window places blocks by its own anchors, and the card
+  labels and the panel show the stored numbers.
+- **M2, deleted lines**: a `LineAnchor` whose range is empty or reversed while the text it last saw
+  wasn't empty lost its lines (deleted; or deleted and put back before the tab looked, like a stash
+  and a pop: the ends come back the wrong way around). It is anchored on its line numbers again:
+  same text there → kept (a multi-line comment stays multi-line), else `Outdated` on those lines,
+  immediately (it doesn't move onto the next line). So `cc`/`S` on a commented line, or deleting its
+  whole text, also outdates it; a comment on an empty line can't tell and still moves with the next
+  line. A `git stash` while the file stays in the review outdates its comments (sticky after the pop).
+- **M1**: `CommentStore::restore` takes the largest stored id, including unreadable rows. **L1/L2**:
+  above ("Pruning"). **L3**: a panel selection whose row went away moves to the nearest selectable
+  row (the earlier of two), never the "Comments (N)" heading. **L4**: one `Moved` event per update and
+  one reconcile per buffer edit (was one event and reconcile per moved comment); loading emits only for
+  newly outdated comments.
+- **Nits**: `can_resolve` before resolving base-text anchors (`old_row_in_unified_diff`,
+  `comment_order`); the export uses open editors' text (above); `Y` on a comment still being written
+  (no text) says "No comment at the cursor"; summarizing doc comments removed.
+- **Vim writes in comment editors**: `vim::VimSave` is private and `no_register`, so its type id comes
+  from an instance: `command_palette_hooks::GlobalCommandPaletteInterceptor::intercept("w")` (vim's
+  interceptor, ready immediately for `w`; cached in a global). Each comment editor registers a
+  capture-phase listener for it (`Editor::register_action_renderer` + `Window::on_action`) that stops
+  propagation and leaves the comment keeping its text. So every `:w` form (`:w`, `:w!`, `:'<,'>w`,
+  `:%w file`, `:w file`) leaves the comment; `:%w file` no longer reaches vim's
+  `editor.project().unwrap()` (`vim/src/command.rs:424`, a panic in comment editors, which have no
+  project). No vim patch. New dependency `command_palette_hooks` (already in `zed`'s graph).
+- Tests: 3 new (113 total + 1 ignored): two projects (root + subfolder, two windows) on one fake repo
+  (must terminate, no outdated flag, no position fight, both reopen), deleted and restored lines,
+  unreadable stored comments; extended: forgotten reviews (the first review opened is kept, a written
+  review is kept), panel selection, export with an open editor, `Y` on an empty comment, `:w!`,
+  `:'<,'>w`, `:%w x` among the leave keys. Clippy clean.
+- **Live check** (harness, scratch repo; screenshots in the orchestrator's `validation/hardening2/`):
+  lines 5–6 commented, then deleted from the shell → OUTDATED badge, still "Lines 5–6"; `:%w
+  /tmp/hardening2/x` in a comment editor → no crash, comment saved and left; a second window (new
+  window + Zed's path prompt on the repository's `src/` subfolder) opens the same uncommitted review:
+  both show each other's comments, a shell edit moves them alike, an unsaved edit in one window moves
+  them only there, Zed stays idle (no ping-pong).
+
 **Known issues / notes for the next slices:**
 
 - **M7 hooks** (`plans/M7-github-v2.md` §6):
   - Gate: `CommentBlocks::add_comment` is the only place comments are made; check a `CommentGate` there,
     before `session.add_comment` (keep the gate on `ReviewSession` so every tab of the review shares it).
     The target (`path`, `side`, `lines`, 1-based) is in `NewComment.target`.
-  - Placement: `placement()` / `line_row_anchor()` take a `Comment` with an anchor. For remote threads
-    (line numbers, no anchors), make anchors like `resolve_anchors` does (`side_buffer` +
-    `line_anchor_and_text`), then reuse them. Generalize `hosted: HashMap<CommentId, HostedBlock>` to a
-    key enum (`Comment(id) | Remote(thread_id)`) carrying an `AnyView`; `reconcile`, `comment_order`
-    and `ReviewView::panel_comments` then include remote items.
+  - Placement: `placement()` / `line_row_anchor()` take a `Comment` and its anchor (the tab's
+    `LineAnchor.range`). For remote threads (line numbers, no anchors), make anchors like
+    `update_anchors` does (`side_buffer` + `line_anchor_and_text`) and keep them per tab too (never on
+    state shared by the review's tabs: another project's tab has other buffers, "Hardening 2"), then
+    reuse them. Generalize `hosted: HashMap<CommentId, HostedBlock>` to a key enum (`Comment(id) |
+    Remote(thread_id)`) carrying an `AnyView`; `reconcile`, `comment_order` and
+    `ReviewView::panel_comments` then include remote items.
   - Submitted: `CommentState::Submitted` is stored; add `ReviewSession::mark_submitted(ids, review_id)`
     (set the state + `save_comment`). The export already skips submitted comments, the panel marks
     them, `begin_edit`/`confirm_delete` refuse them; hiding them inline is M7's call (`placement` →
     `None`).
   - Live lines for submit: `CommentTarget::Lines.lines` are kept current from the anchors (every
-    reconcile and buffer edit), so they are the live numbers; `Side::Old` = LEFT with the base's
-    numbering (left-side context rows are Old too).
+    reconcile and buffer edit; the last tab that saw them move when windows' buffers differ), so they
+    are the live numbers; `Side::Old` = LEFT with the base's numbering (left-side context rows are Old
+    too).
   - Export: add the PR arm in `ReviewView::export_preamble` ("Reviewing pull request o/r#N: title",
     "URL: …", "Head: sha7", scope "pull request o/r#N").
-- **Comment editors, known gaps**: `:w!` and visual `:'<,'>w` don't leave the comment (vim's private
-  `VimSave` can't be intercepted, and `:w!`'s Overwrite intent skips a non-dirty item); use `:w`, `Esc`
-  or `ctrl-enter`. `:%w file` / `:'<,'>w file` panic upstream (`vim/src/command.rs:424` unwraps the
-  editor's project; comment editors have none, like the git panel's commit editor), a core patch
-  candidate (`let Some(project) = … else { return }`). `:qa`, `:qa!`, `:wqa`, `:xa` close the review
-  tab(s); open comment text is saved even by `:qa!`. Two tabs editing one saved comment: last writer
-  wins. Old-side lines removed from a branch review's base while it is open collapse onto a neighbour
-  and are only flagged outdated after a reopen.
+- **Comment editors, known gaps**: every `:w` form leaves the comment keeping its text (see "Hardening
+  2"); none writes a file. `:qa`, `:qa!`, `:wqa`, `:xa` close the review tab(s); open comment text is
+  saved even by `:qa!`. Two tabs editing one saved comment: last writer wins. Two windows whose buffers
+  differ (unsaved edits) disagree on a comment's line numbers: each places it by its own buffer, the
+  stored numbers are the last mover's.
 - Split view: a block below a *changed* row is still mirrored below the start of its hunk, so rows inside
   a multi-row hunk don't face each other until the hunk ends; a block below the last unchanged row of an
   excerpt is mirrored above the facing row (no next row to anchor to). Both are upstream
@@ -676,8 +732,9 @@ state dir):**
   `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
   in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 110 tests
-  + 1 ignored live GitHub test (after M7 slice a; 89 after M6, stable under `ITERATIONS=5`).
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 113 tests
+  + 1 ignored live GitHub test (after hardening 2; 110 after M7 slice a, 89 after M6, stable under
+  `ITERATIONS=5`; the hardening-2 comment tests under `ITERATIONS=10`).
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
   snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
   `]f`/`]c`/line cursor/`e` in branch, live and snapshot reviews.
