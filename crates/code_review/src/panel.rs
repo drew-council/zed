@@ -436,7 +436,7 @@ impl ReviewPanel {
         self.entries.get(self.selected?)
     }
 
-    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.entries.len() {
             return;
         }
@@ -449,7 +449,7 @@ impl ReviewPanel {
             && review.read(cx).diff().read(cx).single_file().is_some()
         {
             let path_key = file.path_key.clone();
-            self.reveal_in_diff(&review, path_key, cx);
+            review.update(cx, |review, cx| review.reveal_file(path_key, window, cx));
         }
         cx.notify();
     }
@@ -487,26 +487,15 @@ impl ReviewPanel {
         }
     }
 
-    fn reveal_in_diff(&self, review: &Entity<ReviewView>, path_key: PathKey, cx: &mut App) {
-        let Some(window_handle) = cx.active_window() else {
-            return;
-        };
-        window_handle
-            .update(cx, |_, window, cx| {
-                review.update(cx, |review, cx| review.reveal_file(path_key, window, cx));
-            })
-            .log_err();
-    }
-
-    fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.selected.map_or(0, |index| index + 1);
-        self.select(index, cx);
+        self.select(index, window, cx);
     }
 
     fn select_previous(
         &mut self,
         _: &menu::SelectPrevious,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let index = self
@@ -514,15 +503,15 @@ impl ReviewPanel {
             .map_or(self.entries.len().saturating_sub(1), |index| {
                 index.saturating_sub(1)
             });
-        self.select(index, cx);
+        self.select(index, window, cx);
     }
 
-    fn select_first(&mut self, _: &menu::SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(0, cx);
+    fn select_first(&mut self, _: &menu::SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(0, window, cx);
     }
 
-    fn select_last(&mut self, _: &menu::SelectLast, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(self.entries.len().saturating_sub(1), cx);
+    fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(self.entries.len().saturating_sub(1), window, cx);
     }
 
     /// Enter: a file opens in the diff, which takes focus; a directory expands or collapses.
@@ -590,7 +579,7 @@ impl ReviewPanel {
             }) => self.toggle_directory(path, cx),
             Some(TreeEntry::Directory { expanded: true, .. }) => {
                 if let Some(index) = self.selected {
-                    self.select(index + 1, cx);
+                    self.select(index + 1, window, cx);
                 }
             }
             Some(TreeEntry::File { file, .. }) => self.open_file(file.path_key, false, window, cx),
@@ -602,7 +591,7 @@ impl ReviewPanel {
     fn collapse_selected_entry(
         &mut self,
         _: &CollapseSelectedEntry,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.selected else {
@@ -627,7 +616,7 @@ impl ReviewPanel {
             })
         });
         if let Some(parent) = parent {
-            self.select(parent, cx);
+            self.select(parent, window, cx);
         }
     }
 
@@ -711,14 +700,14 @@ impl ReviewPanel {
             PromptKind::Search => {
                 self.search = (!text.is_empty()).then_some(text);
                 self.close_prompt(window, cx);
-                self.select_match(true, cx);
+                self.select_match(true, window, cx);
             }
         }
     }
 
     /// Selects the next (or previous) file whose path contains the search, wrapping around and
     /// expanding the directories around it.
-    fn select_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+    fn select_match(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(search) = self.search.as_ref().map(|search| search.to_lowercase()) else {
             return;
         };
@@ -768,21 +757,26 @@ impl ReviewPanel {
         if let Some(index) = self.entries.iter().position(
             |entry| matches!(entry, TreeEntry::File { file, .. } if file.path_key == target.path_key),
         ) {
-            self.select(index, cx);
+            self.select(index, window, cx);
         }
     }
 
-    fn select_next_match(&mut self, _: &SelectNextMatch, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_match(true, cx);
+    fn select_next_match(
+        &mut self,
+        _: &SelectNextMatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_match(true, window, cx);
     }
 
     fn select_previous_match(
         &mut self,
         _: &SelectPreviousMatch,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_match(false, cx);
+        self.select_match(false, window, cx);
     }
 
     fn cancel_editor(
@@ -1499,6 +1493,24 @@ mod tests {
                 status_line(review.filters(), &summary, single_file),
             )
         })
+    }
+
+    #[gpui::test]
+    async fn test_panel_selection_shows_the_file_in_single_file_mode(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_tree_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("; f");
+        assert_eq!(excerpt_paths(&review, cx), ["docs/old.md"]);
+
+        cx.simulate_keystrokes("; h j j j");
+        assert_eq!(selected(&panel, cx), "c.rs A");
+        assert_eq!(excerpt_paths(&review, cx), ["src/a/b/c.rs"]);
+        cx.simulate_keystrokes("G");
+        assert_eq!(excerpt_paths(&review, cx), ["z.txt"]);
+        cx.simulate_keystrokes("g g j");
+        assert_eq!(excerpt_paths(&review, cx), ["docs/old.md"]);
     }
 
     #[gpui::test]
