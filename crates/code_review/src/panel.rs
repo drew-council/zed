@@ -4,7 +4,11 @@ use crate::{
     ReviewView, SearchPaths, SelectNextMatch, SelectPreviousMatch, ToggleFileReviewed, ToggleFocus,
     ToggleHideReviewed, TogglePanel, ToggleSelectedDirectory, ToggleShowGenerated,
     ToggleShowVendored,
-    view::{PanelFile, ReviewFilters, ReviewSummary, current_review, filter_regex, focus_diff},
+    comments::CommentId,
+    view::{
+        PanelComment, PanelFile, ReviewFilters, ReviewSummary, current_review, filter_regex,
+        focus_diff,
+    },
 };
 use anyhow::Result;
 use collections::HashSet;
@@ -157,7 +161,7 @@ struct Prompt {
     error: Option<SharedString>,
 }
 
-/// A row of the file tree.
+/// A row of the panel: the file tree, then the review's comments.
 #[derive(Clone, Debug)]
 enum TreeEntry {
     Directory {
@@ -172,12 +176,18 @@ enum TreeEntry {
         name: SharedString,
         depth: usize,
     },
+    /// The heading of the comment list, which selection skips.
+    CommentsHeader {
+        count: usize,
+    },
+    Comment(PanelComment),
 }
 
 impl TreeEntry {
     fn depth(&self) -> usize {
         match self {
             TreeEntry::Directory { depth, .. } | TreeEntry::File { depth, .. } => *depth,
+            TreeEntry::CommentsHeader { .. } | TreeEntry::Comment(_) => 0,
         }
     }
 
@@ -185,7 +195,13 @@ impl TreeEntry {
         match self {
             TreeEntry::Directory { path, .. } => EntryKey::Directory(path.clone()),
             TreeEntry::File { file, .. } => EntryKey::File(file.path_key.clone()),
+            TreeEntry::CommentsHeader { .. } => EntryKey::CommentsHeader,
+            TreeEntry::Comment(comment) => EntryKey::Comment(comment.id),
         }
+    }
+
+    fn is_selectable(&self) -> bool {
+        !matches!(self, TreeEntry::CommentsHeader { .. })
     }
 }
 
@@ -193,6 +209,8 @@ impl TreeEntry {
 enum EntryKey {
     Directory(RepoPath),
     File(PathKey),
+    CommentsHeader,
+    Comment(CommentId),
 }
 
 #[derive(Default)]
@@ -369,6 +387,16 @@ impl ReviewPanel {
 
         let mut entries = Vec::new();
         self.flatten(&root, 0, review_id, &mut entries);
+        let comments = self
+            .active_review()
+            .map(|review| review.read(cx).panel_comments(cx))
+            .unwrap_or_default();
+        if !comments.is_empty() {
+            entries.push(TreeEntry::CommentsHeader {
+                count: comments.len(),
+            });
+            entries.extend(comments.into_iter().map(TreeEntry::Comment));
+        }
         self.entries = entries;
         self.selected = match selected_key {
             Some(key) => self
@@ -437,7 +465,11 @@ impl ReviewPanel {
     }
 
     fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.entries.len() {
+        if self
+            .entries
+            .get(index)
+            .is_none_or(|entry| !entry.is_selectable())
+        {
             return;
         }
         self.selected = Some(index);
@@ -488,8 +520,10 @@ impl ReviewPanel {
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
-        let index = self.selected.map_or(0, |index| index + 1);
-        self.select(index, window, cx);
+        let start = self.selected.map_or(0, |index| index + 1);
+        if let Some(index) = (start..self.entries.len()).find(|index| self.is_selectable(*index)) {
+            self.select(index, window, cx);
+        }
     }
 
     fn select_previous(
@@ -498,20 +532,31 @@ impl ReviewPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self
-            .selected
-            .map_or(self.entries.len().saturating_sub(1), |index| {
-                index.saturating_sub(1)
-            });
-        self.select(index, window, cx);
+        let end = self.selected.unwrap_or(self.entries.len());
+        if let Some(index) = (0..end).rev().find(|index| self.is_selectable(*index)) {
+            self.select(index, window, cx);
+        }
     }
 
     fn select_first(&mut self, _: &menu::SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(0, window, cx);
+        if let Some(index) = (0..self.entries.len()).find(|index| self.is_selectable(*index)) {
+            self.select(index, window, cx);
+        }
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(self.entries.len().saturating_sub(1), window, cx);
+        if let Some(index) = (0..self.entries.len())
+            .rev()
+            .find(|index| self.is_selectable(*index))
+        {
+            self.select(index, window, cx);
+        }
+    }
+
+    fn is_selectable(&self, index: usize) -> bool {
+        self.entries
+            .get(index)
+            .is_some_and(TreeEntry::is_selectable)
     }
 
     /// Enter: a file opens in the diff, which takes focus; a directory expands or collapses.
@@ -523,8 +568,48 @@ impl ReviewPanel {
         match self.selected_entry().cloned() {
             Some(TreeEntry::File { file, .. }) => self.open_file(file.path_key, true, window, cx),
             Some(TreeEntry::Directory { path, .. }) => self.toggle_directory(path, cx),
-            None => {}
+            Some(TreeEntry::Comment(comment)) => self.open_comment(&comment, window, cx),
+            Some(TreeEntry::CommentsHeader { .. }) | None => {}
         }
+    }
+
+    /// Like `]t`: the diff moves to a line or file comment and takes the focus. A review comment
+    /// opens for editing.
+    fn open_comment(
+        &mut self,
+        comment: &PanelComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = self.active_review() else {
+            return;
+        };
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&review, true, false, window, cx)
+            });
+        }
+        let blocks = review.read(cx).comments().clone();
+        let id = comment.id;
+        if comment.is_review {
+            blocks.update(cx, |blocks, cx| blocks.edit(id, window, cx));
+            return;
+        }
+        let landed = blocks.update(cx, |blocks, cx| blocks.land_on(id, window, cx));
+        if !landed {
+            self.show_toast("This comment's lines aren't in the diff", cx);
+        }
+    }
+
+    fn show_toast(&self, message: &'static str, cx: &mut App) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<Self>(), message).autohide(),
+                    cx,
+                )
+            })
+            .log_err();
     }
 
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
@@ -583,7 +668,7 @@ impl ReviewPanel {
                 }
             }
             Some(TreeEntry::File { file, .. }) => self.open_file(file.path_key, false, window, cx),
-            None => {}
+            Some(TreeEntry::CommentsHeader { .. } | TreeEntry::Comment(_)) | None => {}
         }
     }
 
@@ -1051,6 +1136,83 @@ impl ReviewPanel {
                     }))
                     .into_any_element()
             }
+            TreeEntry::CommentsHeader { count } => h_flex()
+                .id(("review-comments-header", index))
+                .px_2()
+                .pt_2()
+                .pb_0p5()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Label::new(format!("Comments ({count})"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            TreeEntry::Comment(comment) => {
+                let muted = comment.outdated || comment.submitted;
+                ListItem::new(("review-comment", index))
+                    .spacing(ListItemSpacing::Sparse)
+                    .toggle_state(selected)
+                    .focused(selected && focused)
+                    .start_slot(match comment.comment_type {
+                        Some(comment_type) => Label::new(comment_type.label())
+                            .size(LabelSize::XSmall)
+                            .color(comment_type.color())
+                            .buffer_font(cx)
+                            .into_any_element(),
+                        None => Icon::new(IconName::Chat)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                            .into_any_element(),
+                    })
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                Label::new(comment.location.clone())
+                                    .size(LabelSize::Small)
+                                    .color(if muted { Color::Muted } else { Color::Default })
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(comment.first_line.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .when(comment.outdated || comment.submitted, |item| {
+                        item.end_slot(
+                            Label::new(if comment.outdated {
+                                "outdated"
+                            } else {
+                                "submitted"
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(if comment.outdated {
+                                Color::Warning
+                            } else {
+                                Color::Muted
+                            }),
+                        )
+                    })
+                    .tooltip({
+                        let location = comment.location.clone();
+                        move |_, cx| Tooltip::simple(location.clone(), cx)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.selected = Some(index);
+                        if let Some(TreeEntry::Comment(comment)) = this.entries.get(index).cloned()
+                        {
+                            this.open_comment(&comment, window, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
         }
     }
 
@@ -1227,6 +1389,24 @@ impl ReviewPanel {
                             ""
                         };
                         format!("{marker}{indent}{name}{kind} {letter}{reviewed}")
+                    }
+                    TreeEntry::CommentsHeader { count } => format!("{marker}Comments ({count})"),
+                    TreeEntry::Comment(comment) => {
+                        let comment_type = comment
+                            .comment_type
+                            .map(|comment_type| format!("[{}] ", comment_type.label()))
+                            .unwrap_or_default();
+                        let state = if comment.outdated {
+                            " (outdated)"
+                        } else if comment.submitted {
+                            " (submitted)"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "{marker}{comment_type}{} {}{state}",
+                            comment.location, comment.first_line
+                        )
                     }
                 }
             })
@@ -1876,5 +2056,78 @@ mod tests {
         dispatch(menu::Cancel, cx);
         assert!(panel.read_with(cx, |panel, _| panel.context_menu.is_none()));
         cx.update(|window, cx| assert!(panel.focus_handle(cx).contains_focused(window, cx)));
+    }
+
+    #[gpui::test]
+    async fn test_panel_lists_comments(cx: &mut TestAppContext) {
+        use crate::test_support::{cursor_line, move_to_row_with_text, open_review_fixture};
+
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        let editor = rhs_editor(&review, cx);
+        cx.run_until_parked();
+        let comment_rows = |cx: &mut VisualTestContext| {
+            let rows = rows(&panel, cx);
+            let start = rows
+                .iter()
+                .position(|row| row.trim_start_matches('>').starts_with("Comments"));
+            start.map_or(Vec::new(), |start| rows[start..].to_vec())
+        };
+        assert!(comment_rows(cx).is_empty());
+
+        for (row_text, keys, body) in [
+            ("ONE", "shift-c", "file note"),
+            ("line 3", "c", "first line\nsecond line"),
+            ("gone 1", "c", "removed"),
+            ("line 4", "; c", "overall"),
+        ] {
+            move_to_row_with_text(&editor, row_text, cx);
+            cx.simulate_keystrokes(keys);
+            cx.simulate_input(body);
+            cx.simulate_keystrokes("escape");
+            if body == "removed" {
+                cx.simulate_keystrokes("tab");
+            }
+            cx.simulate_keystrokes("ctrl-enter");
+        }
+        // Review comments first, then in the review's file order.
+        assert_eq!(
+            comment_rows(cx),
+            [
+                "Comments (4)",
+                "Review overall",
+                "a.rs:3 first line",
+                "[ISSUE] deleted.txt:~1 removed",
+                "modified.txt file note",
+            ]
+        );
+
+        // Enter on a comment moves the diff there, like `]t`.
+        cx.simulate_keystrokes("; h shift-g");
+        assert_eq!(selected(&panel, cx), "modified.txt file note");
+        cx.simulate_keystrokes("k enter");
+        assert!(cx.update(|window, cx| editor.focus_handle(cx).is_focused(window)));
+        assert_eq!(cursor_line(&editor, cx), "gone 1");
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("deleted.txt"));
+
+        // A review comment opens for editing.
+        cx.simulate_keystrokes("; h shift-g k k k");
+        assert_eq!(selected(&panel, cx), "Review overall");
+        // The heading isn't selectable.
+        cx.simulate_keystrokes("k");
+        assert_ne!(selected(&panel, cx), "Comments (4)");
+        cx.simulate_keystrokes("j enter");
+        let open = review.read_with(cx, |review, cx| review.comments().read(cx).is_editing(cx));
+        assert!(open);
+        cx.simulate_keystrokes("escape escape");
+
+        // Deleting a comment removes its row.
+        move_to_row_with_text(&editor, "line 3", cx);
+        cx.simulate_keystrokes("d d");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert_eq!(comment_rows(cx).len(), 4);
+        assert_eq!(comment_rows(cx)[0], "Comments (3)");
     }
 }

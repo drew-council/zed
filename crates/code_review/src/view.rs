@@ -4,7 +4,7 @@ use crate::{
     PreviousComment, PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch,
     ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed,
     ToggleHeader, ToggleHunkReviewed, ToggleSingleFileMode,
-    comments::{CommentBlocks, CommentBlocksEvent},
+    comments::{CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType},
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
         resolve_commit_spec,
@@ -276,6 +276,18 @@ pub(crate) struct PanelFile {
     pub status: FileStatus,
     pub reviewed: bool,
     pub attributes: FileAttributes,
+}
+
+/// A comment as the review panel lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PanelComment {
+    pub id: CommentId,
+    pub is_review: bool,
+    pub comment_type: Option<CommentType>,
+    pub location: SharedString,
+    pub first_line: SharedString,
+    pub outdated: bool,
+    pub submitted: bool,
 }
 
 /// Which files a review tab shows. Per tab and not persisted (like tuicr's filters).
@@ -1588,9 +1600,50 @@ impl ReviewView {
             .update(cx, |comments, cx| comments.go_to_previous(window, cx));
     }
 
-    #[cfg(test)]
     pub(crate) fn comments(&self) -> &Entity<CommentBlocks> {
         &self.comments
+    }
+
+    /// The comments the review panel lists: review comments first, then by file in review order,
+    /// file comments before line comments, those by their last line. Comments still being
+    /// written for the first time (without text) aren't listed.
+    pub(crate) fn panel_comments(&self, cx: &App) -> Vec<PanelComment> {
+        let mut comments = self
+            .session
+            .read(cx)
+            .comments()
+            .iter()
+            .filter(|comment| !comment.body.is_empty())
+            .collect::<Vec<_>>();
+        comments.sort_by_key(|comment| {
+            let path_key = comment.target.path().map(review_path_key);
+            let line = match &comment.target {
+                CommentTarget::Lines { lines, .. } => Some(*lines.end()),
+                CommentTarget::Review | CommentTarget::File { .. } => None,
+            };
+            (path_key, line, comment.id)
+        });
+        comments
+            .into_iter()
+            .map(|comment| PanelComment {
+                id: comment.id,
+                is_review: comment.target == CommentTarget::Review,
+                comment_type: comment.comment_type,
+                location: comment
+                    .location()
+                    .unwrap_or_else(|| "Review".to_string())
+                    .into(),
+                first_line: comment
+                    .body
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+                    .into(),
+                outdated: comment.is_outdated(),
+                submitted: comment.is_submitted(),
+            })
+            .collect()
     }
 
     /// Compares anchors: a cursor on a folded file's header resolves to the whole folded file.

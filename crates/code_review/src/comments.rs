@@ -142,6 +142,27 @@ impl Comment {
     pub(crate) fn is_submitted(&self) -> bool {
         matches!(self.state, CommentState::Submitted { .. })
     }
+
+    /// Where the comment is, as the export and the review panel show it: `path:12`,
+    /// `path:12-14`, `path:~12` (old side), `path`, or `None` for a review comment.
+    pub(crate) fn location(&self) -> Option<String> {
+        match &self.target {
+            CommentTarget::Review => None,
+            CommentTarget::File { path } => Some(path.as_unix_str().to_string()),
+            CommentTarget::Lines { path, side, lines } => {
+                let path = path.as_unix_str();
+                let marker = match side {
+                    Side::Old => "~",
+                    Side::New => "",
+                };
+                Some(if lines.start() == lines.end() {
+                    format!("{path}:{marker}{}", lines.start())
+                } else {
+                    format!("{path}:{marker}{}-{marker}{}", lines.start(), lines.end())
+                })
+            }
+        }
+    }
 }
 
 pub(crate) struct NewComment {
@@ -404,6 +425,7 @@ mod tests {
         let minimal = r#"{"target":{"kind":"lines","path":"a.rs","side":"new","start":2,"end":2},"body":"b"}"#;
         let comment = Comment::from_json(CommentId(1), minimal).unwrap();
         assert_eq!(comment.state, CommentState::Draft);
+        assert_eq!(comment.location().as_deref(), Some("a.rs:2"));
         let reversed = r#"{"target":{"kind":"lines","path":"a.rs","side":"new","start":3,"end":2},"body":"b"}"#;
         assert!(Comment::from_json(CommentId(1), reversed).is_err());
     }
