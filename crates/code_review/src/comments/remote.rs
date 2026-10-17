@@ -1,6 +1,6 @@
 use crate::forge::{DiffSide, RemoteThread, ThreadAnchor};
 use editor::hover_markdown_style;
-use gpui::Entity;
+use gpui::{Entity, deferred};
 use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use std::sync::Arc;
@@ -80,6 +80,21 @@ impl HoveredLink {
                 .overflow_hidden()
                 .child(LinkPreview::new(url, cx)),
         )
+    }
+
+    /// Where the hovered link goes, hanging below the bottom left corner of a `relative`
+    /// container (over whatever follows it), so that it covers none of the container.
+    pub(crate) fn render_below(&self, cx: &mut App) -> Option<impl IntoElement + use<>> {
+        let (_, url) = self.0.as_ref()?;
+        Some(deferred(
+            div()
+                .absolute()
+                .top_full()
+                .left_0()
+                .max_w_full()
+                .overflow_hidden()
+                .child(LinkPreview::new(url, cx)),
+        ))
     }
 }
 

@@ -832,7 +832,8 @@ impl Render for ReviewTopBlock {
         if content.is_none() && review_comments.is_empty() {
             return div().into_any_element();
         }
-        let hovered_link = self.hovered_link.render(cx);
+        // The bottom of the block has the thread toggles and the review comments.
+        let hovered_link = self.hovered_link.render_below(cx);
         v_flex()
             .relative()
             .w_full()
