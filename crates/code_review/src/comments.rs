@@ -4,8 +4,8 @@ mod view;
 
 pub(crate) use blocks::{CommentBlocks, CommentBlocksEvent, ItemKey, RemoteItem, RemoteKey};
 pub(crate) use remote::{
-    HoveredLink, RemoteThreadContent, comment_markdown_style, open_web_link, thread_location,
-    untrusted_markdown,
+    HoveredLink, RemoteThreadContent, comment_markdown_style, github_markdown, open_web_link,
+    thread_location, untrusted_markdown,
 };
 
 use anyhow::{Context as _, Result};

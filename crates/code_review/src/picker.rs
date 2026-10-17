@@ -1650,7 +1650,7 @@ mod tests {
                 picker.delegate.entries().last(),
                 Some(&Entry::Status(
                     "GitHub rejected the GitHub CLI's token for github.com. Run \
-                     `gh auth login --hostname github.com`."
+                     \"gh auth login --hostname github.com\"."
                         .into()
                 ))
             );
@@ -1709,9 +1709,9 @@ mod tests {
                 entries.last(),
                 Some(&Entry::Status(
                     "GitHub isn't configured for github.attacker.dev. If it is a GitHub \
-                     Enterprise Server, add it to `git_hosting_providers` in your settings \
-                     (provider \"github\") or run `gh auth login --hostname \
-                     github.attacker.dev`."
+                     Enterprise Server, add it to \"git_hosting_providers\" in your settings \
+                     (provider \"github\") or run \"gh auth login --hostname \
+                     github.attacker.dev\"."
                         .into()
                 ))
             );

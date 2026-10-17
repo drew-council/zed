@@ -1,6 +1,7 @@
 use crate::{
     comments::{
-        CommentBlocks, HoveredLink, comment_markdown_style, open_web_link, untrusted_markdown,
+        CommentBlocks, HoveredLink, comment_markdown_style, github_markdown, open_web_link,
+        untrusted_markdown,
     },
     commits::CommitChain,
     diff::ReviewDiff,
@@ -130,12 +131,12 @@ impl ReviewTopBlock {
         let state = state.read(cx);
         let sources = std::iter::once((
             SharedString::from(DESCRIPTION_KEY),
-            state.details().body.clone(),
+            github_markdown(&state.details().body),
         ))
         .chain(
             state
                 .visible_summaries()
-                .map(|summary| (summary.id.clone(), summary.body.clone())),
+                .map(|summary| (summary.id.clone(), github_markdown(&summary.body))),
         )
         .collect::<Vec<_>>();
         let mut previous = std::mem::take(&mut self.markdown);
@@ -488,7 +489,7 @@ impl ReviewTopBlock {
                                 .id("review-pull-request-description-text")
                                 .w_full()
                                 .gap_1()
-                                .max_h(window.line_height() * 12.)
+                                .max_h(window.line_height() * 8.)
                                 .overflow_y_scroll()
                                 .track_scroll(&self.scroll_handle)
                                 .child(match description {
@@ -748,7 +749,7 @@ fn render_summary(
                         .weight(FontWeight::SEMIBOLD),
                 )
                 .when(summary.author.is_bot, |line| {
-                    line.child(badge("Bot", Color::Muted, cx))
+                    line.child(badge("BOT", Color::Muted, cx))
                 })
                 .child(
                     Label::new(match time {

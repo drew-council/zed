@@ -2934,7 +2934,7 @@ pub(crate) mod tests {
                     pull_request.load_errors(),
                     [
                         "GitHub rejected the GitHub CLI's token for github.com. Run \
-                         `gh auth login --hostname github.com`."
+                         \"gh auth login --hostname github.com\"."
                     ]
                 );
                 assert!(pull_request.commentable().is_some());

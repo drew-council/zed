@@ -107,6 +107,106 @@ pub(crate) fn comment_markdown_style(window: &Window, cx: &App) -> MarkdownStyle
     }
 }
 
+/// GitHub-authored Markdown as the review renders it: GitHub's collapsible sections
+/// (`<details>`, `<summary>`), which bots use a lot, would show as raw HTML (HTML isn't parsed,
+/// as it could load remote images), so their tags go and a summary becomes a bold line. Only
+/// lines that start with one of these tags change, and nothing inside fenced code blocks.
+pub(crate) fn github_markdown(source: &SharedString) -> SharedString {
+    let mut fence: Option<(char, usize)> = None;
+    let mut changed = false;
+    let mut lines = Vec::new();
+    for line in source.split('\n') {
+        let trimmed = line.trim_start();
+        let fence_marker = ['`', '~'].into_iter().find_map(|marker| {
+            let length = trimmed.chars().take_while(|c| *c == marker).count();
+            (length >= 3).then_some((marker, length))
+        });
+        match (fence, fence_marker) {
+            (None, Some(marker)) => fence = Some(marker),
+            (Some((open, open_length)), Some((marker, length)))
+                if marker == open
+                    && length >= open_length
+                    && trimmed[length..].trim().is_empty() =>
+            {
+                fence = None
+            }
+            _ => {}
+        }
+        if fence.is_none()
+            && fence_marker.is_none()
+            && let Some(replaced) = strip_collapsible_tags(trimmed)
+        {
+            changed = true;
+            lines.push(replaced);
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if changed {
+        lines.join("\n").into()
+    } else {
+        source.clone()
+    }
+}
+
+/// A line starting with `<details>`, `</details>`, `<summary>` or `</summary>` without these
+/// tags, a summary in bold; `None` for any other line.
+fn strip_collapsible_tags(line: &str) -> Option<String> {
+    fn tag_at<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+        let rest = text.get(..name.len() + 1)?;
+        if !rest.eq_ignore_ascii_case(&format!("<{name}")) {
+            return None;
+        }
+        let after = &text[name.len() + 1..];
+        if !after.starts_with(['>', ' ', '\t']) {
+            return None;
+        }
+        let end = after.find('>')?;
+        Some(&after[end + 1..])
+    }
+    let mut rest = line;
+    let mut output = String::new();
+    let mut found = false;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = tag_at(rest, "details").or_else(|| tag_at(rest, "/details")) {
+            rest = after;
+        } else if let Some(after) = tag_at(rest, "summary") {
+            let (summary, after) = match after.to_ascii_lowercase().find("</summary>") {
+                Some(end) => (&after[..end], &after[end + "</summary>".len()..]),
+                None => (after, ""),
+            };
+            let summary = summary.trim();
+            if !summary.is_empty() {
+                output.push_str(&format!("**{summary}**"));
+            }
+            rest = after;
+        } else if let Some(after) = tag_at(rest, "/summary") {
+            rest = after;
+        } else {
+            break;
+        }
+        found = true;
+    }
+    if !found {
+        return None;
+    }
+    let rest = rest.trim_end();
+    let rest = rest
+        .len()
+        .checked_sub("</details>".len())
+        .filter(|start| {
+            rest.get(*start..)
+                .is_some_and(|end| end.eq_ignore_ascii_case("</details>"))
+        })
+        .map_or(rest, |start| rest[..start].trim_end());
+    if !output.is_empty() && !rest.is_empty() {
+        output.push(' ');
+    }
+    output.push_str(rest);
+    Some(output)
+}
+
 /// Markdown someone else wrote: its links show where they go while hovered (in the view's
 /// [`HoveredLink`], under `key`) and only open web pages.
 pub(crate) fn untrusted_markdown<V: 'static>(
@@ -174,29 +274,31 @@ impl RemoteThreadView {
         this
     }
 
-    /// Keeps the rendered markdown of threads that didn't change.
+    /// Keeps the rendered markdown of threads that didn't change. Returns whether any thread
+    /// changed, came or went.
     pub(crate) fn set_threads(
         &mut self,
         title: Option<SharedString>,
         threads: Vec<RemoteThreadContent>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let mut previous = std::mem::take(&mut self.threads);
+        let mut changed = false;
         self.threads = threads
             .into_iter()
             .map(|content| {
                 if let Some(index) = previous.iter().position(|entry| entry.content == content) {
                     return previous.swap_remove(index);
                 }
+                changed = true;
                 let bodies = content
                     .thread
                     .comments
                     .iter()
                     .map(|comment| {
                         let language_registry = self.language_registry.clone();
-                        cx.new(|cx| {
-                            Markdown::new(comment.body.clone(), Some(language_registry), None, cx)
-                        })
+                        let source = github_markdown(&comment.body);
+                        cx.new(|cx| Markdown::new(source, Some(language_registry), None, cx))
                     })
                     .collect();
                 ThreadEntry { content, bodies }
@@ -204,6 +306,7 @@ impl RemoteThreadView {
             .collect();
         self.title = title;
         cx.notify();
+        changed || !previous.is_empty()
     }
 
     pub(crate) fn threads(&self) -> impl Iterator<Item = &Arc<RemoteThread>> {
@@ -534,5 +637,37 @@ mod tests {
         assert_eq!(hovered.0, Some((description.clone(), "https://x".into())));
         assert!(hovered.set(&description, None));
         assert_eq!(hovered.0, None);
+    }
+
+    #[test]
+    fn test_github_markdown_drops_collapsible_tags() {
+        let markdown = |source: &str| github_markdown(&source.into()).to_string();
+        assert_eq!(
+            markdown(
+                "Summary\n\n<details>\n<summary>Notes</summary>\n\nHidden text\n</details>\nAfter"
+            ),
+            "Summary\n\n\n**Notes**\n\nHidden text\n\nAfter"
+        );
+        assert_eq!(
+            markdown("<details open><summary> Two words </summary>\nText</details>"),
+            "**Two words**\nText</details>"
+        );
+        assert_eq!(markdown("<DETAILS><Summary>Caps</SUMMARY>"), "**Caps**");
+        assert_eq!(markdown("<details><summary>A</summary>tail"), "**A** tail");
+        assert_eq!(
+            markdown("  <summary>\n  Multi\n  </summary>"),
+            "\n  Multi\n"
+        );
+        // Not at the start of a line, other tags, and fenced code stay as they are.
+        for source in [
+            "Use `<details>` for this",
+            "<detailsx>",
+            "<div>x</div>",
+            "```html\n<details>\n<summary>Code</summary>\n```\n",
+            "~~~~\n```\n<details>\n~~~~",
+        ] {
+            assert_eq!(markdown(source), source);
+        }
+        assert_eq!(markdown("```\ncode\n```\n<details>"), "```\ncode\n```\n");
     }
 }

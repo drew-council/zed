@@ -164,8 +164,8 @@ impl GitHubError {
             GitHubError::Unsupported => "This repository has no GitHub remote.".into(),
             GitHubError::HostNotConfigured { host } => format!(
                 "GitHub isn't configured for {host}. If it is a GitHub Enterprise Server, add it \
-                 to `git_hosting_providers` in your settings (provider \"github\") or run \
-                 `gh auth login --hostname {host}`."
+                 to \"git_hosting_providers\" in your settings (provider \"github\") or run \
+                 \"gh auth login --hostname {host}\"."
             )
             .into(),
             GitHubError::OtherRepository { repo } => {
@@ -179,15 +179,15 @@ impl GitHubError {
                     ),
                     AuthFailure::Rejected(TokenOrigin::GitHubCli) => format!(
                         "GitHub rejected the GitHub CLI's token for {host}. Run \
-                         `gh auth login --hostname {host}`."
+                         \"gh auth login --hostname {host}\"."
                     ),
                     AuthFailure::NoToken => format!(
                         "No GitHub token for {host}. Set {variable} or run \
-                         `gh auth login --hostname {host}`."
+                         \"gh auth login --hostname {host}\"."
                     ),
                     AuthFailure::NoTokenNoCli => format!(
                         "No GitHub token for {host}. Set {variable}, or install the GitHub CLI \
-                         and run `gh auth login --hostname {host}`."
+                         and run \"gh auth login --hostname {host}\"."
                     ),
                 }
                 .into()
@@ -207,7 +207,7 @@ impl GitHubError {
             }
             GitHubError::NotFound { what } => format!(
                 "{what} not found on GitHub, or your token can't see it (private repositories \
-                 need the `repo` scope)."
+                 need the \"repo\" scope)."
             )
             .into(),
             GitHubError::Validation {
@@ -3464,17 +3464,17 @@ mod tests {
         assert_eq!(
             hint(&github, AuthFailure::NoToken),
             "No GitHub token for github.com. Set GITHUB_TOKEN or run \
-             `gh auth login --hostname github.com`."
+             \"gh auth login --hostname github.com\"."
         );
         assert_eq!(
             hint(&github, AuthFailure::NoTokenNoCli),
             "No GitHub token for github.com. Set GITHUB_TOKEN, or install the GitHub CLI and \
-             run `gh auth login --hostname github.com`."
+             run \"gh auth login --hostname github.com\"."
         );
         assert_eq!(
             hint(&enterprise, AuthFailure::NoToken),
             "No GitHub token for ghe.corp. Set GH_ENTERPRISE_TOKEN or run \
-             `gh auth login --hostname ghe.corp`."
+             \"gh auth login --hostname ghe.corp\"."
         );
         assert_eq!(
             hint(
@@ -3487,13 +3487,13 @@ mod tests {
         assert_eq!(
             hint(&github, AuthFailure::Rejected(TokenOrigin::GitHubCli)),
             "GitHub rejected the GitHub CLI's token for github.com. Run \
-             `gh auth login --hostname github.com`."
+             \"gh auth login --hostname github.com\"."
         );
         assert_eq!(
             GitHubError::HostNotConfigured { host: lookalike }.hint(),
             "GitHub isn't configured for github.attacker.dev. If it is a GitHub Enterprise \
-             Server, add it to `git_hosting_providers` in your settings (provider \"github\") \
-             or run `gh auth login --hostname github.attacker.dev`."
+             Server, add it to \"git_hosting_providers\" in your settings (provider \"github\") \
+             or run \"gh auth login --hostname github.attacker.dev\"."
         );
     }
 
@@ -4257,7 +4257,7 @@ mod tests {
         assert_eq!(
             error.hint(),
             "GitHub rejected the GitHub CLI's token for github.com. Run \
-             `gh auth login --hostname github.com`."
+             \"gh auth login --hostname github.com\"."
         );
         assert!(client.token.is_revoked());
 
@@ -4335,7 +4335,7 @@ mod tests {
         assert_eq!(
             error.hint(),
             "drew-council/code-review-sandbox#4 not found on GitHub, or your token can't see it \
-             (private repositories need the `repo` scope)."
+             (private repositories need the \"repo\" scope)."
         );
 
         let error = error_for(Reply::status(502, "<html>Bad gateway</html>"));
@@ -5439,7 +5439,7 @@ mod tests {
         assert_eq!(
             error_message(&error),
             "GitHub rejected the GitHub CLI's token for github.com. Run \
-             `gh auth login --hostname github.com`."
+             \"gh auth login --hostname github.com\"."
         );
 
         // After `gh auth login`, resolving again looks the token up again.

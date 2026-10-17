@@ -458,8 +458,8 @@ async fn is_ancestor(context: &GitContext, ancestor: &str, descendant: &str) -> 
 fn diverged_hint(branch: &str) -> String {
     format!(
         "{branch} has diverged from the pull request: the pull request was force-pushed, or \
-         {branch} has commits of its own. Rename the branch (`git branch -m {branch} \
-         {branch}-old`), then open the pull request again."
+         {branch} has commits of its own. Rename the branch (\"git branch -m {branch} \
+         {branch}-old\"), then open the pull request again."
     )
 }
 
