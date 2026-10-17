@@ -60,6 +60,11 @@ pub(crate) struct ReviewSession {
     /// Comments whose lines moved (or whose text changed) since they were last saved. They are
     /// saved with the comment's next change, and when the review's tabs close or Zed quits.
     moved_comments: HashSet<CommentId>,
+    /// Line comments loaded from the database whose lines haven't been compared with their file
+    /// yet: the first tab that shows the file does, once per run, and flags them outdated when
+    /// the text changed. Other tabs (maybe another project's buffers with other unsaved edits)
+    /// take the result as is.
+    unchecked: HashSet<CommentId>,
     _load_task: Task<()>,
 }
 
@@ -133,6 +138,7 @@ impl ReviewSession {
             content_hashes: HashMap::default(),
             comments: CommentStore::default(),
             moved_comments: HashSet::default(),
+            unchecked: HashSet::default(),
             _load_task: load_task,
         }
     }
@@ -158,11 +164,21 @@ impl ReviewSession {
             }
         }
         let max_stored_id = stored.comments.iter().map(|(id, _)| *id).max();
-        let comments = stored.comments.into_iter().filter_map(|(id, json)| {
-            Comment::from_json(CommentId(id), &json)
-                .with_context(|| format!("skipping stored comment {id}"))
-                .log_err()
-        });
+        let comments = stored
+            .comments
+            .into_iter()
+            .filter_map(|(id, json)| {
+                Comment::from_json(CommentId(id), &json)
+                    .with_context(|| format!("skipping stored comment {id}"))
+                    .log_err()
+            })
+            .collect::<Vec<_>>();
+        self.unchecked.extend(
+            comments
+                .iter()
+                .filter(|comment| matches!(comment.target, CommentTarget::Lines { .. }))
+                .map(|comment| comment.id),
+        );
         self.comments.restore(comments, max_stored_id);
         self.loaded = true;
         cx.emit(ReviewSessionEvent::Loaded);
@@ -369,6 +385,7 @@ impl ReviewSession {
     pub(crate) fn delete_comment(&mut self, id: CommentId, cx: &mut Context<Self>) {
         if self.comments.remove(id).is_some() {
             self.moved_comments.remove(&id);
+            self.unchecked.remove(&id);
             persist(
                 self.db.delete_comment(self.key.0.to_string(), id.0),
                 "Couldn't delete the comment",
@@ -379,67 +396,62 @@ impl ReviewSession {
         }
     }
 
-    /// Records where a line comment's anchor is now: its lines, and their text unless the
-    /// comment is outdated (whose text is what the comment was about). Saved later.
-    pub(crate) fn set_comment_position(
+    /// Records where line comments' lines are now, and their text unless the comment is
+    /// outdated (its text is what the comment was about). Saved later.
+    pub(crate) fn set_comment_positions(
         &mut self,
-        id: CommentId,
-        lines: RangeInclusive<u32>,
-        line_text: String,
+        positions: Vec<(CommentId, RangeInclusive<u32>, String)>,
         cx: &mut Context<Self>,
     ) {
-        let Some(comment) = self.comments.get_mut(id) else {
-            return;
-        };
-        let CommentTarget::Lines {
-            lines: comment_lines,
-            ..
-        } = &mut comment.target
-        else {
-            return;
-        };
-        let mut changed = false;
-        if *comment_lines != lines {
-            *comment_lines = lines;
-            changed = true;
+        let mut moved = Vec::new();
+        for (id, lines, line_text) in positions {
+            let Some(comment) = self.comments.get_mut(id) else {
+                continue;
+            };
+            let is_outdated = comment.is_outdated();
+            let CommentTarget::Lines {
+                lines: comment_lines,
+                ..
+            } = &mut comment.target
+            else {
+                continue;
+            };
+            let mut changed = false;
+            if *comment_lines != lines {
+                *comment_lines = lines;
+                changed = true;
+            }
+            if !is_outdated && comment.line_text.as_deref() != Some(line_text.as_str()) {
+                comment.line_text = Some(line_text);
+                changed = true;
+            }
+            if changed {
+                self.moved_comments.insert(id);
+                moved.push(id);
+            }
         }
-        if !comment.is_outdated() && comment.line_text.as_deref() != Some(line_text.as_str()) {
-            comment.line_text = Some(line_text);
-            changed = true;
-        }
-        if changed {
-            self.moved_comments.insert(id);
-            cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
+        if !moved.is_empty() {
+            cx.emit(ReviewSessionEvent::Comment(CommentEvent::Moved(moved)));
             cx.notify();
         }
     }
 
-    /// Gives a comment loaded from the database its anchor in its file, flagging it outdated
-    /// when its lines' text changed while the review was closed.
-    pub(crate) fn resolve_comment(
-        &mut self,
-        id: CommentId,
-        anchor: Range<Anchor>,
-        outdated: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn needs_check(&self, id: CommentId) -> bool {
+        self.unchecked.contains(&id)
+    }
+
+    /// Records whether a line comment's lines still have the text it was about. A comment whose
+    /// text changed is outdated (stored, and sticky until it is deleted).
+    pub(crate) fn check_comment(&mut self, id: CommentId, outdated: bool, cx: &mut Context<Self>) {
+        self.unchecked.remove(&id);
         let Some(comment) = self.comments.get_mut(id) else {
             return;
         };
-        comment.anchor = Some(anchor);
         if outdated && comment.state == CommentState::Draft {
             comment.state = CommentState::Outdated;
             self.save_comment(id, cx);
-        }
-        cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
-        cx.notify();
-    }
-
-    /// Forgets a comment's anchor, whose buffer was replaced (the file's diff base was reloaded
-    /// as another buffer, or its snapshot rebuilt); it is resolved again by its lines.
-    pub(crate) fn unresolve_comment(&mut self, id: CommentId) {
-        if let Some(comment) = self.comments.get_mut(id) {
-            comment.anchor = None;
+            cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
+            cx.notify();
         }
     }
 
@@ -792,7 +804,6 @@ mod tests {
                             lines: 3..=4,
                         },
                         line_text: Some("line 3\nline 4".into()),
-                        anchor: None,
                     },
                     cx,
                 )
@@ -812,7 +823,6 @@ mod tests {
             let new_comment = NewComment {
                 target: CommentTarget::Review,
                 line_text: None,
-                anchor: None,
             };
             assert!(session.add_comment(new_comment, cx).is_none());
         });
@@ -829,12 +839,11 @@ mod tests {
                 NewComment {
                     target: CommentTarget::Review,
                     line_text: None,
-                    anchor: None,
                 },
                 cx,
             );
             // Positions are stored on the next change, or when flushed.
-            session.set_comment_position(second, 10..=11, "line 10\nline 11".into(), cx);
+            session.set_comment_positions(vec![(second, 10..=11, "line 10\nline 11".into())], cx);
             session.flush(cx);
         });
         drop(session);
@@ -863,7 +872,8 @@ mod tests {
                 }
             );
             assert_eq!(second.line_text.as_deref(), Some("line 10\nline 11"));
-            assert!(second.anchor.is_none());
+            // Their lines are compared with their files once those are shown.
+            assert!(session.needs_check(second.id));
         });
         // Ids continue after the stored ones.
         let next = add_line_comment(&session, "next", cx);
@@ -871,10 +881,9 @@ mod tests {
 
         // An outdated comment stays outdated, and keeps the text it was about.
         session.update(cx, |session, cx| {
-            let anchor =
-                language::Anchor::min_max_range_for_buffer(language::BufferId::new(1).unwrap());
-            session.resolve_comment(first, anchor, true, cx);
-            session.set_comment_position(first, 1..=1, "changed".into(), cx);
+            session.check_comment(first, true, cx);
+            assert!(!session.needs_check(first));
+            session.set_comment_positions(vec![(first, 1..=1, "changed".into())], cx);
             session.flush(cx);
         });
         drop(session);

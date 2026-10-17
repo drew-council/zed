@@ -119,7 +119,6 @@ mod tests {
             body: body.into(),
             line_text: None,
             state: CommentState::Draft,
-            anchor: None,
         }
     }
 

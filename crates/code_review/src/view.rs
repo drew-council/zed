@@ -382,8 +382,8 @@ pub struct ReviewView {
     /// Shared by every tab reviewing the same thing; replaced when the review key changes.
     session: Entity<ReviewSession>,
     /// The sessions of the keys this tab reviewed before (another base, another branch), kept
-    /// while the tab is open so that switching back finds their comments as they were, anchors
-    /// and all.
+    /// while the tab is open so that switching back finds their comments as they were (their
+    /// anchors are parked in [`CommentBlocks`]).
     previous_sessions: HashMap<ReviewKey, Entity<ReviewSession>>,
     comments: Entity<CommentBlocks>,
     filters: ReviewFilters,

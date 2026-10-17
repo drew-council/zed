@@ -23,7 +23,10 @@ use language::{
 use multi_buffer::{
     MultiBuffer, MultiBufferRow, MultiBufferSnapshot, PathKey, RowInfo, ToPoint as _,
 };
-use std::{ops::RangeInclusive, sync::Arc};
+use std::{
+    ops::{Range, RangeInclusive},
+    sync::Arc,
+};
 use ui::prelude::*;
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -44,6 +47,10 @@ pub(crate) struct CommentBlocks {
     views: HashMap<CommentId, Entity<CommentView>>,
     /// The blocks showing line and file comments in the diff.
     hosted: HashMap<CommentId, HostedBlock>,
+    anchors: TabAnchors,
+    /// The anchors of the sessions this tab showed before (another base or branch), by session,
+    /// for when it switches back: they followed the edits made meanwhile.
+    parked_anchors: HashMap<EntityId, TabAnchors>,
     /// The left side of a split diff is recreated on every split (also when the pane gets wide
     /// enough) and dropped on unsplit; its blocks go with it.
     lhs_editor_id: Option<EntityId>,
@@ -62,6 +69,27 @@ pub(crate) struct CommentBlocks {
 enum Host {
     Rhs,
     Lhs,
+}
+
+/// Where this tab's line comments are. Anchors are per tab rather than per comment: a review of
+/// the same thing in another project (another window) has other buffers.
+#[derive(Default)]
+struct TabAnchors {
+    lines: HashMap<CommentId, LineAnchor>,
+    /// Comments whose lines were deleted, or whose buffer was replaced. They are anchored on
+    /// their line numbers again, and flagged outdated unless those lines still have their text.
+    lost: HashSet<CommentId>,
+}
+
+/// A line comment's lines in this tab's buffer of their side: the file's buffer, or its diff
+/// base for old lines.
+struct LineAnchor {
+    range: Range<language::Anchor>,
+    /// The lines (1-based) and their text as this tab last saw them. A tab only reports its own
+    /// moves: tabs whose buffers differ (unsaved edits in another window) would otherwise undo
+    /// each other's.
+    lines: RangeInclusive<u32>,
+    text: String,
 }
 
 struct HostedBlock {
@@ -140,10 +168,9 @@ impl CommentBlocks {
                 |this, _, event: &EditorEvent, window, cx| match event {
                     EditorEvent::BufferRangesUpdated { .. }
                     | EditorEvent::BuffersRemoved { .. }
-                    | EditorEvent::BufferFoldToggled { .. } => this.reconcile(window, cx),
-                    EditorEvent::BufferEdited | EditorEvent::BuffersEdited { .. } => {
-                        this.sync_positions(cx)
-                    }
+                    | EditorEvent::BufferFoldToggled { .. }
+                    | EditorEvent::BufferEdited
+                    | EditorEvent::BuffersEdited { .. } => this.reconcile(window, cx),
                     EditorEvent::SelectionsChanged { .. } => this.update_targeted(cx),
                     _ => {}
                 },
@@ -177,6 +204,8 @@ impl CommentBlocks {
             language_registry,
             views: HashMap::default(),
             hosted: HashMap::default(),
+            anchors: TabAnchors::default(),
+            parked_anchors: HashMap::default(),
             lhs_editor_id,
             selected: None,
             targeted: None,
@@ -207,7 +236,15 @@ impl CommentBlocks {
         self.views.clear();
         self.selected = None;
         self.targeted = None;
-        self.session = session;
+        let anchors = self
+            .parked_anchors
+            .remove(&session.entity_id())
+            .unwrap_or_default();
+        let previous = std::mem::replace(&mut self.session, session);
+        self.parked_anchors.insert(
+            previous.entity_id(),
+            std::mem::replace(&mut self.anchors, anchors),
+        );
         self._session_subscription =
             cx.subscribe_in(&self.session, window, Self::handle_session_event);
         self.create_views(cx);
@@ -236,16 +273,17 @@ impl CommentBlocks {
                 self.reconcile(window, cx);
             }
             ReviewSessionEvent::Comment(CommentEvent::Changed(id)) => {
-                let comment = self.session.read(cx).comments().get(*id).cloned();
-                if let (Some(view), Some(comment)) = (self.views.get(id), comment) {
-                    view.update(cx, |view, cx| view.update_comment(&comment, cx));
-                }
-                // Another tab's new comment shows once it has text; a stored one once its file
-                // is loaded.
+                self.update_views(&[*id], cx);
+                // Another tab's new comment shows once it has text.
                 self.reconcile(window, cx);
             }
+            // Where a comment is in this tab is up to this tab's anchors, which follow its
+            // buffers' edits.
+            ReviewSessionEvent::Comment(CommentEvent::Moved(ids)) => self.update_views(ids, cx),
             ReviewSessionEvent::Comment(CommentEvent::Removed(id)) => {
                 self.remove_view(*id, window, cx);
+                self.anchors.lines.remove(id);
+                self.anchors.lost.remove(id);
                 self.reconcile(window, cx);
             }
             ReviewSessionEvent::FilesChanged(_)
@@ -265,6 +303,15 @@ impl CommentBlocks {
             .collect::<Vec<_>>();
         for id in ids {
             self.ensure_view(id, cx);
+        }
+    }
+
+    fn update_views(&self, ids: &[CommentId], cx: &mut Context<Self>) {
+        for id in ids {
+            let comment = self.session.read(cx).comments().get(*id).cloned();
+            if let (Some(view), Some(comment)) = (self.views.get(id), comment) {
+                view.update(cx, |view, cx| view.update_comment(&comment, cx));
+            }
         }
     }
 
@@ -385,10 +432,9 @@ impl CommentBlocks {
 
     /// Brings the comment blocks in line with the comments and with what the diff shows: a
     /// comment whose lines aren't in an excerpt (hidden or folded file, lines without changes
-    /// nearby) has no block. Comments loaded from the database get their anchors first.
+    /// nearby) has no block. The anchors are brought up to date first.
     fn reconcile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.resolve_anchors(cx);
-        self.sync_positions(cx);
+        self.update_anchors(cx);
 
         let rhs = self.rhs_editor(cx);
         let lhs = self.lhs_editor(cx);
@@ -401,7 +447,12 @@ impl CommentBlocks {
                 .iter()
                 .filter(|comment| self.is_listed(comment, cx))
                 .filter_map(|comment| {
-                    let (host, placement) = placement(comment, &hosts, diff, cx)?;
+                    let anchor = self
+                        .anchors
+                        .lines
+                        .get(&comment.id)
+                        .map(|anchor| &anchor.range);
+                    let (host, placement) = placement(comment, anchor, &hosts, diff, cx)?;
                     Some((comment.id, (host, placement)))
                 })
                 .collect::<HashMap<_, _>>()
@@ -489,84 +540,99 @@ impl CommentBlocks {
         self.update_targeted(cx);
     }
 
-    /// Gives the line comments loaded from the database anchors in their file's buffers, once
-    /// those are loaded, flagging the ones whose lines changed meanwhile as outdated. A comment
-    /// whose buffer was replaced (a diff base reloaded as another buffer) is resolved again.
-    fn resolve_anchors(&mut self, cx: &mut Context<Self>) {
-        let mut resolved = Vec::new();
-        let mut unresolved = Vec::new();
+    /// Anchors the line comments whose file is shown and that have no anchor in this tab yet
+    /// (the lines of comments loaded from the database are compared with the file then),
+    /// notices lines that were deleted, and records where the comments' lines are now.
+    fn update_anchors(&mut self, cx: &mut Context<Self>) {
+        let mut checked = Vec::new();
+        let mut moves = Vec::new();
         {
             let diff = self.diff.read(cx);
-            for comment in self.session.read(cx).comments().iter() {
+            let session = self.session.read(cx);
+            let comments = session.comments();
+            let anchors = &mut self.anchors;
+            anchors.lines.retain(|id, _| comments.get(*id).is_some());
+            anchors.lost.retain(|id| comments.get(*id).is_some());
+            let mut snapshots = HashMap::<EntityId, BufferSnapshot>::default();
+            for comment in comments.iter() {
+                let id = comment.id;
                 let CommentTarget::Lines { path, side, lines } = &comment.target else {
                     continue;
                 };
                 let Some(buffer) = side_buffer(diff, path, *side, cx) else {
                     continue;
                 };
-                let buffer = buffer.read(cx).snapshot();
-                if let Some(anchor) = &comment.anchor {
-                    if anchor.start.buffer_id == buffer.remote_id() {
-                        continue;
+                let buffer = snapshots
+                    .entry(buffer.entity_id())
+                    .or_insert_with(|| buffer.read(cx).snapshot());
+
+                if let Some(anchor) = anchors.lines.get(&id) {
+                    let start = &anchor.range.start;
+                    let end = &anchor.range.end;
+                    // The buffer was replaced: the file left the review and came back, or its
+                    // diff base or snapshot was rebuilt.
+                    let replaced = !buffer.can_resolve(start) || !buffer.can_resolve(end);
+                    // Deleting the lines collapses both ends onto the deletion; text inserted
+                    // there later (a stash popped) goes between them, the wrong way around.
+                    // An empty line has nothing to delete.
+                    let deleted = !replaced
+                        && !anchor.text.is_empty()
+                        && start.to_offset(buffer) >= end.to_offset(buffer);
+                    if replaced || deleted {
+                        anchors.lines.remove(&id);
+                        anchors.lost.insert(id);
                     }
-                    unresolved.push(comment.id);
                 }
-                let max_row = buffer.max_point().row;
-                let start_row = (lines.start() - 1).min(max_row);
-                let end_row = (lines.end() - 1).min(max_row).max(start_row);
-                let in_range = *lines.end() - 1 <= max_row;
-                let (anchor, text) = line_anchor_and_text(&buffer, start_row..=end_row);
-                let outdated = !in_range
-                    || comment
-                        .line_text
-                        .as_ref()
-                        .is_some_and(|line_text| *line_text != text);
-                resolved.push((comment.id, anchor, outdated));
+
+                if !anchors.lines.contains_key(&id) {
+                    let max_row = buffer.max_point().row;
+                    let last_row = lines.end().saturating_sub(1);
+                    let start_row = lines.start().saturating_sub(1).min(max_row);
+                    let end_row = last_row.min(max_row).max(start_row);
+                    let (range, text) = line_anchor_and_text(buffer, start_row..=end_row);
+                    if session.needs_check(id) || anchors.lost.remove(&id) {
+                        let outdated = last_row > max_row
+                            || comment
+                                .line_text
+                                .as_ref()
+                                .is_some_and(|line_text| *line_text != text);
+                        checked.push((id, outdated));
+                    }
+                    // As stored, so that a position that had to be clamped is recorded below.
+                    anchors.lines.insert(
+                        id,
+                        LineAnchor {
+                            range,
+                            lines: lines.clone(),
+                            text: comment.line_text.clone().unwrap_or_default(),
+                        },
+                    );
+                }
+
+                let Some(anchor) = anchors.lines.get_mut(&id) else {
+                    continue;
+                };
+                // Typing on an empty commented line moves the range's start past its end; the
+                // block stays below the end.
+                let end_row = anchor.range.end.to_point(buffer).row;
+                let start_row = anchor.range.start.to_point(buffer).row.min(end_row);
+                let (_, text) = line_anchor_and_text(buffer, start_row..=end_row);
+                let lines = start_row + 1..=end_row + 1;
+                if anchor.lines != lines || anchor.text != text {
+                    anchor.lines = lines.clone();
+                    anchor.text = text.clone();
+                    moves.push((id, lines, text));
+                }
             }
         }
-        if resolved.is_empty() {
+        if checked.is_empty() && moves.is_empty() {
             return;
         }
         self.session.update(cx, |session, cx| {
-            for id in unresolved {
-                session.unresolve_comment(id);
+            for (id, outdated) in checked {
+                session.check_comment(id, outdated, cx);
             }
-            for (id, anchor, outdated) in resolved {
-                session.resolve_comment(id, anchor, outdated, cx);
-            }
-        });
-    }
-
-    /// Updates the line numbers (and text) of line comments to where their anchors are now.
-    fn sync_positions(&mut self, cx: &mut Context<Self>) {
-        let positions = {
-            let diff = self.diff.read(cx);
-            self.session
-                .read(cx)
-                .comments()
-                .iter()
-                .filter_map(|comment| {
-                    let CommentTarget::Lines { path, side, .. } = &comment.target else {
-                        return None;
-                    };
-                    let anchor = comment.anchor.as_ref()?;
-                    let buffer = side_buffer(diff, path, *side, cx)?.read(cx).snapshot();
-                    if anchor.start.buffer_id != buffer.remote_id() {
-                        return None;
-                    }
-                    // Typing on an empty commented line moves the range's start past its end; the
-                    // block stays below the end.
-                    let end_row = anchor.end.to_point(&buffer).row;
-                    let start_row = anchor.start.to_point(&buffer).row.min(end_row);
-                    let (_, text) = line_anchor_and_text(&buffer, start_row..=end_row);
-                    Some((comment.id, start_row + 1..=end_row + 1, text))
-                })
-                .collect::<Vec<_>>()
-        };
-        self.session.update(cx, |session, cx| {
-            for (id, lines, text) in positions {
-                session.set_comment_position(id, lines, text, cx);
-            }
+            session.set_comment_positions(moves, cx);
         });
     }
 
@@ -598,17 +664,18 @@ impl CommentBlocks {
                     return;
                 };
                 let snapshot = buffer.read(cx).snapshot();
-                let (anchor, text) = line_anchor_and_text(&snapshot, rows.clone());
+                let (range, text) = line_anchor_and_text(&snapshot, rows.clone());
+                let lines = rows.start() + 1..=rows.end() + 1;
                 let new_comment = NewComment {
                     target: CommentTarget::Lines {
                         path,
                         side,
-                        lines: rows.start() + 1..=rows.end() + 1,
+                        lines: lines.clone(),
                     },
-                    line_text: Some(text),
-                    anchor: Some(anchor),
+                    line_text: Some(text.clone()),
                 };
-                self.add_comment(new_comment, editor, window, cx);
+                let anchor = LineAnchor { range, lines, text };
+                self.add_comment(new_comment, Some(anchor), editor, window, cx);
             }
         }
     }
@@ -708,9 +775,8 @@ impl CommentBlocks {
         let new_comment = NewComment {
             target: CommentTarget::File { path },
             line_text: None,
-            anchor: None,
         };
-        self.add_comment(new_comment, return_to, window, cx);
+        self.add_comment(new_comment, None, return_to, window, cx);
     }
 
     /// `;c`: adds a comment on the whole review, at the top of the tab.
@@ -720,15 +786,15 @@ impl CommentBlocks {
         let new_comment = NewComment {
             target: CommentTarget::Review,
             line_text: None,
-            anchor: None,
         };
-        self.add_comment(new_comment, editor, window, cx);
+        self.add_comment(new_comment, None, editor, window, cx);
     }
 
     /// Every comment is made here.
     fn add_comment(
         &mut self,
         new_comment: NewComment,
+        anchor: Option<LineAnchor>,
         return_to: Entity<Editor>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -740,6 +806,9 @@ impl CommentBlocks {
             self.show_toast("The review's comments haven't loaded yet", cx);
             return;
         };
+        if let Some(anchor) = anchor {
+            self.anchors.lines.insert(id, anchor);
+        }
         // The session's event comes later; the editor opens now.
         self.ensure_view(id, cx);
         self.begin_edit(id, true, Some(return_to), window, cx);
@@ -1178,10 +1247,10 @@ impl CommentBlocks {
                 let (row, side) = match &comment.target {
                     CommentTarget::File { .. } => (-1, Side::Old),
                     CommentTarget::Lines { side, .. } => {
-                        let anchor = comment.anchor.as_ref()?;
+                        let anchor = &self.anchors.lines.get(&comment.id)?.range;
                         // Files hidden by single-file mode have no excerpts to check.
                         if diff.is_shown(&path_key) {
-                            line_row_anchor(comment, &hosts, diff, cx)?;
+                            line_row_anchor(comment, anchor, &hosts, diff, cx)?;
                         }
                         let (buffer, file_diff) = diff.file_diff(&path_key)?;
                         let buffer = buffer.read(cx).snapshot();
@@ -1189,14 +1258,14 @@ impl CommentBlocks {
                         // review and came back) can't be resolved.
                         let row = match side {
                             Side::New => {
-                                if anchor.end.buffer_id != buffer.remote_id() {
+                                if !buffer.can_resolve(&anchor.end) {
                                     return None;
                                 }
                                 anchor.end.to_point(&buffer).row
                             }
                             Side::Old => {
                                 let file_diff = file_diff.read(cx).snapshot(cx);
-                                if anchor.end.buffer_id != file_diff.base_text().remote_id() {
+                                if !file_diff.base_text().can_resolve(&anchor.end) {
                                     return None;
                                 }
                                 let point = anchor.end.to_point(file_diff.base_text());
@@ -1526,6 +1595,7 @@ fn save_text(
 /// everything else on the right side.
 fn placement(
     comment: &Comment,
+    anchor: Option<&Range<language::Anchor>>,
     hosts: &Hosts,
     diff: &ReviewDiff,
     cx: &App,
@@ -1533,7 +1603,7 @@ fn placement(
     match &comment.target {
         CommentTarget::Review => None,
         CommentTarget::Lines { .. } => {
-            let (host, row) = line_row_anchor(comment, hosts, diff, cx)?;
+            let (host, row) = line_row_anchor(comment, anchor?, hosts, diff, cx)?;
             Some((
                 host,
                 Placement {
@@ -1565,10 +1635,11 @@ fn placement(
     }
 }
 
-/// The side showing a line comment's last line and that row's anchor there, while the row is
-/// shown (in an excerpt, in a file that isn't folded).
+/// The side showing a line comment's last line (`anchor` is where its lines are) and that row's
+/// anchor there, while the row is shown (in an excerpt, in a file that isn't folded).
 fn line_row_anchor(
     comment: &Comment,
+    anchor: &Range<language::Anchor>,
     hosts: &Hosts,
     diff: &ReviewDiff,
     cx: &App,
@@ -1576,7 +1647,6 @@ fn line_row_anchor(
     let CommentTarget::Lines { path, side, .. } = &comment.target else {
         return None;
     };
-    let anchor = comment.anchor.as_ref()?;
     let buffer_id = diff.buffer_id_for(&review_path_key(path), cx)?;
     // Folding the right side folds the left side too.
     if hosts.rhs.is_buffer_folded(buffer_id, cx) {
@@ -1605,7 +1675,7 @@ fn old_row_in_unified_diff(
     let buffer = snapshot.buffer_for_id(buffer_id)?;
     let file_diff = snapshot.diff_for_buffer_id(buffer_id)?;
     let base_text = file_diff.base_text();
-    if base_anchor.buffer_id != base_text.remote_id() {
+    if !base_text.can_resolve(&base_anchor) {
         return None;
     }
     let row_start = Point::new(base_anchor.to_point(base_text).row, 0);
@@ -2792,6 +2862,219 @@ mod tests {
                 .clone()
         });
         assert_eq!(line_text.as_deref(), Some("LINE 3\nline 4"));
+    }
+
+    /// The comment's lines, and whether it is outdated.
+    fn line_state(
+        review: &Entity<ReviewView>,
+        id: CommentId,
+        cx: &VisualTestContext,
+    ) -> (CommentTarget, bool) {
+        review.read_with(cx, |review, cx| {
+            let comment = review.session().read(cx).comments().get(id).unwrap();
+            (comment.target.clone(), comment.is_outdated())
+        })
+    }
+
+    fn display_buffer(
+        review: &Entity<ReviewView>,
+        path: &str,
+        cx: &VisualTestContext,
+    ) -> Entity<Buffer> {
+        review.read_with(cx, |review, cx| {
+            review
+                .diff()
+                .read(cx)
+                .display_buffer(&review_path_key(&RepoPath::new(path).unwrap()))
+                .unwrap()
+                .clone()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_deleted_lines_make_comments_outdated(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("v j c");
+        cx.simulate_input("range");
+        cx.simulate_keystrokes("ctrl-enter");
+        let id = comment_ids(&review, cx)[0];
+        let buffer = display_buffer(&review, "a.rs", cx);
+        let commented = "line 3\nline 4\n";
+        let offset_of = |buffer: &Buffer| buffer.text().find(commented).unwrap();
+
+        // The lines are deleted and put back before the review notices (a stash and a pop): the
+        // comment stays on both lines.
+        buffer.update(cx, |buffer, cx| {
+            let offset = offset_of(buffer);
+            buffer.edit([(offset..offset + commented.len(), "")], None, cx);
+            buffer.edit([(offset..offset, commented)], None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, id, cx), (lines("a.rs", 3..=4), false));
+        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "new\n")], None, cx));
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, id, cx), (lines("a.rs", 4..=5), false));
+
+        // Deleting them makes the comment outdated, on the lines with its numbers, rather than
+        // moving it onto the next line.
+        buffer.update(cx, |buffer, cx| {
+            let offset = offset_of(buffer);
+            buffer.edit([(offset..offset + commented.len(), "")], None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, id, cx), (lines("a.rs", 4..=5), true));
+        review.read_with(cx, |review, cx| {
+            let comment = review.session().read(cx).comments().get(id).unwrap();
+            assert_eq!(comment.line_text.as_deref(), Some("line 3\nline 4"));
+        });
+        blocks(&review, cx).read_with(cx, |blocks, cx| {
+            assert!(blocks.view(id).unwrap().read(cx).is_outdated());
+        });
+
+        // A single commented line too.
+        move_to_row_with_text(&rhs, "line 1", cx);
+        cx.simulate_keystrokes("c");
+        cx.simulate_input("single");
+        cx.simulate_keystrokes("ctrl-enter");
+        let single = comment_ids(&review, cx)[1];
+        assert_eq!(
+            line_state(&review, single, cx),
+            (lines("a.rs", 2..=2), false)
+        );
+        buffer.update(cx, |buffer, cx| {
+            let offset = buffer.text().find("line 1\n").unwrap();
+            buffer.edit([(offset..offset + "line 1\n".len(), "")], None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            line_state(&review, single, cx),
+            (lines("a.rs", 2..=2), true)
+        );
+    }
+
+    /// Two projects on one repository (its root and a subfolder, in two windows) review the
+    /// same thing, so they share the review's comments, but each has its own buffers.
+    #[gpui::test]
+    async fn test_two_projects_review_the_same_repository(cx: &mut TestAppContext) {
+        use crate::test_support::{dot_git, line};
+        use project::{FakeFs, Project};
+        use workspace::MultiWorkspace;
+
+        init(cx, DiffViewStyle::Unified);
+        let head: String = (1..=10).map(line).collect();
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            serde_json::json!({
+                ".git": {},
+                "sub": { "x.rs": head.replace(&line(5), "LINE 5\n") },
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(dot_git(), &[("sub/x.rs", head)]);
+
+        let mut windows = Vec::new();
+        for root in [path!("/project"), path!("/project/sub")] {
+            let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+            let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = window
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                .unwrap();
+            windows.push((workspace, VisualTestContext::from_window(window.into(), cx)));
+        }
+        let [(workspace_a, cx_a), (workspace_b, cx_b)] = &mut windows[..] else {
+            unreachable!()
+        };
+        let open_review = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.focus(workspace);
+            cx.update(|window, cx| {
+                window.dispatch_action(crate::ReviewUncommitted.boxed_clone(), cx)
+            });
+            cx.run_until_parked();
+            let review = workspace.update(cx, |workspace, cx| {
+                workspace.active_item_as::<ReviewView>(cx).unwrap()
+            });
+            cx.focus(&review);
+            cx.run_until_parked();
+            review
+        };
+        let review_a = open_review(workspace_a, cx_a);
+        let review_b = open_review(workspace_b, cx_b);
+        let key = |review: &Entity<ReviewView>, cx: &VisualTestContext| {
+            review.read_with(cx, |review, cx| review.session().read(cx).key().clone())
+        };
+        assert_eq!(key(&review_a, cx_a), key(&review_b, cx_b));
+
+        let rhs_a = rhs_editor(&review_a, cx_a);
+        move_to_row_with_text(&rhs_a, "line 4", cx_a);
+        cx_a.simulate_keystrokes("c");
+        cx_a.simulate_input("shared");
+        cx_a.simulate_keystrokes("ctrl-enter");
+        cx_b.run_until_parked();
+        let id = comment_ids(&review_a, cx_a)[0];
+        assert_eq!(hosted_rows(&review_b, cx_b).len(), 1);
+        assert_eq!(
+            line_state(&review_a, id, cx_a),
+            (lines("sub/x.rs", 4..=4), false)
+        );
+
+        // An unsaved edit in one window moves the comment there; the other window's buffer
+        // doesn't have it and doesn't move the comment back.
+        let buffer_a = display_buffer(&review_a, "sub/x.rs", cx_a);
+        let buffer_b = display_buffer(&review_b, "sub/x.rs", cx_b);
+        assert_ne!(buffer_a.entity_id(), buffer_b.entity_id());
+        buffer_a.update(cx_a, |buffer, cx| buffer.edit([(0..0, "new\n")], None, cx));
+        cx_a.run_until_parked();
+        assert_eq!(
+            line_state(&review_b, id, cx_b),
+            (lines("sub/x.rs", 5..=5), false)
+        );
+        buffer_b.update(cx_b, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "tail\n")], None, cx)
+        });
+        cx_b.run_until_parked();
+        assert_eq!(
+            line_state(&review_b, id, cx_b),
+            (lines("sub/x.rs", 5..=5), false)
+        );
+        assert_eq!(hosted_rows(&review_a, cx_a).len(), 1);
+        assert_eq!(hosted_rows(&review_b, cx_b).len(), 1);
+
+        // Both reopen the stored comment: the window whose buffer has the edit checks it first,
+        // and the other one doesn't flag it outdated for its own buffer's text.
+        for (workspace, review, cx) in [
+            (&*workspace_a, &review_a, &mut *cx_a),
+            (&*workspace_b, &review_b, &mut *cx_b),
+        ] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.close_item_by_id(
+                        review.entity_id(),
+                        workspace::SaveIntent::Skip,
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx)
+                })
+            });
+            cx.run_until_parked();
+        }
+        drop((review_a, review_b, rhs_a));
+        let review_a = open_review(workspace_a, cx_a);
+        let review_b = open_review(workspace_b, cx_b);
+        let id = comment_ids(&review_a, cx_a)[0];
+        assert_eq!(
+            line_state(&review_a, id, cx_a),
+            (lines("sub/x.rs", 5..=5), false)
+        );
+        assert_eq!(hosted_rows(&review_a, cx_a).len(), 1);
+        assert_eq!(hosted_rows(&review_b, cx_b).len(), 1);
+        drop((buffer_a, buffer_b));
     }
 
     #[gpui::test]

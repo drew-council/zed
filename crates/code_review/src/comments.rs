@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use git::repository::RepoPath;
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
-use std::ops::{Range, RangeInclusive};
+use std::ops::RangeInclusive;
 use ui::Color;
 
 /// A comment's number within its review, in creation order.
@@ -101,7 +101,7 @@ pub(crate) enum CommentTarget {
     Lines {
         path: RepoPath,
         side: Side,
-        /// 1-based line numbers on `side`. They follow the comment's anchor while the review is
+        /// 1-based line numbers on `side`. They follow the comment's lines while the review is
         /// open, and are what a review opened later looks for.
         lines: RangeInclusive<u32>,
     },
@@ -141,10 +141,6 @@ pub(crate) struct Comment {
     /// they changed while the review was closed.
     pub line_text: Option<String>,
     pub state: CommentState,
-    /// Where a line comment's lines are now, in the buffer of their side (the file's buffer for
-    /// the new side, its diff base for the old side). Anchors follow edits; they aren't stored,
-    /// and a comment loaded from the database gets them once its file is loaded.
-    pub anchor: Option<Range<language::Anchor>>,
 }
 
 impl Comment {
@@ -181,13 +177,14 @@ impl Comment {
 pub(crate) struct NewComment {
     pub target: CommentTarget,
     pub line_text: Option<String>,
-    pub anchor: Option<Range<language::Anchor>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommentEvent {
     Added(CommentId),
     Changed(CommentId),
+    /// The lines of line comments moved, or their text changed, as one tab saw them.
+    Moved(Vec<CommentId>),
     Removed(CommentId),
 }
 
@@ -221,7 +218,6 @@ impl CommentStore {
             body: String::new(),
             line_text: new_comment.line_text,
             state: CommentState::Draft,
-            anchor: new_comment.anchor,
         });
         id
     }
@@ -363,7 +359,6 @@ impl Comment {
             body: stored.body,
             line_text: stored.line_text,
             state,
-            anchor: None,
         })
     }
 }
@@ -404,7 +399,6 @@ mod tests {
                 body: "Nice".into(),
                 line_text: None,
                 state: CommentState::Draft,
-                anchor: None,
             },
             Comment {
                 id: CommentId(3),
@@ -417,7 +411,6 @@ mod tests {
                 state: CommentState::Submitted {
                     review_id: "42".into(),
                 },
-                anchor: None,
             },
             Comment {
                 id: CommentId(7),
@@ -430,7 +423,6 @@ mod tests {
                 body: "x".into(),
                 line_text: Some("a\nb\nc".into()),
                 state: CommentState::Outdated,
-                anchor: None,
             },
         ];
         for comment in comments {
