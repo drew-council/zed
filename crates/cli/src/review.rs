@@ -117,8 +117,12 @@ mod tests {
         let path = directory.path().canonicalize().unwrap();
         let path = path.to_str().unwrap().to_string();
 
-        assert!(request(None, &[path.clone()]).unwrap().is_none());
-        let review = request(Some("uncommitted"), &[path.clone()])
+        assert!(
+            request(None, std::slice::from_ref(&path))
+                .unwrap()
+                .is_none()
+        );
+        let review = request(Some("uncommitted"), std::slice::from_ref(&path))
             .unwrap()
             .unwrap();
         assert_eq!(review.repo_dir, path);
