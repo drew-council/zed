@@ -498,14 +498,14 @@ pub fn github_error(error: &anyhow::Error) -> Option<&GitHubError> {
 
 struct ForgeErrorToast;
 
-/// Shows an error of a [`Forge`] in a toast. A single sign-on error links to the page that
-/// authorizes the token.
+/// Shows an error of a [`Forge`] or of opening a pull request in a toast. A single sign-on
+/// error links to the page that authorizes the token; Restricted Mode offers to trust the project.
 pub fn show_error_toast(
     workspace: &mut Workspace,
     error: &anyhow::Error,
     cx: &mut Context<Workspace>,
 ) {
-    log::error!("GitHub: {error:#}");
+    log::error!("pull request: {error:#}");
     let mut toast = Toast::new(
         NotificationId::unique::<ForgeErrorToast>(),
         error_message(error).to_string(),
@@ -513,6 +513,13 @@ pub fn show_error_toast(
     if let Some(GitHubError::Sso { url: Some(url) }) = github_error(error) {
         let url = url.clone();
         toast = toast.on_click("Authorize", move |_, cx| cx.open_url(&url));
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::checkout::RestrictedMode>())
+    {
+        toast = toast.on_click("Trust Project…", |window, cx| {
+            window.dispatch_action(Box::new(workspace::ToggleWorktreeSecurity), cx)
+        });
     }
     workspace.show_toast(toast, cx);
 }

@@ -255,9 +255,15 @@ fn repo_reference(host: Option<String>, owner: &str, name: &str) -> Option<Forge
 }
 
 /// Checks a branch name that comes from a forge (a pull request's head or base branch) before it
-/// reaches git: git's `check-ref-format --branch` rules, and nothing git could read as an option.
+/// reaches git: git's `check-ref-format --branch` rules, and nothing git could read as an option
+/// or as one of its own refs (`origin/HEAD` is a symbolic ref to the default branch).
 pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
+    let is_pseudo_ref = name.ends_with("HEAD")
+        && name
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character == '_');
     let is_valid = is_plain_revision(name)
+        && !is_pseudo_ref
         && name != "@"
         && !name.starts_with('/')
         && !name.ends_with('/')
@@ -439,11 +445,17 @@ mod tests {
             "a.b",
             "ünïcode",
             "x+y",
+            "HEADS",
+            "fix-HEAD",
+            "feature/HEAD",
         ] {
             assert!(validate_branch_name(valid).is_ok(), "{valid:?} should pass");
         }
         for invalid in [
             "",
+            "HEAD",
+            "FETCH_HEAD",
+            "ORIG_HEAD",
             "-x",
             "--upload-pack=x",
             "@",

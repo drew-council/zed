@@ -3,7 +3,7 @@
 //! threads, review summaries and the lines GitHub accepts comments on.
 
 use crate::{
-    checkout::{self, CheckoutStep, canonical_source, head_remote, plan_checkout, run_checkout},
+    checkout::{self, CheckoutStep, canonical_source, plan_checkout, run_checkout},
     comments::{CommentTarget, Side},
     forge::{
         self, CommentableLines, DiffSide, Forge, ForgeRepoRef, GitHubError, PullRequestDetails,
@@ -14,19 +14,32 @@ use crate::{
     target::{PullRequestReference, PullRequestTarget, ReviewTarget, validate_branch_name},
     view::ReviewView,
 };
-use anyhow::{Context as _, Result, bail};
-use collections::HashMap;
-use git::{Oid, repository::RepoPath};
-use gpui::{
-    App, AppContext as _, AsyncWindowContext, BackgroundExecutor, Context, Entity, EventEmitter,
-    Global, PromptLevel, SharedString, Task, WeakEntity, Window,
+use anyhow::{Context as _, Result, anyhow, bail};
+use collections::{HashMap, HashSet};
+use git::{
+    Oid,
+    repository::{CreateWorktreeTarget, RepoPath},
 };
-use project::{Project, git_store::Repository, project_settings::ProjectSettings};
+use gpui::{
+    App, AppContext as _, AsyncWindowContext, BackgroundExecutor, Context, Entity, EntityId,
+    EventEmitter, Global, PromptLevel, SharedString, Task, WeakEntity, Window,
+};
+use project::{
+    Project,
+    git_store::Repository,
+    project_settings::ProjectSettings,
+    trusted_worktrees::{PathTrust, TrustedWorktrees},
+};
 use settings::Settings as _;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 use util::{ResultExt as _, path_list::PathList};
 use workspace::{OpenMode, Workspace};
-use zed_actions::{CreateWorktree, NewWorktreeBranchTarget};
 
 /// What the review tabs of one pull request share: the forge it is on, its details, and what it
 /// has on GitHub besides the code (threads, summaries, GitHub's own diff).
@@ -444,7 +457,9 @@ pub(crate) fn place_thread(
             side: comment_side(*side),
             lines: *line..=*line,
         }),
-        // A range from an old line to a new one sits below its new line, like its last row.
+        // A range from an old line to a new one sits below its new line, like its last row; so
+        // does one whose start GitHub's diff doesn't have before its end (a left start is
+        // numbered in the commit the thread was made on).
         ThreadAnchor::Range {
             start_side,
             start,
@@ -453,7 +468,11 @@ pub(crate) fn place_thread(
         } => ThreadPlacement::Inline(CommentTarget::Lines {
             path,
             side: comment_side(*side),
-            lines: if start_side == side && start <= line {
+            lines: if start_side == side
+                && start <= line
+                && files.is_none_or(|files| {
+                    files.allows_range(&thread.path, (*start_side, *start), (*side, *line))
+                }) {
                 *start..=*line
             } else {
                 *line..=*line
@@ -534,10 +553,16 @@ pub fn open_pull_request(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<ReviewView>>> {
+    let Some(opening) = OpeningPullRequest::begin(repository.entity_id(), cx) else {
+        return Task::ready(Err(anyhow!(
+            "Another pull request is being opened in this repository. Try again once it is open."
+        )));
+    };
     let project = workspace.project().clone();
     let resolve = forge::resolve_forge(&repository, reference.repo.clone(), &project, cx);
     let workspace_handle = cx.weak_entity();
     cx.spawn_in(window, async move |_, cx| {
+        let _opening = opening;
         let forge = resolve.await?;
         let details = cx
             .background_executor()
@@ -557,6 +582,36 @@ pub fn open_pull_request(
             .await
         }
     })
+}
+
+/// The repositories a pull request is being opened in.
+#[derive(Default)]
+struct OpeningPullRequests(Rc<RefCell<HashSet<EntityId>>>);
+
+impl Global for OpeningPullRequests {}
+
+/// Held while a pull request is opened in a repository: two at once would interleave their
+/// branch switches and fast-forwards on the repository's job queue.
+struct OpeningPullRequest {
+    opening: Rc<RefCell<HashSet<EntityId>>>,
+    repository: EntityId,
+}
+
+impl OpeningPullRequest {
+    fn begin(repository: EntityId, cx: &mut App) -> Option<Self> {
+        let opening = cx.default_global::<OpeningPullRequests>().0.clone();
+        let is_new = opening.borrow_mut().insert(repository);
+        is_new.then_some(Self {
+            opening,
+            repository,
+        })
+    }
+}
+
+impl Drop for OpeningPullRequest {
+    fn drop(&mut self) {
+        self.opening.borrow_mut().remove(&self.repository);
+    }
 }
 
 /// [`open_pull_request`], with a failure shown as a toast.
@@ -580,9 +635,6 @@ pub(crate) fn open_pull_request_and_notify(
                 })
                 .log_err();
         }
-        Err(error) if error.downcast_ref::<ShownByWorktreeService>().is_some() => {
-            log::error!("opening a pull request: {error:#}");
-        }
         Err(error) => {
             let shown = workspace.update(cx, |workspace, cx| {
                 forge::show_error_toast(workspace, &error, cx)
@@ -593,16 +645,6 @@ pub(crate) fn open_pull_request_and_notify(
         }
     })
     .detach();
-}
-
-/// Zed's worktree service shows its errors itself.
-#[derive(Debug)]
-struct ShownByWorktreeService;
-
-impl std::fmt::Display for ShownByWorktreeService {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Couldn't create the worktree")
-    }
 }
 
 struct LoadedPullRequest {
@@ -624,35 +666,42 @@ async fn check_out_and_open(
         details.base_oid,
     )?;
     let remotes = cx.update(|_, cx| github::remotes(&repository, cx))?.await?;
-    let current_branch = repository.read_with(cx, |repository, _| {
-        repository
-            .branch
-            .as_ref()
-            .map(|branch| branch.name().to_string())
-    });
-    let head = checkout::head_sha(&repository, cx).await?;
-    let steps = plan_checkout(
-        &details,
-        forge.context(),
-        &remotes,
-        current_branch.as_deref(),
-        head,
-    )?;
+    let local = cx
+        .update(|_, cx| checkout::read_local_state(&repository, details.base_oid, cx))?
+        .await?;
+    let steps = plan_checkout(&details, forge.context(), &remotes, &local)?;
+    if !steps.is_empty() {
+        cx.update(|_, cx| checkout::ensure_trusted(&repository, cx))??;
+    }
     if confirm_checkout && !steps.is_empty() {
         let work_dir = repository.read_with(cx, |repository, _| {
             repository.work_directory_abs_path.clone()
         });
+        let what = match checkout::checked_out_branch(&steps) {
+            Some(branch) => format!("checks out {branch}"),
+            None => format!("fetches its base branch {}", details.base_ref),
+        };
+        let mut detail = format!(
+            "Reviewing {}#{} {what} in {}.",
+            forge.context().canonical,
+            details.number,
+            work_dir.display()
+        );
+        if !trusts_head_repository(&details, forge.context()) {
+            detail.push_str(&format!(
+                " It comes from {}: like this project's own code, its project settings and \
+                 tasks apply and language servers may run its build scripts.",
+                match &details.head_repository {
+                    Some(head_repository) => format!("the fork {head_repository}"),
+                    None => "a deleted fork".to_string(),
+                }
+            ));
+        }
         let answer = cx.update(|window, cx| {
             window.prompt(
                 PromptLevel::Warning,
                 &format!("Check out pull request #{}?", details.number),
-                Some(&format!(
-                    "Reviewing {}#{} checks out {} in {}.",
-                    forge.context().canonical,
-                    details.number,
-                    details.head_ref,
-                    work_dir.display()
-                )),
+                Some(&detail),
                 &["Check Out", "Cancel"],
                 cx,
             )
@@ -661,7 +710,7 @@ async fn check_out_and_open(
             bail!("Review cancelled");
         }
     }
-    run_checkout(&repository, steps, details.head_oid, &workspace, cx).await?;
+    run_checkout(&repository, steps, &workspace, cx).await?;
 
     let target = ReviewTarget::PullRequest(target);
     workspace.update_in(cx, |workspace, window, cx| {
@@ -673,63 +722,52 @@ async fn check_out_and_open(
     })
 }
 
-/// How to make a worktree at the pull request's head: the fetches to run first, then what Zed's
-/// worktree creation starts the (detached) worktree from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorktreePlan {
-    pub(crate) steps: Vec<CheckoutStep>,
-    pub(crate) branch_target: NewWorktreeBranchTarget,
+/// Whether the pull request's code is the repository's own: from the repository itself or the
+/// viewer's own fork. Any other fork's code is a stranger's.
+fn trusts_head_repository(details: &PullRequestDetails, context: &RepositoryContext) -> bool {
+    if !details.is_cross_repository {
+        return true;
+    }
+    details
+        .head_repository
+        .as_ref()
+        .is_some_and(|head_repository| head_repository.owner.eq_ignore_ascii_case(&context.viewer))
 }
 
-/// A pull request whose head branch is on a remote starts from that remote branch (Zed's worktree
-/// creation fetches the remote); any other one from its head commit, fetched from `refs/pull`
-/// without creating a branch (a branch can't be fetched into while another worktree has it).
-pub(crate) fn plan_worktree(
+/// What brings a pull request's head and base into the repository for a review worktree, which
+/// is detached at the head (`git worktree add --detach` takes any commit): `refs/pull/N/head`
+/// into `FETCH_HEAD`, whichever remote has the head branch. A branch would be in the way: git
+/// can't fetch into a branch another worktree has checked out.
+pub(crate) fn plan_worktree_fetch(
     details: &PullRequestDetails,
     context: &RepositoryContext,
     remotes: &[GitHubRemote],
-) -> Result<WorktreePlan> {
+) -> Result<CheckoutStep> {
     validate_branch_name(&details.head_ref).context("The pull request's head branch")?;
     validate_branch_name(&details.base_ref).context("The pull request's base branch")?;
-    let base_refspec = format!("refs/heads/{}", details.base_ref);
-    Ok(match head_remote(details, remotes) {
-        Some(head_remote) => WorktreePlan {
-            steps: if head_remote.repo.is_same_repo(&context.canonical) {
-                Vec::new()
-            } else {
-                vec![CheckoutStep::FetchRefspec {
-                    source: canonical_source(context, remotes),
-                    refspecs: vec![base_refspec],
-                }]
-            },
-            branch_target: NewWorktreeBranchTarget::RemoteBranch {
-                remote_name: head_remote.name.clone(),
-                branch_name: details.head_ref.to_string(),
-            },
-        },
-        None => WorktreePlan {
-            steps: vec![CheckoutStep::FetchRefspec {
-                source: canonical_source(context, remotes),
-                refspecs: vec![format!("refs/pull/{}/head", details.number), base_refspec],
-            }],
-            // `git worktree add --detach` takes any revision.
-            branch_target: NewWorktreeBranchTarget::ExistingBranch {
-                name: details.head_oid.to_string(),
-            },
-        },
+    Ok(CheckoutStep::FetchRefspec {
+        source: canonical_source(context, remotes),
+        refspecs: vec![
+            format!("refs/pull/{}/head", details.number),
+            format!("refs/heads/{}", details.base_ref),
+        ],
     })
 }
 
-/// Reviews the pull request in a linked worktree `pr-N` of the repository, opened as another
-/// workspace of the window; the original checkout stays as it is. A worktree made for it before
-/// is reused.
+/// Reviews the pull request in a linked worktree `pr-N` of the repository, detached at the pull
+/// request's head and opened as another workspace of the window; the original checkout stays as
+/// it is. A worktree of that name made before is reused, and only moved to the pull request's
+/// head when the user agrees.
 async fn open_in_new_worktree(
     workspace: WeakEntity<Workspace>,
     repository: Entity<Repository>,
     pull_request: LoadedPullRequest,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<ReviewView>> {
-    let worktree_name = format!("pr-{}", pull_request.details.number);
+    let details = &pull_request.details;
+    let context = pull_request.forge.context();
+    let head_oid = details.head_oid;
+    let worktree_name = format!("pr-{}", details.number);
     let worktree_directory = cx.update(|_, cx| {
         ProjectSettings::get_global(cx)
             .git
@@ -741,49 +779,84 @@ async fn open_in_new_worktree(
     })?;
     let worktrees = repository.update(cx, |repository, _| repository.worktrees());
     let worktrees = worktrees.await.context("the git job was canceled")??;
+    let existing = worktrees.into_iter().find(|worktree| worktree.path == path);
+    let moves_existing = existing
+        .as_ref()
+        .is_some_and(|existing| existing.sha.parse::<Oid>().ok() != Some(head_oid));
 
-    let new_workspace = if worktrees.iter().any(|worktree| worktree.path == path) {
-        open_existing_worktree(&workspace, path, cx).await?
-    } else {
+    if let Some(existing) = existing.as_ref().filter(|_| moves_existing) {
+        let checked_out = match existing
+            .ref_name
+            .as_deref()
+            .map(|ref_name| ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name))
+        {
+            Some(branch) => format!("has {branch} checked out"),
+            None => match existing.sha.parse::<Oid>() {
+                Ok(sha) => format!("is at {}", sha.display_short()),
+                Err(_) => format!("is at {}", existing.sha),
+            },
+        };
+        let answer = cx.update(|window, cx| {
+            window.prompt(
+                PromptLevel::Warning,
+                &format!("Move the worktree {worktree_name} to pull request #{}?", details.number),
+                Some(&format!(
+                    "{} {checked_out}. Reviewing {}#{} there checks out the pull request's head \
+                     {} (detached); branches stay as they are.",
+                    path.display(),
+                    context.canonical,
+                    details.number,
+                    head_oid.display_short(),
+                )),
+                &["Check Out", "Cancel"],
+                cx,
+            )
+        })?;
+        if answer.await? != 0 {
+            bail!("Review cancelled");
+        }
+    }
+    let creates = existing.is_none();
+    if creates || moves_existing {
+        cx.update(|_, cx| checkout::ensure_trusted(&repository, cx))??;
         let remotes = cx.update(|_, cx| github::remotes(&repository, cx))?.await?;
-        let plan = plan_worktree(
-            &pull_request.details,
-            pull_request.forge.context(),
-            &remotes,
-        )?;
+        let fetch = plan_worktree_fetch(details, context, &remotes)?;
+        run_checkout(&repository, vec![fetch], &workspace, cx).await?;
+    }
+    if creates {
+        let create = repository.update(cx, |repository, _| {
+            repository.create_worktree(
+                CreateWorktreeTarget::Detached {
+                    base_sha: Some(head_oid.to_string()),
+                },
+                path.clone(),
+            )
+        });
+        create
+            .await
+            .context("the git job was canceled")?
+            .with_context(|| format!("Couldn't create the worktree {}", path.display()))?;
+    }
+
+    let new_workspace = open_worktree(&workspace, path.clone(), cx).await?;
+    // A worktree of the repository's own code is trusted like the checkout it was made from
+    // (Zed's worktree creation does the same). Any other fork's gets Zed's Restricted Mode prompt:
+    // its project settings, tasks and build scripts would run otherwise.
+    if creates && trusts_head_repository(details, context) {
+        cx.update(|window, cx| trust_worktree(&new_workspace, &path, window, cx))?;
+    }
+    let new_repository = repository_at(&new_workspace, &path, cx).await?;
+    if moves_existing {
         run_checkout(
-            &repository,
-            plan.steps,
-            pull_request.details.head_oid,
-            &workspace,
+            &new_repository,
+            vec![CheckoutStep::Detach {
+                to: head_oid.to_string(),
+            }],
+            &new_workspace.downgrade(),
             cx,
         )
         .await?;
-        let action = CreateWorktree {
-            worktree_name: Some(worktree_name),
-            branch_target: plan.branch_target,
-        };
-        let created = workspace
-            .update_in(cx, |workspace, window, cx| {
-                git_ui_core::worktree_service::create_worktree_workspace(
-                    workspace, &action, window, None, cx,
-                )
-            })?
-            .await
-            .context(ShownByWorktreeService)?;
-        // It opens in the background.
-        let multi_workspace =
-            workspace.read_with(cx, |workspace, _| workspace.multi_workspace().cloned())?;
-        if let Some(multi_workspace) = multi_workspace {
-            let new_workspace = created.workspace.clone();
-            multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-                multi_workspace.activate(new_workspace, Some(workspace.clone()), window, cx)
-            })?;
-        }
-        created.workspace
-    };
-
-    let new_repository = repository_of(&new_workspace, cx).await?;
+    }
     check_out_and_open(
         new_workspace.downgrade(),
         new_repository,
@@ -794,7 +867,7 @@ async fn open_in_new_worktree(
     .await
 }
 
-async fn open_existing_worktree(
+async fn open_worktree(
     workspace: &WeakEntity<Workspace>,
     path: PathBuf,
     cx: &mut AsyncWindowContext,
@@ -816,9 +889,29 @@ async fn open_existing_worktree(
     open.await
 }
 
-/// The repository of a workspace that was just opened on a worktree, once Zed found it.
-async fn repository_of(
+fn trust_worktree(workspace: &Entity<Workspace>, path: &Path, window: &mut Window, cx: &mut App) {
+    if !ProjectSettings::get_global(cx).session.trust_all_worktrees
+        && let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx)
+    {
+        let worktree_store = workspace.read(cx).project().read(cx).worktree_store();
+        let worktree = worktree_store.read(cx).find_worktree(path, cx);
+        if let Some((worktree, _)) = worktree {
+            let worktree = PathTrust::Worktree(worktree.read(cx).id());
+            trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+                trusted_worktrees.trust(&worktree_store, HashSet::from_iter([worktree]), cx);
+            });
+        }
+    }
+    // The prompt that opened with the workspace closes when nothing is restricted any more.
+    workspace.update(cx, |workspace, cx| {
+        workspace.show_worktree_trust_security_modal(false, window, cx);
+    });
+}
+
+/// The repository of a workspace just opened on the worktree at `path`, once Zed found it.
+async fn repository_at(
     workspace: &Entity<Workspace>,
+    path: &Path,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<Repository>> {
     let scan = workspace.read_with(cx, |workspace, cx| {
@@ -828,7 +921,17 @@ async fn repository_of(
     // Repositories are discovered from the scan's results shortly after it ends.
     for _ in 0..50 {
         let repository = workspace.read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).active_repository(cx)
+            let repositories = workspace.project().read(cx).repositories(cx);
+            repositories
+                .values()
+                .find(|repository| *repository.read(cx).work_directory_abs_path == *path)
+                // The path may be a symlink's, and the workspace has nothing else.
+                .or_else(|| {
+                    (repositories.len() == 1)
+                        .then(|| repositories.values().next())
+                        .flatten()
+                })
+                .cloned()
         });
         if let Some(repository) = repository {
             return Ok(repository);
@@ -837,7 +940,7 @@ async fn repository_of(
             .timer(Duration::from_millis(100))
             .await;
     }
-    bail!("No git repository found in the new worktree")
+    bail!("No git repository found in the worktree {}", path.display())
 }
 
 #[cfg(test)]
@@ -896,46 +999,60 @@ mod tests {
             pending_review: None,
         };
         let remotes = [remote("origin", canonical.clone())];
-
-        assert_eq!(
-            plan_worktree(&details(Some(canonical.clone())), &context, &remotes).unwrap(),
-            WorktreePlan {
-                steps: Vec::new(),
-                branch_target: NewWorktreeBranchTarget::RemoteBranch {
-                    remote_name: "origin".into(),
-                    branch_name: "fix/truncate".into(),
-                },
-            }
-        );
         let fork_remotes = [remote("origin", repo("me")), remote("upstream", canonical)];
+        let fetch = |source: &str| CheckoutStep::FetchRefspec {
+            source: source.into(),
+            refspecs: vec!["refs/pull/2/head".into(), "refs/heads/main".into()],
+        };
+
+        // The head always comes from the canonical repository's refs/pull, into FETCH_HEAD: the
+        // worktree is detached at it.
         assert_eq!(
-            plan_worktree(&details(Some(repo("me"))), &context, &fork_remotes).unwrap(),
-            WorktreePlan {
-                steps: vec![CheckoutStep::FetchRefspec {
-                    source: "upstream".into(),
-                    refspecs: vec!["refs/heads/main".into()],
-                }],
-                branch_target: NewWorktreeBranchTarget::RemoteBranch {
-                    remote_name: "origin".into(),
-                    branch_name: "fix/truncate".into(),
-                },
-            }
+            plan_worktree_fetch(&details(Some(repo("o"))), &context, &remotes).unwrap(),
+            fetch("origin")
         );
         assert_eq!(
-            plan_worktree(&details(Some(repo("someone"))), &context, &remotes).unwrap(),
-            WorktreePlan {
-                steps: vec![CheckoutStep::FetchRefspec {
-                    source: "origin".into(),
-                    refspecs: vec!["refs/pull/2/head".into(), "refs/heads/main".into()],
-                }],
-                branch_target: NewWorktreeBranchTarget::ExistingBranch {
-                    name: "632ee13692b487a7ea71911f473781416f35ff01".into(),
-                },
-            }
+            plan_worktree_fetch(&details(Some(repo("me"))), &context, &fork_remotes).unwrap(),
+            fetch("upstream")
+        );
+        assert_eq!(
+            plan_worktree_fetch(&details(Some(repo("someone"))), &context, &[remote(
+                "origin",
+                repo("me")
+            )])
+            .unwrap(),
+            fetch("git@github.com:o/r.git")
         );
         let mut hostile = details(None);
         hostile.head_ref = "-x".into();
-        assert!(plan_worktree(&hostile, &context, &remotes).is_err());
+        assert!(plan_worktree_fetch(&hostile, &context, &remotes).is_err());
+
+        // Only the repository's own code and the viewer's fork are trusted like the checkout.
+        let mut same_repository = details(Some(repo("o")));
+        same_repository.is_cross_repository = false;
+        assert!(trusts_head_repository(&same_repository, &context));
+        let mut own_fork = details(Some(repo("Me")));
+        own_fork.is_cross_repository = true;
+        assert!(trusts_head_repository(&own_fork, &context));
+        let mut stranger = details(Some(repo("someone")));
+        stranger.is_cross_repository = true;
+        assert!(!trusts_head_repository(&stranger, &context));
+        let mut deleted = details(None);
+        deleted.is_cross_repository = true;
+        assert!(!trusts_head_repository(&deleted, &context));
+    }
+
+    #[gpui::test]
+    fn test_one_pull_request_opens_per_repository(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let (repository, other_repository) = (EntityId::from(1), EntityId::from(2));
+            let first = OpeningPullRequest::begin(repository, cx).unwrap();
+            assert!(OpeningPullRequest::begin(repository, cx).is_none());
+            let other = OpeningPullRequest::begin(other_repository, cx).unwrap();
+            drop(first);
+            assert!(OpeningPullRequest::begin(repository, cx).is_some());
+            drop(other);
+        });
     }
 
     fn new_lines(path: &str, lines: std::ops::RangeInclusive<u32>) -> ThreadPlacement {
@@ -1756,6 +1873,56 @@ mod tests {
             let highlighted = crate::line_cursor::cursor_rows(&lhs, cx);
             assert_eq!(highlighted.len(), 1, "{highlighted:?}");
             assert_eq!(row_text(&lhs, highlighted[0].0, cx), "engine 193");
+        }
+
+        /// Restricted Mode: no git runs to check out a pull request (in place or in a new
+        /// worktree) in a repository Zed doesn't trust. Reading it is fine. (The fake
+        /// repository's fetch would panic.)
+        #[gpui::test]
+        async fn test_no_checkout_in_restricted_mode(cx: &mut TestAppContext) {
+            let (fs, workspace, _review, requests, cx) =
+                open_pull_request_review(DiffViewStyle::Unified, Default::default(), cx).await;
+            let repository = workspace.read_with(cx, |workspace, cx| {
+                workspace.project().read(cx).active_repository(cx).unwrap()
+            });
+            assert!(!repository.read_with(cx, |repository, _| repository.is_trusted()));
+            fs.with_git_state(dot_git(), true, |state| {
+                state.refs.insert("HEAD".into(), C1.into());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let details_loaded = requests_of(&requests, "PullRequestDetails");
+
+            for in_new_worktree in [false, true] {
+                let task = workspace.update_in(cx, |workspace, window, cx| {
+                    open_pull_request(
+                        workspace,
+                        repository.clone(),
+                        crate::target::parse_pull_request_reference("1").unwrap(),
+                        OpenPullRequestOptions {
+                            in_new_worktree,
+                            confirm_checkout: false,
+                        },
+                        window,
+                        cx,
+                    )
+                });
+                let error = task.await.unwrap_err();
+                assert!(
+                    error.downcast_ref::<checkout::RestrictedMode>().is_some(),
+                    "{error:#}"
+                );
+            }
+            assert_eq!(
+                requests_of(&requests, "PullRequestDetails"),
+                details_loaded + 2
+            );
+            assert_eq!(
+                fs.with_git_state(dot_git(), false, |state| state.refs.get("HEAD").cloned())
+                    .unwrap()
+                    .as_deref(),
+                Some(C1)
+            );
         }
 
         #[gpui::test]

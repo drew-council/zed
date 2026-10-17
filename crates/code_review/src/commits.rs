@@ -42,7 +42,7 @@ const BINARY_PLACEHOLDER: &str = "(binary file not shown)";
 const SNAPSHOT_FILES_PER_JOB: usize = 32;
 
 /// Runs `job` on the repository's git job queue with its local backend.
-fn local_job<R, Fut>(
+pub(crate) fn local_job<R, Fut>(
     repo: &Entity<Repository>,
     description: &'static str,
     job: impl FnOnce(Arc<dyn GitRepository>) -> Fut + 'static,
