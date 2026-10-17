@@ -873,7 +873,7 @@ mod tests {
         test_support::{
             C1, C2, C3, active_review, commit_data, cursor_line, cursor_point, dispatch, dot_git,
             excerpt_paths, init_vim_test, insert_commit_ref, move_to_row_with_text, open_workspace,
-            path_at_cursor, record_commit, repository, rhs_editor, tab_title,
+            path_at_cursor, record_commit, repository, rhs_editor, row_text, tab_title,
         },
     };
     use editor::{Editor, test::editor_test_context::assert_state_with_diff};
@@ -1087,6 +1087,39 @@ mod tests {
             let buffer = buffer.read(cx);
             assert!(buffer.file().unwrap().as_local().is_some());
             assert_eq!(buffer.text(), WORKTREE_LIB);
+        });
+        assert_eq!(cursor_point(&opened, cx).row, 1);
+    }
+
+    /// `e` on a removed row of a snapshot shown unified opens the working tree's file at the
+    /// removed row's line, as on the left side of a split diff (V1.F1).
+    #[gpui::test]
+    async fn test_open_file_at_a_removed_row_of_a_snapshot(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (fs, workspace, cx) = history_fixture(cx).await;
+        // C3 becomes history: HEAD moves on to C4.
+        let repo = repository(&workspace, cx);
+        let c3 = [("lib.rs", C3_LIB.into()), ("x.txt", "x\n".into())];
+        record_commit(&fs, &repo, &c3, C3, cx).await;
+        fs.set_head_for_repo(dot_git(), &c3, "4444444444444444444444444444444444444444");
+        cx.run_until_parked();
+
+        review_commits(C3, cx);
+        let review = active_review(&workspace, cx);
+        assert!(is_snapshot(&review, cx));
+        let editor = rhs_editor(&review, cx);
+
+        cx.focus(&review);
+        let row = move_to_row_with_text(&editor, "fn b() {}", cx);
+        assert_eq!(row_text(&editor, row + 1, cx), "fn b() { 1 }");
+        cx.simulate_keystrokes("e");
+        cx.run_until_parked();
+        let opened = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).unwrap()
+        });
+        opened.read_with(cx, |opened, cx| {
+            let buffer = opened.buffer().read(cx).as_singleton().unwrap();
+            assert_eq!(buffer.read(cx).text(), WORKTREE_LIB);
         });
         assert_eq!(cursor_point(&opened, cx).row, 1);
     }

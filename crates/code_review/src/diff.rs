@@ -813,17 +813,20 @@ impl ReviewDiff {
         snapshot.path_for_buffer(anchor.buffer_id).cloned()
     }
 
-    /// The file under the cursor of the focused side, and the cursor's row in that side's buffer.
+    /// The file under the cursor of the focused side, and the cursor's row in that side's buffer
+    /// (on a removed row of a unified diff, its row in the diff base, as on the left side).
     pub(crate) fn path_and_row_at_cursor(&self, cx: &mut App) -> Option<(PathKey, u32)> {
+        // A removed row's point is in the diff base's buffer, which has no path of its own.
+        let path_key = self.path_at_cursor(cx)?;
         let editor = self.editor.read(cx).focused_editor().clone();
-        editor.update(cx, |editor, cx| {
+        let row = editor.update(cx, |editor, cx| {
             let display_snapshot = editor.display_snapshot(cx);
             let head = editor.selections.newest::<Point>(&display_snapshot).head();
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let (buffer, point) = snapshot.point_to_buffer_point(head)?;
-            let path_key = snapshot.path_for_buffer(buffer.remote_id())?.clone();
-            Some((path_key, point.row))
-        })
+            let (_, point) = snapshot.point_to_buffer_point(head)?;
+            Some(point.row)
+        })?;
+        Some((path_key, row))
     }
 
     /// Moves the cursor to the first row of the file (showing only that file in single-file
