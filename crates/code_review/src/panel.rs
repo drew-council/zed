@@ -5,7 +5,7 @@ use crate::{
     SelectNextMatch, SelectPreviousMatch, ToggleBotReviews, ToggleFileReviewed, ToggleFocus,
     ToggleHideReviewed, ToggleOutdatedThreads, TogglePanel, ToggleResolvedThreads,
     ToggleSelectedDirectory, ToggleShowGenerated, ToggleShowVendored,
-    comments::ItemKey,
+    comments::{CommentId, ItemKey},
     view::{
         PanelComment, PanelCommentKey, PanelFile, ReviewFilters, ReviewSummary,
         current_pull_request, current_review, filter_regex, focus_diff,
@@ -28,7 +28,7 @@ use gpui::{
 use smallvec::SmallVec;
 use std::{collections::BTreeMap, ops::Range};
 use ui::{
-    CommonAnimationExt as _, ContextMenu, IndentGuideColors, ListItem, ListItemSpacing,
+    Checkbox, CommonAnimationExt as _, ContextMenu, IndentGuideColors, ListItem, ListItemSpacing,
     PopoverMenu, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
@@ -627,6 +627,41 @@ impl ReviewPanel {
         }
     }
 
+    /// A comment row's edit button: the diff moves to the comment and its editor opens.
+    fn edit_comment(&mut self, id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.active_review() else {
+            return;
+        };
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&review, true, false, window, cx)
+            });
+        }
+        let blocks = review.read(cx).comments().clone();
+        if !blocks.update(cx, |blocks, cx| blocks.land_and_edit(id, window, cx)) {
+            self.show_toast("This comment's lines aren't in the diff", cx);
+        }
+    }
+
+    /// A comment row's delete button: deletes the comment after asking, like `dd`.
+    fn delete_comment(&mut self, id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.active_review() else {
+            return;
+        };
+        let blocks = review.read(cx).comments().clone();
+        blocks.update(cx, |blocks, cx| blocks.confirm_delete(id, window, cx));
+    }
+
+    /// A file row's checkbox: toggles the file's reviewed mark, without selecting the row.
+    fn toggle_file_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(TreeEntry::File { file, .. }) = self.entries.get(index).cloned() else {
+            return;
+        };
+        if let Some(review) = self.active_review() {
+            review.update(cx, |review, cx| review.toggle_file(&file.repo_path, cx));
+        }
+    }
+
     fn show_toast(&self, message: &'static str, cx: &mut App) {
         self.workspace
             .update(cx, |workspace, cx| {
@@ -1173,6 +1208,34 @@ impl ReviewPanel {
                     .color(Color::Muted);
                 let (letter, color) = status_letter(file.status);
                 let is_deleted = file.status.is_deleted();
+                let path = file.repo_path.as_unix_str().to_string();
+                let status_label = || Label::new(letter).size(LabelSize::Small).color(color);
+                // On hover, the ✓ gives way to a checkbox that marks the file without selecting
+                // the row or taking the focus.
+                let reviewed_checkbox = div()
+                    .debug_selector({
+                        let path = path.clone();
+                        move || format!("review-panel-reviewed-{path}")
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Checkbox::new(("review-panel-reviewed", index), file.reviewed.into())
+                            .tooltip(Tooltip::for_action_title(
+                                if file.reviewed {
+                                    "Mark as Not Reviewed"
+                                } else {
+                                    "Mark as Reviewed"
+                                },
+                                &ToggleFileReviewed,
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_file_at(index, cx);
+                            })),
+                    );
                 ListItem::new(("review-file", index))
                     .spacing(ListItemSpacing::Sparse)
                     .indent_level(*depth)
@@ -1189,6 +1252,7 @@ impl ReviewPanel {
                     )
                     .end_slot(
                         h_flex()
+                            .debug_selector(move || format!("review-panel-file-status-{path}"))
                             .gap_1()
                             .child(
                                 h_flex()
@@ -1199,7 +1263,13 @@ impl ReviewPanel {
                                     )
                                     .when(!file.reviewed, |slot| slot.invisible()),
                             )
-                            .child(Label::new(letter).size(LabelSize::Small).color(color)),
+                            .child(status_label()),
+                    )
+                    .end_slot_on_hover(
+                        h_flex()
+                            .gap_1()
+                            .child(reviewed_checkbox)
+                            .child(status_label()),
                     )
                     .when(
                         file.attributes.generated || file.attributes.vendored,
@@ -1322,6 +1392,60 @@ impl ReviewPanel {
                     .when_some(state, |item, (state, color)| {
                         item.end_slot(Label::new(state).size(LabelSize::XSmall).color(color))
                     })
+                    .when_some(
+                        match comment.key {
+                            PanelCommentKey::Comment(id)
+                                if !comment.remote && !comment.submitted =>
+                            {
+                                Some(id)
+                            }
+                            PanelCommentKey::Comment(_) | PanelCommentKey::Thread(_) => None,
+                        },
+                        |item, id| {
+                            item.end_slot_on_hover(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("review-panel-edit-comment-{}", id.0)
+                                            })
+                                            .child(
+                                                IconButton::new(
+                                                    ("review-panel-edit-comment", index),
+                                                    IconName::Pencil,
+                                                )
+                                                .icon_size(IconSize::Small)
+                                                .tooltip(Tooltip::text("Edit Comment"))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.edit_comment(id, window, cx)
+                                                    },
+                                                )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("review-panel-delete-comment-{}", id.0)
+                                            })
+                                            .child(
+                                                IconButton::new(
+                                                    ("review-panel-delete-comment", index),
+                                                    IconName::Trash,
+                                                )
+                                                .icon_size(IconSize::Small)
+                                                .tooltip(Tooltip::text("Delete Comment"))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.delete_comment(id, window, cx)
+                                                    },
+                                                )),
+                                            ),
+                                    ),
+                            )
+                        },
+                    )
                     .tooltip({
                         let location = if comment.remote {
                             SharedString::from(format!("{} (on GitHub)", comment.location))
@@ -1754,8 +1878,8 @@ impl Panel for ReviewPanel {
 mod tests {
     use super::*;
     use crate::test_support::{
-        add_review_panel, dispatch, excerpt_paths, init_vim_test, is_folded, is_reviewed,
-        open_tree_fixture, path_at_cursor, rhs_editor,
+        add_review_panel, click_selector, dispatch, excerpt_paths, init_vim_test, is_folded,
+        is_reviewed, move_to_row_with_text, open_tree_fixture, path_at_cursor, redraw, rhs_editor,
     };
     use gpui::{TestAppContext, VisualTestContext};
     use settings::DiffViewStyle;
@@ -1800,6 +1924,94 @@ mod tests {
                 status_line(review.filters(), &summary, single_file),
             )
         })
+    }
+
+    /// Hovering a file row swaps its ✓ for a checkbox, which marks the file without selecting
+    /// the row or taking the focus; hovering a comment row shows its edit and delete buttons.
+    #[gpui::test]
+    async fn test_panel_hover_controls(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_tree_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<ReviewPanel>(window, cx)
+        });
+        cx.focus(&review);
+        cx.run_until_parked();
+        let rhs = rhs_editor(&review, cx);
+        let diff_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| rhs.read(cx).focus_handle(cx).is_focused(window))
+        };
+        let hover = |selector: &'static str, cx: &mut VisualTestContext| {
+            redraw(cx);
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} isn't drawn"));
+            cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::none());
+            redraw(cx);
+        };
+        let selected_before = selected(&panel, cx);
+
+        // Not shown until the row is hovered.
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("review-panel-reviewed-src/lib.rs")
+                .is_none()
+        );
+        hover("review-panel-file-status-src/lib.rs", cx);
+        click_selector("review-panel-reviewed-src/lib.rs", cx);
+        assert!(is_reviewed(&review, "src/lib.rs", cx));
+        assert!(is_folded(&review, "src/lib.rs", cx));
+        assert_eq!(selected(&panel, cx), selected_before);
+        assert!(diff_focused(cx));
+        hover("review-panel-reviewed-src/lib.rs", cx);
+        click_selector("review-panel-reviewed-src/lib.rs", cx);
+        assert!(!is_reviewed(&review, "src/lib.rs", cx));
+
+        move_to_row_with_text(&rhs, "LINE 2", cx);
+        cx.simulate_keystrokes("c");
+        cx.simulate_input("two");
+        cx.simulate_keystrokes("ctrl-enter");
+        let id = review.read_with(cx, |review, cx| {
+            review
+                .session()
+                .read(cx)
+                .comments()
+                .iter()
+                .next()
+                .unwrap()
+                .id
+        });
+        let is_editing = |cx: &mut VisualTestContext| {
+            review.read_with(cx, |review, cx| review.comments().read(cx).is_editing(cx))
+        };
+        // The comment's line scrolls away; the edit button brings it back, editing.
+        cx.simulate_keystrokes("G");
+        hover("review-comment-location: two", cx);
+        click_selector(format!("review-panel-edit-comment-{}", id.0).leak(), cx);
+        assert!(is_editing(cx));
+        cx.simulate_input("too ");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert!(!is_editing(cx));
+        let bodies = |cx: &mut VisualTestContext| {
+            review.read_with(cx, |review, cx| {
+                review
+                    .session()
+                    .read(cx)
+                    .comments()
+                    .iter()
+                    .map(|comment| comment.body.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(bodies(cx), ["too two"]);
+
+        hover("review-comment-location: too two", cx);
+        click_selector(format!("review-panel-delete-comment-{}", id.0).leak(), cx);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(bodies(cx).is_empty());
     }
 
     #[gpui::test]

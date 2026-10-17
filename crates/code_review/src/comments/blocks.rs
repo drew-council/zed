@@ -1341,6 +1341,36 @@ impl CommentBlocks {
         self.begin_edit(id, false, Some(editor), window, cx);
     }
 
+    /// The review panel's edit button: the diff moves to the comment (showing its file), then
+    /// its editor opens. A comment the diff doesn't show (its file is hidden) isn't edited.
+    pub(crate) fn land_and_edit(
+        &mut self,
+        id: CommentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = ItemKey::Comment(id);
+        if self
+            .session
+            .read(cx)
+            .comments()
+            .get(id)
+            .is_some_and(|comment| comment.target == CommentTarget::Review)
+        {
+            self.edit(id, window, cx);
+            return true;
+        }
+        if !self.land_on(&key, window, cx) {
+            return false;
+        }
+        let editor = self
+            .hosted
+            .get(&key)
+            .and_then(|hosted| hosted.editor.upgrade());
+        self.begin_edit(id, false, editor, window, cx);
+        true
+    }
+
     fn begin_edit(
         &mut self,
         id: CommentId,
