@@ -42,6 +42,10 @@ impl LineCursor {
                 | EditorEvent::BuffersEdited { .. }
                 | EditorEvent::BufferFoldToggled { .. }
                 | EditorEvent::BufferEdited => this.refresh(cx),
+                // The side that gets the focus is only recorded while the window draws, when
+                // the split editor's notifications don't reach observers: focusing the other
+                // side directly (not with `ctrl-w`) would leave the highlight behind.
+                EditorEvent::Focused => this.sync_split_state(cx),
                 _ => {}
             }),
             cx.observe(&editor, |this, _, cx| this.sync_split_state(cx)),
@@ -293,67 +297,68 @@ fn deleted_row_color(cx: &App) -> Hsla {
 }
 
 #[cfg(test)]
+/// The highlighted cursor rows of `editor`, with the kind of row they were painted as.
+pub(crate) fn cursor_rows(
+    editor: &Entity<Editor>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<(u32, &'static str)> {
+    use editor::ToPoint as _;
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let mut rows = Vec::new();
+        let highlights: [(&'static str, Vec<std::ops::Range<Anchor>>); 3] = [
+            (
+                "context",
+                editor
+                    .highlighted_rows::<CursorRowContext>(cx)
+                    .map(|(range, _)| range)
+                    .collect(),
+            ),
+            (
+                "added",
+                editor
+                    .highlighted_rows::<CursorRowAdded>(cx)
+                    .map(|(range, _)| range)
+                    .collect(),
+            ),
+            (
+                "deleted",
+                editor
+                    .highlighted_rows::<CursorRowDeleted>(cx)
+                    .map(|(range, _)| range)
+                    .collect(),
+            ),
+        ];
+        for (kind, ranges) in highlights {
+            for range in ranges {
+                let start = range.start.to_point(&snapshot).row;
+                let end = range.end.to_point(&snapshot);
+                let end_row = if !range.end.is_max() && end.column == 0 && end.row > start {
+                    end.row - 1
+                } else {
+                    end.row
+                };
+                rows.extend((start..=end_row).map(|row| (row, kind)));
+            }
+        }
+        rows.sort();
+        rows
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{
         add_review_panel, cursor_point, lhs_editor, move_to_row_with_text, open_review_fixture,
         rhs_editor, row_text, splittable,
     };
-    use editor::{SelectionEffects, ToPoint as _, ToggleSplitDiff};
+    use editor::{SelectionEffects, ToggleSplitDiff};
     use gpui::{Focusable as _, TestAppContext, VisualTestContext};
     use settings::DiffViewStyle;
-    use std::ops::Range;
 
     fn init(cx: &mut TestAppContext, diff_view_style: DiffViewStyle) {
         crate::test_support::init_vim_test(cx, diff_view_style);
-    }
-
-    /// The highlighted cursor rows of `editor`, with the kind of row they were painted as.
-    fn cursor_rows(
-        editor: &Entity<Editor>,
-        cx: &mut VisualTestContext,
-    ) -> Vec<(u32, &'static str)> {
-        editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let mut rows = Vec::new();
-            let highlights: [(&'static str, Vec<Range<Anchor>>); 3] = [
-                (
-                    "context",
-                    editor
-                        .highlighted_rows::<CursorRowContext>(cx)
-                        .map(|(range, _)| range)
-                        .collect(),
-                ),
-                (
-                    "added",
-                    editor
-                        .highlighted_rows::<CursorRowAdded>(cx)
-                        .map(|(range, _)| range)
-                        .collect(),
-                ),
-                (
-                    "deleted",
-                    editor
-                        .highlighted_rows::<CursorRowDeleted>(cx)
-                        .map(|(range, _)| range)
-                        .collect(),
-                ),
-            ];
-            for (kind, ranges) in highlights {
-                for range in ranges {
-                    let start = range.start.to_point(&snapshot).row;
-                    let end = range.end.to_point(&snapshot);
-                    let end_row = if !range.end.is_max() && end.column == 0 && end.row > start {
-                        end.row - 1
-                    } else {
-                        end.row
-                    };
-                    rows.extend((start..=end_row).map(|row| (row, kind)));
-                }
-            }
-            rows.sort();
-            rows
-        })
     }
 
     fn scroll_x(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> f64 {
@@ -528,8 +533,24 @@ mod tests {
         assert_eq!(rhs_rows.len(), 1);
         assert_eq!(row_text(&rhs, rhs_rows[0].0, cx), "ONE");
 
-        // The left side is recreated when the diff is split again.
+        // So does focusing a side directly, as moving to a comment does (on a row facing a
+        // spacer, where the right side's cursor can't follow).
         cx.simulate_keystrokes("ctrl-w l");
+        move_to_row_with_text(&rhs, "three", cx);
+        move_to_row_with_text(&lhs, "gone 2", cx);
+        cx.update(|window, cx| window.focus(&lhs.focus_handle(cx), cx));
+        cx.run_until_parked();
+        let lhs_rows = cursor_rows(&lhs, cx);
+        assert_eq!(lhs_rows.len(), 1);
+        assert_eq!(row_text(&lhs, lhs_rows[0].0, cx), "gone 2");
+        move_to_row_with_text(&rhs, "three", cx);
+        cx.update(|window, cx| window.focus(&rhs.focus_handle(cx), cx));
+        cx.run_until_parked();
+        let rhs_rows = cursor_rows(&rhs, cx);
+        assert_eq!(rhs_rows.len(), 1);
+        assert_eq!(row_text(&rhs, rhs_rows[0].0, cx), "three");
+
+        // The left side is recreated when the diff is split again.
         let rhs_row = move_to_row_with_text(&rhs, "three", cx);
         for _ in 0..2 {
             cx.update(|window, cx| {
