@@ -3029,4 +3029,22 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         cx.simulate_keystrokes("v j y");
         assert_eq!(clipboard(cx), "gone 1\ngone 2");
     }
+
+    #[gpui::test]
+    async fn test_enter_types_a_new_line(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("c o n e enter t w o");
+        let editor = open_editor(&review, cx).unwrap();
+        assert_eq!(text(&editor, cx), "one\ntwo");
+        // In normal mode, `enter` is vim's.
+        cx.simulate_keystrokes("escape k enter");
+        assert_eq!(text(&editor, cx), "one\ntwo");
+        assert_eq!(cursor_point(&editor, cx).row, 1);
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!(bodies(&review, cx), ["one\ntwo"]);
+    }
 }
