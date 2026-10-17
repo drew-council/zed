@@ -22,7 +22,9 @@ progress: slice (a), the GitHub client (see "Milestone 7, slice (a)"), is done, 
 hardening pass over the M5 part 2 + M6 review (see "Hardening 2"), then slice (b), pull request
 reviews from the picker with checkout in place or in a new worktree (see "Milestone 7, slice (b)"),
 and slice (c), the pull request's description and its review threads read-only in the diff, with
-GitHub's comment gate (see "Milestone 7, slice (c)"); slice (d) submit is next.** The
+GitHub's comment gate (see "Milestone 7, slice (c)"), then a third hardening pass over the M7 (a) +
+(b) review: token scoping, safe checkouts, Restricted Mode (see "Hardening 3"); slice (d) submit is
+next.** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
@@ -66,9 +68,9 @@ What exists:
 | `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location` |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
 | `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`), the `Forge` trait, `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
-| `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup and cache, `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache; `test_support` (fake GitHub `HttpClient`, fixtures) and tests, an ignored live test |
-| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point M8 calls), the in-place flow, `plan_worktree` and the new-worktree flow. M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment`/`check_comment_target` (the gate); PR review GPUI tests |
-| `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, the pure `plan_checkout` and `head_remote`, `run_checkout` (Zed's fetch and branch switch, plus our own git runner `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
+| `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, host rules (`GitHubHost::{Cloud, Configured, Unverified}`, `GitHubHosts`: user-configured providers, registry hosts, SSH aliases via `ssh -G`), remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup (gh's rules) and cache per (host, work dir), `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache (keyed by every remote URL); `test_support` (fake GitHub `HttpClient`, fixtures, `FakeLookups`) and tests, an ignored live test |
+| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point M8 calls; one at a time per repository, `OpeningPullRequest`), the in-place flow, `plan_worktree_fetch`, `trusts_head_repository` and the new-worktree flow (own `git worktree add --detach`, `trust_worktree`, `repository_at`). M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment`/`check_comment_target` (the gate); PR review GPUI tests |
+| `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, `LocalState` (`read_local_state`/`local_state`: HEAD, base present, local branches + upstreams, read from git), the pure `plan_checkout`, `head_remote`, `RestrictedMode` + `ensure_trusted`, `run_checkout` (Zed's fetch and branch switch, plus our own git jobs: `fast_forward` with the branch check, `ensure_fast_forward`, detach; `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
 | `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
 | `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
@@ -574,30 +576,30 @@ state dir):**
   helper (SSO errors get an "Authorize" button). No `submit_review` yet (slice d).
 - **Resolution** (`resolve_forge(repo, reference, project, cx)`): GitHub remotes from
   `Repository::remote_urls()`, preferred: the branch's upstream remote, `origin`, `upstream`, then by
-  name. A remote is GitHub when its host is `github.com`, ends in `.ghe.com`, or matches the base URL
-  of a hosting provider named "GitHub"/"GitHub Self-Hosted" (Zed registers a self-hosted one from
-  `origin` only when its host contains "github"; providers configured in settings with other names
-  aren't recognised). `RepositoryContext` query → `canonical` = `parent` when `isFork` (**user
+  name. Which remotes are GitHub's, and which hosts get a token: see "Hardening 3" (H1/L5; the
+  original rule, any host of a registry provider named "GitHub"/"GitHub Self-Hosted", sent tokens to
+  look-alike hosts). `RepositoryContext` query → `canonical` = `parent` when `isFork` (**user
   decision: a fork's checkout lists the upstream's PRs**). A `reference` that names a remote's
   repository (case-insensitive) uses that repository as is (no parent); otherwise it must equal the
   canonical repository, else `GitHubError::OtherRepository` ("Open this pull request from a checkout of
   o/r."). No GitHub remote → `GitHubError::Unsupported`. `canonical_https_url` is GitHub's `url`
   (no `.git`), `canonical_ssh_url` its `sshUrl`.
-- **Caches**: forges per (work dir, origin/upstream URLs, branch remote, reference) in the
-  `GitHubForges` global; tokens per host in `GitHubTokens` (`Shared` tasks, so parallel callers share
-  one lookup). A failed lookup or resolution is retried on the next call. A 401 marks the token
-  revoked (`GitHubToken` clones share the flag): the next `resolve_forge` resolves the forge and looks
-  the token up again. **Holders of an `Arc<dyn Forge>` (slice b/c's `PullRequestState`) must call
+- **Caches**: forges per (work dir, every remote's URL, host rules, branch remote, reference) in the
+  `GitHubForges` global; tokens per (host, work dir) in `GitHubLookups` (`Shared` tasks, so parallel
+  callers share one lookup; "Hardening 3" L4/L9). A failed lookup or resolution is retried on the
+  next call. A 401 marks the token revoked (`GitHubToken` clones share the flag): the next
+  `resolve_forge` resolves the forge and looks the token up again. **Holders of an `Arc<dyn Forge>` (slice b/c's `PullRequestState`) must call
   `resolve_forge` again after a `GitHubError::Auth`** to pick up a new token.
 - **Token** (never logged; `GitHubToken`'s `Debug` redacts it; requests are logged at debug level
-  with method, URL, operation and status only): `GITHUB_TOKEN` of Zed's process, then of the
-  project's directory environment (`ProjectEnvironment::directory_environment(work_dir)`, direnv), then
-  `gh auth token --hostname <host>` run with that environment (`kill_on_drop`, 10 s executor timer;
-  stdout trimmed). `GitHubError::Auth { host, failure: Rejected | NoToken | NoTokenNoCli }`: the last
-  one (gh missing) says "or install the GitHub CLI". Tests install a fake source
-  (`github::set_fake_token_source`), so they never read the real environment or run `gh`.
+  with method, URL, operation and status only): gh's rules since "Hardening 3" (H1). `gh auth token
+  --hostname <host>` runs with the project's environment minus the token variables (`kill_on_drop`,
+  10 s executor timer; stdout trimmed). `GitHubError::Auth { host, failure: Rejected(origin) |
+  NoToken | NoTokenNoCli }`: the last one (gh missing) says "or install the GitHub CLI"; a rejected
+  token names its source. Tests install fakes (`github::set_fake_token_source` for gh logins,
+  `set_fake_lookups` for environment variables and SSH aliases too), so they never read the real
+  environment or run `gh`/`ssh`.
 - **Transport**: endpoints `api.github.com` / `api.{H}` (`*.ghe.com`) / `{H}/api/v3` +
-  `{H}/api/graphql` (GHES); headers `Authorization: Bearer`, `Accept: application/vnd.github+json`,
+  `{H}/api/graphql` (GHES; `H` keeps an HTTPS remote's port); headers `Authorization: Bearer`, `Accept: application/vnd.github+json`,
   `X-GitHub-Api-Version: 2022-11-28` (also on GraphQL, accepted live), `Content-Type` on bodies, 30 s
   timeout; GraphQL body `{query: <whole document>, operationName, variables}`. GraphQL connections
   are paged at `hasNextPage` (cap 20 pages); `pulls/N/files?per_page=100&page=k` until a short page
@@ -713,7 +715,9 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   leading `-`, whitespace or control characters (`is_plain_revision`), and git's check-ref-format
   rules (`~^:?*[\`, `..`, `//`, `@{`, `@`, leading/trailing `/`, trailing `.`, components starting
   with `.` or ending in `.lock`). Unicode, `+`, `@` inside are allowed, as git allows them.
-- **Checkout plan** (`checkout::plan_checkout`, pure): HEAD == PR head → nothing (no fetch). A
+- **Checkout plan** (`checkout::plan_checkout`, pure; amended by "Hardening 3": the plan reads a
+  `LocalState` from git, reuses a same-named branch only when it tracks the PR's branch, fast-forwards
+  a named branch, fetches a missing base): HEAD == PR head → nothing (no fetch). A
   remote pointing at the head repository (`head_remote`, C15) → `FetchRemote{R}` (Zed's fetch) →
   `ChangeBranch{"R/head_ref"}` (Zed's `change_branch`: a local tracking branch, checked out) → plus
   `FetchRefspec{canonical, ["refs/heads/{base}"]}` when R isn't the canonical repository (the user's
@@ -736,9 +740,10 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   protocol off), the repository's environment, `GIT_TERMINAL_PROMPT=0`, Zed's askpass
   (`AskPassSession`, `GIT_ASKPASS`/`SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE=force`, unless the environment
   sets `GIT_ASKPASS`; the delegate is a copy of the worktree service's private one with
-  `AskPassModal`), `--end-of-options` before the source/refs. Hints: a rejected non-fast-forward
-  fetch into `pr/N` → "The pull request was force-pushed. Delete the local branch pr/N and try
-  again."; a refused fast-forward → "‹branch› has commits the pull request doesn't have…". **Dirty
+  `AskPassModal`), `--end-of-options` before the source/refs. Hints (since "Hardening 3"): a rejected
+  non-fast-forward fetch into `pr/N`, a diverged branch and a refused fast-forward → "‹branch› has
+  diverged from the pull request: … Rename the branch (`git branch -m …`), then open the pull request
+  again." **Dirty
   tree**: nothing stashes; git carries changes over or refuses, the stderr shows in the error toast
   (Zed's `change_branch` creates the tracking branch before its checkout fails, as in its branch
   picker).
@@ -749,7 +754,9 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   checkout only moves after the user picked the pull request (picker / action). Errors:
   `forge::show_error_toast` (GitHub hint or the git error chain); a success dismisses an earlier
   error toast (`forge::dismiss_error_toast`).
-- **Review in Worktree** (`options.in_new_worktree`, picker `ctrl-enter`): worktree name `pr-N`; an
+- **Review in Worktree** (`options.in_new_worktree`, picker `ctrl-enter`; reworked in "Hardening 3":
+  our own `git worktree add --detach <head oid>` for the PR's repository only, trust only for the
+  repository's own code, an existing `pr-N` moved only after asking): worktree name `pr-N`; an
   existing linked worktree at Zed's path for that name is opened with
   `MultiWorkspace::find_or_create_local_workspace` and the in-place flow runs there. Otherwise
   `plan_worktree`: a head remote → `NewWorktreeBranchTarget::RemoteBranch{R, head_ref}` (Zed's
@@ -936,6 +943,106 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   warning and Closed/Merged badges (no such state on PR A), a HEAD switch moving threads (GPUI tests
   cover them).
 
+**Hardening 3 (M7 slices (a) + (b) review findings, `reviews/M7ab.md` in the orchestrator's state
+dir)** — orchestrator decisions for H1, M1–M4 and the lows; no upstream file changed (new dependency
+`git_hosting_providers`, was a dev-dependency; `zed_actions` dropped):
+
+- **H1, tokens only for GitHub's hosts** (gh's rules): `GitHubHost::Cloud` (github.com, `*.ghe.com`;
+  `ssh.github.com` is github.com) gets `GH_TOKEN`, then `GITHUB_TOKEN` (Zed's environment, then the
+  project's directory environment), then `gh auth token --hostname`. `Configured` (a `github` provider
+  in the **user's** `git_hosting_providers` settings; a project's `.zed/settings.json` never counts)
+  gets `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, then gh. `Unverified` (only Zed's hosting
+  provider registry calls it GitHub's: `origin`'s host containing "github", or a project setting)
+  counts only when `gh` has a login for it, and then gets only that login's token. `gh` runs without
+  the four token variables, so it prints its own login's token; that makes "known to gh" a local check
+  (no network, unlike `gh auth status`). An unverified host without a login → `GitHubError::
+  HostNotConfigured` ("GitHub isn't configured for H. If it is a GitHub Enterprise Server, add it to
+  `git_hosting_providers` in your settings (provider "github") or run `gh auth login --hostname
+  H`."): the picker shows it in the Pull Requests section and nothing is sent anywhere. Picker status
+  rows are truncated with the whole text in a tooltip (the picker's list measures rows unwrapped).
+- **L5**: an HTTPS remote's port is part of the API host (`ghe.corp:8443`; PR URLs keep it too); an
+  SSH remote's port isn't. SSH remotes on hosts that aren't GitHub's by name are resolved with `ssh -G
+  <alias>` (its `hostname`; plain host names only; cached per session), so `github-work` or
+  `github.com-personal` aliases are github.com. A configured provider's `host:port` serves SSH remotes
+  on its host.
+- **L4**: tokens are cached per (host, work dir), so a project's direnv token never serves another
+  project. **L9**: the forge cache key has every remote's URL and the host rules. **N1**: saturating
+  rate-limit arithmetic. **N2**: the SSO "Authorize" button only opens an `https` URL on the host's own
+  web server.
+- **M1**: `FastForward { branch, to }` checks `git symbolic-ref -q HEAD` == `refs/heads/<branch>` in
+  the same git job as `merge --ff-only`, else "Didn't fast-forward B to the pull request's head: X is
+  checked out now (HEAD is detached now). Open the pull request again." The plan's branch, HEAD and
+  branches come from git (`read_local_state`: `revparse_batch` + `branches()` on the job queue), not
+  the snapshot. `open_pull_request` refuses a second open in a repository while one runs ("Another pull
+  request is being opened in this repository. Try again once it is open.").
+- **M2**: a local branch named like the head branch is reused only when its upstream is
+  `refs/remotes/<head remote>/<head_ref>` (`ChangeBranch{head_ref}`: Zed checks the local branch out,
+  no upstream change); any other same-named branch → `refs/pull/N/head` → `pr/N`.
+- **L3**: an existing `pr/N` that isn't checked out is fetched into `FETCH_HEAD`, checked by
+  `EnsureFastForward` (`merge-base --is-ancestor` both ways) before switching, then fast-forwarded: one
+  ahead of the head (own commits on top) stays as it is, like the checked-out case; a diverged one stops
+  with "pr/N has diverged from the pull request: … Rename the branch (`git branch -m pr/N pr/N-old`),
+  then open the pull request again." (never "delete"). A reused tracking branch gets the same check.
+- **L1**: HEAD already at the PR head but the base commit missing → fetch `refs/heads/<base>` from the
+  canonical source. **L2**: `validate_branch_name` rejects `HEAD` and pseudo-refs (all capitals and
+  `_`, ending in `HEAD`: `FETCH_HEAD`, `ORIG_HEAD`, …).
+- **M3**: no git runs to check out a pull request in a repository Zed doesn't trust
+  (`Repository::is_trusted`, Restricted Mode): in place when the plan isn't empty, in a worktree when
+  one is made or moved. `checkout::RestrictedMode` → a toast "This project is in Restricted Mode, so
+  Zed doesn't run git to check out pull requests in it: … Trust the project, then open the pull request
+  again." with a "Trust Project…" button (`workspace::ToggleWorktreeSecurity`). Listing and reading
+  pull requests stays allowed. A linked worktree shares its source checkout's git configuration, so an
+  existing `pr-N` worktree is moved (with its own `-c` restrictions if untrusted) once the source is
+  trusted.
+- **M4 + L6/L7/L8, Review in Worktree**: no longer through `create_worktree_workspace` (it made a
+  worktree for every repository of the project and always propagated trust). It fetches
+  `refs/pull/N/head` + the base into `FETCH_HEAD` in the source repository, runs `git worktree add
+  --detach <loaded head oid>` (`Repository::create_worktree`) for the PR's repository only, opens the
+  path with `MultiWorkspace::find_or_create_local_workspace` and takes the new workspace's repository
+  at that path. The worktree is trusted (`TrustedWorktrees::trust`, then the security modal refreshes)
+  only when the head repository is the base repository or the viewer's own fork; any other fork's
+  worktree gets Zed's standard Restricted Mode prompt. An existing `pr-N` worktree that isn't at the
+  head is moved (`git checkout --detach`) only after a prompt ("Move the worktree pr-N to pull request
+  #N? <path> has B checked out / is at X. … branches stay as they are."). Lost compared to Zed's
+  service: the source workspace's dock layout and open files aren't carried over, and there is no
+  "creating worktree" indicator.
+- **In-place checkout of a stranger's fork** (M4, kept like `gh pr checkout`; documented risk): the
+  checkout keeps the project's trust, so the fork's `.zed/settings.json` (a language server binary,
+  say), its tasks and the build scripts and proc macros language servers run all apply. "Review in
+  Worktree" is the way to read such code. The M8 confirmation says so for fork PRs and names the branch
+  the plan checks out (N4).
+- **N3**: a same-side range thread whose start GitHub's diff doesn't have before its end shows on its
+  last line. **N5**: the toast helper logs "pull request: …". **N6**: no change needed
+  (`active_repository` already toasts "Code review needs a git repository"). **N7**: not changed: our
+  runner uses `git` from the repository environment's `PATH`; Zed's `GitBinary` path isn't reachable
+  through `GitRepository` (would need a core patch).
+- Tests: 9 new (136 total + 1 ignored): host rules (configured with ports, SSH aliases,
+  `ssh.github.com`, look-alikes), `is_host_name`, token precedence per host kind and the rejected/
+  not-configured hints, tokens per host and project, **no request at all to `github.attacker.dev`**
+  (registry auto-registration, GitHub and enterprise tokens in the environment; then configured in
+  user settings → only the enterprise token goes there), a host known to gh, forge cache vs `git
+  remote set-url`, the picker's hint for a look-alike host (zero requests, also for a typed PR),
+  SSO URL checks, saturating headers, `plan_checkout` over `LocalState` (base missing, tracking/own
+  same-named branch, existing/checked-out `pr/N`, `HEAD` names), real git: the fast-forward refusing
+  another checked-out branch or a detached HEAD, `ensure_fast_forward` (behind/ahead/diverged, rename
+  hint), a same-named branch tracking another remote left alone (`RealGitRepository` +
+  `local_state` + Zed's `change_branch`) and a tracking one reused, one open per repository, Restricted
+  Mode refusing in place and in a worktree (the fake fetch would panic). Clippy clean.
+- **Live check** (harness, `validation/hardening3/`; sandbox reads only, nothing posted; leak grep
+  clean): the sandbox picker lists #4/#1/#3/#2 with `GITHUB_TOKEN`; PR #2 with the user's own
+  `fix/truncate-ellipsis` (no upstream, at the base) → `pr/2` at `632ee13`, the user's branch untouched;
+  PR #1 with `feature/template-filters` tracking origin one commit behind → reused and fast-forwarded to
+  `3f22f1b`; "Review in Worktree" #2 → `worktrees/sandbox/pr-2` detached at `632ee13`; that worktree
+  moved to the base in a terminal → reopening asks "Move the worktree pr-2 …" and moves it back. A
+  scratch repository with `origin` `https://github.attacker.dev/x/y` (fake tokens in the environment):
+  the Pull Requests section shows the not-configured hint, the log has the local `gh auth token` check
+  and no request. Trust prompts on (`trust_all_worktrees: false`): staying in Restricted Mode, the
+  picker still lists, opening #2 → the Restricted Mode toast; "Trust Project…" → Zed's modal → trusted
+  → #2 checks out; "Review in Worktree" #1 → the `pr-1` worktree is trusted (no Restricted Mode); in a
+  clone of the public `octocat/Hello-World`, "Review in Worktree" on the fork PR #11572 → the
+  `pr-11572` worktree opens in Restricted Mode with Zed's prompt. Not verified live: the fast-forward
+  branch race, a GHES host, SSH aliases (unit tests cover them).
+
 **Known issues / notes for the next slices:**
 
 - **Notes for slice (d) (submit)**:
@@ -989,8 +1096,8 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
   in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 127 tests
-  + 1 ignored live GitHub test (after M7 slice c; 120 after slice b, 113 after hardening 2, 110 after
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 136 tests
+  + 1 ignored live GitHub test (after hardening 3; 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
   `ITERATIONS=5`; the hardening-2 comment tests under `ITERATIONS=10`).
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
@@ -1009,6 +1116,11 @@ unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency
   pull request review first" elsewhere). Thread line numbers count in HEAD's files: uncommitted edits
   made before a file is first shown shift a thread off its line (anchors only follow edits made
   afterwards).
+- Upstream, outside this crate (seen in hardening 3): Zed's GitHub hosting provider fetches blame
+  avatars from `https://api.{host}/repos/…/commits/…` with `GITHUB_TOKEN` for every GitHub provider,
+  including the "GitHub Self-Hosted" one it registers for any `origin` whose host contains "github"
+  (`git_hosting_providers/src/providers/github.rs`, `fetch_github_commit_author`): the leak H1 fixed in
+  `code_review` exists upstream for blame. Not patched (core).
 - Upstream behaviours seen in slice (b): Zed's `change_branch` splits `remote/branch` at the first
   `/` (remote names with `/` fail); a clone whose fetch refspec lacks the PR branch (single-branch)
   fails with "Branch 'origin/…' not found"; `create_worktree_workspace` creates a worktree for every
@@ -1167,12 +1279,18 @@ over `git rev-parse HEAD`).
   - fork PR → fetch `refs/pull/N/head` into local `pr/<N>`, then checkout;
   - dirty tree → exactly like Zed's branch picker: git carries changes over or refuses, error shown,
     **no auto-stash**;
-  - secondary action **"Review in new worktree"** via Zed's worktree machinery
-    (`crates/git_ui_core/src/worktree_service.rs`, opens as another workspace in the window).
+  - secondary action **"Review in new worktree"** (as built: our own detached `git worktree add`
+    for the PR's repository, opened as another workspace in the window; trusted only for the
+    repository's own code or the viewer's fork, see §0 "Hardening 3");
+  - nothing is checked out in a repository Zed doesn't trust (Restricted Mode); an in-place checkout of
+    a stranger's fork runs its project settings, tasks and build scripts with the project's trust,
+    like `gh pr checkout` (documented risk; the worktree is the safe way to read it).
 - **GitHub access:** in-process via Zed's `HttpClient` (GraphQL for reads, REST for review
-  creation). Token: `GITHUB_TOKEN` env (Zed's existing convention, cf.
-  `crates/http_client/src/github.rs:147`), else one-time `gh auth token` (user's `gh` is logged in
-  with `repo` scope). Signing into Zed with GitHub does **not** give a usable token (the OAuth flow
+  creation). Token (as built, gh's rules): `GH_TOKEN`/`GITHUB_TOKEN` (Zed's or the project's
+  environment) only for github.com and `*.ghe.com`; `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`
+  for an Enterprise Server the user configured in `git_hosting_providers`; else `gh auth token
+  --hostname` (the user's `gh` is logged in with `repo` scope). A host that merely looks like GitHub's
+  gets nothing unless `gh` has a login for it. Signing into Zed with GitHub does **not** give a usable token (the OAuth flow
   returns a zed.dev token; `crates/client/src/client.rs:1430-1551`). API host from the git remote.
   Wrap behind a small provider trait for future forges. git-only VCS (jj later maybe).
 
