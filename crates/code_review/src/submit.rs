@@ -20,7 +20,7 @@ use gpui::{
 };
 use markdown::{Markdown, MarkdownElement};
 use std::ops::RangeInclusive;
-use ui::{KeyBinding, Tooltip, prelude::*};
+use ui::{ElevationIndex, KeyBinding, TintColor, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
 
@@ -725,11 +725,12 @@ impl Render for SubmitReviewModal {
             let selected = self.event == event;
             Button::new(("review-event", event as usize), event.label())
                 .label_size(LabelSize::Small)
+                .layer(ElevationIndex::ModalSurface)
                 .toggle_state(selected)
                 .style(if selected {
-                    ButtonStyle::Filled
+                    ButtonStyle::Tinted(TintColor::Accent)
                 } else {
-                    ButtonStyle::Subtle
+                    ButtonStyle::Outlined
                 })
                 .disabled(!allowed || self.submit_state == SubmitState::Submitting)
                 .when(!allowed, |button| {
@@ -821,6 +822,16 @@ impl Render for SubmitReviewModal {
                     ),
             )
             .child(h_flex().gap_1().children(event_buttons))
+            .when(self.own_pull_request, |modal| {
+                modal.child(
+                    Label::new(
+                        "You wrote this pull request: GitHub doesn't let you approve it or \
+                         request changes on it.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+            })
             .child(self.render_counts())
             .child(
                 v_flex()
@@ -862,6 +873,7 @@ impl Render for SubmitReviewModal {
                     .child(
                         Button::new("submit-review-cancel", "Cancel")
                             .label_size(LabelSize::Small)
+                            .layer(ElevationIndex::ModalSurface)
                             .key_binding(KeyBinding::for_action_in(
                                 &menu::Cancel,
                                 &focus_handle,
@@ -872,6 +884,7 @@ impl Render for SubmitReviewModal {
                     .child(
                         Button::new("submit-review-confirm", confirm_label)
                             .label_size(LabelSize::Small)
+                            .layer(ElevationIndex::ModalSurface)
                             .style(ButtonStyle::Filled)
                             .disabled(matches!(action, SubmitAction::Blocked | SubmitAction::Busy))
                             .key_binding(KeyBinding::for_action_in(
@@ -1217,13 +1230,11 @@ mod review_tests {
         assert_eq!(
             posted(&requests),
             [
-                format!(
-                    "POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews"
-                ),
+                "POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews"
+                    .to_string(),
                 "AddFileThread".to_string(),
-                format!(
-                    "POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews/9/events"
-                ),
+                "POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews/9/events"
+                    .to_string(),
             ]
         );
         let review_post = requests
