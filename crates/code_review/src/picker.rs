@@ -100,7 +100,7 @@ impl StartReviewModal {
                         picker.refresh(window, cx);
                     })
                 })
-                .ok();
+                .log_err();
             }),
             cx.spawn_in(window, async move |this, cx| {
                 let commits = match recent_commits.await {
@@ -116,7 +116,7 @@ impl StartReviewModal {
                         picker.refresh(window, cx);
                     })
                 })
-                .ok();
+                .log_err();
             }),
         ];
 
@@ -169,7 +169,6 @@ pub(crate) enum RecentCommits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Section {
     Local,
-    // Milestone 7 adds the pull request section after the local one.
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,7 +371,6 @@ impl StartReviewDelegate {
             }
             entries.extend(status.map(Entry::Status));
         }
-        // Milestone 7 appends the pull request section here.
         self.entries = entries;
 
         let wanted_key =
@@ -434,13 +432,13 @@ impl StartReviewDelegate {
 
     fn render_commit(
         &self,
-        ix: usize,
-        index: usize,
+        entry_index: usize,
+        commit_index: usize,
         positions: &[usize],
         selected: bool,
         checkbox: Option<AnyElement>,
     ) -> Option<AnyElement> {
-        let commit = self.recent_commits().get(index)?;
+        let commit = self.recent_commits().get(commit_index)?;
         let sha = commit.sha.display_short();
         let subject_start = sha.len() + 1;
         let author_start = subject_start + commit.subject.len() + 1;
@@ -463,7 +461,7 @@ impl StartReviewDelegate {
             time_format::TimestampFormat::Relative,
         );
         Some(
-            ListItem::new(("start-review-commit", ix))
+            ListItem::new(("start-review-commit", entry_index))
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
@@ -531,16 +529,21 @@ impl PickerDelegate for StartReviewDelegate {
 
     fn set_selected_index(
         &mut self,
-        ix: usize,
+        index: usize,
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) {
-        self.selected_index = ix;
+        self.selected_index = index;
     }
 
-    fn can_select(&self, ix: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) -> bool {
+    fn can_select(
+        &self,
+        index: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> bool {
         self.entries
-            .get(ix)
+            .get(index)
             .is_some_and(|entry| entry.key().is_some())
     }
 
@@ -607,8 +610,8 @@ impl PickerDelegate for StartReviewDelegate {
         true
     }
 
-    fn is_item_selected(&self, ix: usize) -> bool {
-        match self.entries.get(ix) {
+    fn is_item_selected(&self, index: usize) -> bool {
+        match self.entries.get(index) {
             Some(Entry::Commit { index, .. }) => self.selection.contains(*index),
             _ => false,
         }
@@ -616,11 +619,11 @@ impl PickerDelegate for StartReviewDelegate {
 
     fn toggle_item_selected(
         &mut self,
-        ix: usize,
+        entry_index: usize,
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        if let Some(Entry::Commit { index, .. }) = self.entries.get(ix) {
+        if let Some(Entry::Commit { index, .. }) = self.entries.get(entry_index) {
             self.selection.toggle(*index);
             cx.notify();
         }
@@ -656,20 +659,20 @@ impl PickerDelegate for StartReviewDelegate {
 
     fn render_match(
         &self,
-        ix: usize,
+        entry_index: usize,
         selected: bool,
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let row = |label: AnyElement| {
-            ListItem::new(("start-review-entry", ix))
+            ListItem::new(("start-review-entry", entry_index))
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
                 .child(label)
                 .into_any_element()
         };
-        match self.entries.get(ix)? {
+        match self.entries.get(entry_index)? {
             Entry::Header(Section::Local) => Some(
                 div()
                     .pt_1()
@@ -687,10 +690,10 @@ impl PickerDelegate for StartReviewDelegate {
             )
             .into_any_element())),
             Entry::Commit { index, positions } => {
-                self.render_commit(ix, *index, positions, selected, None)
+                self.render_commit(entry_index, *index, positions, selected, None)
             }
             Entry::Status(text) => Some(
-                ListItem::new(("start-review-status", ix))
+                ListItem::new(("start-review-status", entry_index))
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
                     .child(Label::new(text.clone()).color(Color::Muted))
@@ -702,17 +705,17 @@ impl PickerDelegate for StartReviewDelegate {
     /// Only commits take part in the range selection, so only they get a checkbox.
     fn render_match_with_checkbox(
         &self,
-        ix: usize,
+        entry_index: usize,
         selected: bool,
         checkbox: AnyElement,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        match self.entries.get(ix)? {
+        match self.entries.get(entry_index)? {
             Entry::Commit { index, positions } => {
-                self.render_commit(ix, *index, positions, selected, Some(checkbox))
+                self.render_commit(entry_index, *index, positions, selected, Some(checkbox))
             }
-            _ => self.render_match(ix, selected, window, cx),
+            _ => self.render_match(entry_index, selected, window, cx),
         }
     }
 

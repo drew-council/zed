@@ -363,7 +363,7 @@ impl CommitDiffList {
                         cx.emit(BranchDiffEvent::FileListChanged);
                         cx.notify();
                     })
-                    .ok();
+                    .log_err();
                 }
             }
         });
@@ -690,7 +690,7 @@ fn snapshot_file_status(status: &TreeDiffStatus) -> FileStatus {
     })
 }
 
-// Copied from `DiffBufferList`, where it is private.
+// `DiffBufferList`'s version is private.
 fn tree_status_to_file_status(status: &TreeDiffStatus) -> FileStatus {
     let status_code = match status {
         TreeDiffStatus::Added => StatusCode::Added,
@@ -703,8 +703,8 @@ fn tree_status_to_file_status(status: &TreeDiffStatus) -> FileStatus {
     })
 }
 
-// `GitBlob`, `worktree_id_for_repo_path`, `build_buffer` and `build_buffer_diff` are adapted from
-// `git_ui`'s `CommitView`, where they are crate-private.
+// `GitBlob`, `project_path_for_repo_path`, `build_buffer` and `build_buffer_diff` are adapted
+// from `git_ui`'s `CommitView`, where they are crate-private.
 
 /// The file of a historic buffer. It isn't local, so no language server attaches to it.
 struct GitBlob {
@@ -804,7 +804,7 @@ async fn build_buffer(
         Some(language) => language_registry
             .load_language(language)
             .await
-            .ok()
+            .log_err()
             .and_then(|language| language.log_err()),
         None => None,
     };

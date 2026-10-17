@@ -540,9 +540,16 @@ impl ReviewDiff {
             }
             if was_empty {
                 editor.rhs_editor().update(cx, |editor, cx| {
-                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                        s.select_ranges([multi_buffer::Anchor::Min..multi_buffer::Anchor::Min])
-                    });
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([
+                                multi_buffer::Anchor::Min..multi_buffer::Anchor::Min
+                            ])
+                        },
+                    );
                 });
             }
         });
@@ -1091,23 +1098,23 @@ impl Render for ReviewDiff {
             .items_center()
             .justify_center()
             .size_full()
-            .when(is_empty && is_loading, |el| {
+            .when(is_empty && is_loading, |element| {
                 let rems = TextSize::Large.rems(cx);
-                el.child(
+                element.child(
                     Icon::new(IconName::LoadCircle)
                         .size(IconSize::Custom(rems))
                         .color(Color::Accent)
                         .with_rotate_animation(3),
                 )
             })
-            .when(is_empty && !is_loading, |el| {
+            .when(is_empty && !is_loading, |element| {
                 let focus_handle = self.focus_handle.clone();
-                el.child(
+                element.child(
                     v_flex()
                         .gap_1()
                         .child(h_flex().justify_around().child(Label::new(empty_label)))
-                        .when(self.all_hidden_label.is_some(), |el| {
-                            el.child(
+                        .when(self.all_hidden_label.is_some(), |element| {
+                            element.child(
                                 h_flex().justify_around().child(
                                     Label::new(
                                         "Change the filters in the review panel to see them",
@@ -1136,7 +1143,7 @@ impl Render for ReviewDiff {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |element| element.child(self.editor.clone()))
     }
 }
 

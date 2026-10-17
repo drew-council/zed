@@ -17,8 +17,8 @@ pub(crate) struct CodeReviewDb(ThreadSafeConnection);
 impl Domain for CodeReviewDb {
     const NAME: &str = stringify!(CodeReviewDb);
 
-    // Never edit a migration that has shipped; append new ones. Milestone 5 appends the draft
-    // comments table (`code_review_comments`, keyed by `review_key` like the tables below).
+    // Never edit a migration that has shipped; append new ones. Zed's other databases share this
+    // migrator, so a changed migration makes all of them fall back to memory.
     const MIGRATIONS: &[&str] = &[sql!(
         CREATE TABLE code_review_sessions(
             review_key TEXT PRIMARY KEY,

@@ -452,7 +452,7 @@ impl ReviewView {
                         cx.emit(EditorEvent::TitleChanged);
                         cx.notify();
                     })
-                    .ok();
+                    .log_err();
                 })
             }
             ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } => Task::ready(()),
@@ -689,7 +689,7 @@ impl ReviewView {
                 this.recompute_hidden(window, cx);
                 cx.notify();
             })
-            .ok();
+            .log_err();
         });
     }
 
@@ -869,7 +869,7 @@ impl ReviewView {
                             cx,
                         )
                     })
-                    .ok();
+                    .log_err();
             }
         }
     }

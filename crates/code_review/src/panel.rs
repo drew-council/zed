@@ -354,7 +354,7 @@ impl ReviewPanel {
                 }
                 directory.push_str(component);
                 let name = SharedString::from(component.to_string());
-                let path = RepoPath::new(&directory).ok();
+                let path = RepoPath::new(&directory).log_err();
                 node = node
                     .children
                     .entry(name.clone())
@@ -495,7 +495,7 @@ impl ReviewPanel {
             .update(cx, |_, window, cx| {
                 review.update(cx, |review, cx| review.reveal_file(path_key, window, cx));
             })
-            .ok();
+            .log_err();
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -1097,7 +1097,7 @@ impl ReviewPanel {
                             .menu(move |window, cx| {
                                 panel
                                     .update(cx, |panel, cx| panel.build_menu(None, window, cx))
-                                    .ok()
+                                    .log_err()
                             }),
                     ),
             )
@@ -1142,8 +1142,8 @@ impl ReviewPanel {
                     .child(Label::new(review.diff().read(cx).empty_label(cx)).color(Color::Muted))
                     .when(
                         filters.include.is_some() || filters.exclude.is_some(),
-                        |el| {
-                            el.child(
+                        |element| {
+                            element.child(
                                 Button::new("review-panel-clear-filters", "Clear Filters")
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(ClearFilters.boxed_clone(), cx)
@@ -1151,24 +1151,24 @@ impl ReviewPanel {
                             )
                         },
                     )
-                    .when(summary.reviewed_hidden > 0, |el| {
-                        el.child(
+                    .when(summary.reviewed_hidden > 0, |element| {
+                        element.child(
                             Button::new("review-panel-show-reviewed", "Show Reviewed Files")
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(ToggleHideReviewed.boxed_clone(), cx)
                                 }),
                         )
                     })
-                    .when(summary.generated_hidden > 0, |el| {
-                        el.child(
+                    .when(summary.generated_hidden > 0, |element| {
+                        element.child(
                             Button::new("review-panel-show-generated", "Show Generated Files")
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(ToggleShowGenerated.boxed_clone(), cx)
                                 }),
                         )
                     })
-                    .when(summary.vendored_hidden > 0, |el| {
-                        el.child(
+                    .when(summary.vendored_hidden > 0, |element| {
+                        element.child(
                             Button::new("review-panel-show-vendored", "Show Vendored Files")
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(ToggleShowVendored.boxed_clone(), cx)
@@ -1302,8 +1302,8 @@ fn render_prompt(prompt: &Prompt, cx: &App) -> impl IntoElement {
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
                 .child(div().flex_1().child(prompt.editor.clone())),
         )
-        .when_some(prompt.error.clone(), |el, error| {
-            el.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+        .when_some(prompt.error.clone(), |element, error| {
+            element.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
         })
 }
 

@@ -8,7 +8,7 @@ use markdown::{Markdown, MarkdownElement};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{Disclosure, Tooltip, WithScrollbar as _, prelude::*};
-use util::truncate_and_trailoff;
+use util::{ResultExt as _, truncate_and_trailoff};
 
 /// The fixed header above a review's diff: the commit messages of a commit review, or the base of
 /// a branch review. It sits outside the editor because a custom block can't go above the first
@@ -188,7 +188,7 @@ impl ReviewTopBlock {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.view
                             .update(cx, |view, cx| view.open_base_picker(window, cx))
-                            .ok();
+                            .log_err();
                     })),
             )
             .into_any_element()

@@ -67,7 +67,7 @@ impl ReviewSession {
                 .log_err()
                 .unwrap_or_default();
             this.update(cx, |this, cx| this.apply_stored_marks(marks, cx))
-                .ok();
+                .log_err();
         });
         Self {
             key,

@@ -6,6 +6,7 @@ use language::{BufferId, Point};
 use multi_buffer::MultiBufferRow;
 use std::ops::Range;
 use ui::{Checkbox, ElevationIndex, KeyBinding, Tooltip, prelude::*};
+use util::ResultExt as _;
 
 struct ReviewedHunkAdded;
 struct ReviewedHunkDeleted;
@@ -35,7 +36,7 @@ pub(crate) fn render_file_checkbox(
             let view = view.downgrade();
             move |_, _, cx| {
                 view.update(cx, |view, cx| view.toggle_file(&repo_path, cx))
-                    .ok();
+                    .log_err();
                 cx.stop_propagation();
             }
         });
@@ -119,7 +120,7 @@ impl DiffHunkRenderer for ReviewHunkRenderer {
                         view.update(cx, |view, cx| {
                             view.toggle_hunk(&repo_path, hunk_key.clone(), cx)
                         })
-                        .ok();
+                        .log_err();
                     }
                 }),
             )

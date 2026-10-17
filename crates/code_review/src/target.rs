@@ -5,7 +5,7 @@ use gpui::SharedString;
 use project::git_store::RepositorySnapshot;
 use std::fmt;
 
-/// What a review covers. Pull request targets will be added alongside these.
+/// What a review covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReviewTarget {
     /// HEAD → working tree, staged and unstaged changes together.
