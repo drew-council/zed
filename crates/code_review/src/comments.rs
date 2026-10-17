@@ -1,7 +1,9 @@
 mod blocks;
+mod remote;
 mod view;
 
-pub(crate) use blocks::{CommentBlocks, CommentBlocksEvent};
+pub(crate) use blocks::{CommentBlocks, CommentBlocksEvent, ItemKey, RemoteItem, RemoteKey};
+pub(crate) use remote::{RemoteThreadContent, thread_location};
 
 use anyhow::{Context as _, Result};
 use git::repository::RepoPath;

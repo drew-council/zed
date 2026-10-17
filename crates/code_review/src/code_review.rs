@@ -48,7 +48,8 @@ actions!(
         TogglePullRequestFilter,
         /// Changes the base the current branch review compares against.
         ChangeBase,
-        /// Shows or hides the commit messages at the top of a commit review.
+        /// Shows or hides the commit messages at the top of a commit review, or the description
+        /// and reviews at the top of a pull request review.
         ToggleHeader,
         /// Toggles focus on the review panel.
         ToggleFocus,
@@ -108,8 +109,23 @@ actions!(
         /// Shows or hides vendored files (`linguist-vendored` in `.gitattributes`), which are
         /// hidden by default.
         ToggleShowVendored,
-        /// Copies the name of the reviewed repository's current branch.
+        /// Copies the name of the reviewed repository's current branch (a pull request's head
+        /// branch in a pull request review).
         CopyBranchName,
+        /// Copies the URL of the pull request under review.
+        CopyPullRequestUrl,
+        /// Opens the pull request under review on GitHub.
+        OpenPullRequestInBrowser,
+        /// Loads the pull request under review from GitHub again: its description, review
+        /// threads and diff.
+        ReloadPullRequest,
+        /// Shows or hides the resolved review threads of the pull request under review.
+        ToggleResolvedThreads,
+        /// Shows or hides the outdated review threads of the pull request under review.
+        ToggleOutdatedThreads,
+        /// Shows or hides the review threads and review summaries bots wrote on the pull request
+        /// under review.
+        ToggleBotReviews,
         /// Searches the review panel's files by path.
         SearchPaths,
         /// Selects the next file matching the review panel's path search.

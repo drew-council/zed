@@ -1,8 +1,14 @@
 use crate::{
-    comments::CommentBlocks, commits::CommitChain, diff::ReviewDiff, forge::ForgeRepo,
-    pull_request::PullRequestState, target::CommitRange, view::ReviewView,
+    comments::CommentBlocks,
+    commits::CommitChain,
+    diff::ReviewDiff,
+    forge::{ForgeRepo, PullRequestStatus, RemoteReviewSummary, ReviewDecision, ReviewState},
+    pull_request::{PullRequestState, ThreadFilters},
+    target::CommitRange,
+    view::ReviewView,
 };
 use anyhow::Result;
+use collections::HashMap;
 use editor::hover_markdown_style;
 use git::repository::CommitData;
 use gpui::{Entity, FontWeight, ScrollHandle, Subscription, WeakEntity};
@@ -10,23 +16,29 @@ use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
-use ui::{Disclosure, Tooltip, WithScrollbar as _, prelude::*};
+use ui::{Checkbox, Disclosure, ToggleState, Tooltip, WithScrollbar as _, prelude::*};
 use util::{ResultExt as _, truncate_and_trailoff};
 
-/// The fixed header above a review's diff: the commit messages of a commit review, or the base of
-/// a branch review, then the review-level comments. It sits outside the editor because a custom
-/// block can't go above the first file header, and editor blocks are lost whenever the left side
-/// of a split diff is recreated.
+/// The fixed header above a review's diff: the commit messages of a commit review, the base of a
+/// branch review, or a pull request's description and reviews, then the review-level comments.
+/// It sits outside the editor because a custom block can't go above the first file header, and
+/// editor blocks are lost whenever the left side of a split diff is recreated.
 pub(crate) struct ReviewTopBlock {
     content: TopBlockContent,
     expanded: bool,
     view: WeakEntity<ReviewView>,
     diff: Entity<ReviewDiff>,
     comments: Entity<CommentBlocks>,
+    language_registry: Arc<LanguageRegistry>,
+    /// A pull request's description and review summaries, rendered.
+    markdown: HashMap<SharedString, Entity<Markdown>>,
     scroll_handle: ScrollHandle,
     comments_scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
+
+/// The key of a pull request description's markdown; summaries are keyed by their id.
+const DESCRIPTION_KEY: &str = "description";
 
 pub(crate) enum TopBlockContent {
     None,
@@ -67,6 +79,7 @@ impl ReviewTopBlock {
         view: WeakEntity<ReviewView>,
         diff: Entity<ReviewDiff>,
         comments: Entity<CommentBlocks>,
+        language_registry: Arc<LanguageRegistry>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut subscriptions = vec![
@@ -78,18 +91,79 @@ impl ReviewTopBlock {
             state: Some(state), ..
         } = &content
         {
-            subscriptions.push(cx.observe(state, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(state, |this, _, cx| {
+                this.sync_pull_request_markdown(cx);
+                cx.notify();
+            }));
         }
-        Self {
+        // A pull request's description is what the review is about; commit messages stay out
+        // of the way until asked for.
+        let expanded = matches!(content, TopBlockContent::PullRequest { .. });
+        let mut this = Self {
             content,
-            expanded: false,
+            expanded,
             view,
             diff,
             comments,
+            language_registry,
+            markdown: HashMap::default(),
             scroll_handle: ScrollHandle::new(),
             comments_scroll_handle: ScrollHandle::new(),
             _subscriptions: subscriptions,
+        };
+        this.sync_pull_request_markdown(cx);
+        this
+    }
+
+    /// Renders the pull request's description and summaries again where their text changed.
+    fn sync_pull_request_markdown(&mut self, cx: &mut Context<Self>) {
+        let TopBlockContent::PullRequest {
+            state: Some(state), ..
+        } = &self.content
+        else {
+            return;
+        };
+        let state = state.read(cx);
+        let sources = std::iter::once((
+            SharedString::from(DESCRIPTION_KEY),
+            state.details().body.clone(),
+        ))
+        .chain(
+            state
+                .visible_summaries()
+                .map(|summary| (summary.id.clone(), summary.body.clone())),
+        )
+        .collect::<Vec<_>>();
+        let mut previous = std::mem::take(&mut self.markdown);
+        for (key, source) in sources {
+            let markdown = match previous.remove(&key) {
+                Some(markdown) => {
+                    if markdown.read(cx).source() != source.as_ref() {
+                        markdown.update(cx, |markdown, cx| markdown.replace(source, cx));
+                    }
+                    markdown
+                }
+                None => {
+                    let language_registry = self.language_registry.clone();
+                    cx.new(|cx| Markdown::new(source, Some(language_registry), None, cx))
+                }
+            };
+            self.markdown.insert(key, markdown);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_source(&self, key: &str, cx: &App) -> Option<SharedString> {
+        self.markdown
+            .get(key)
+            .map(|markdown| markdown.read(cx).source().to_string().into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn markdown_keys(&self) -> Vec<SharedString> {
+        let mut keys = self.markdown.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
 
     #[cfg(test)]
@@ -244,15 +318,33 @@ impl ReviewTopBlock {
         repo: &ForgeRepo,
         number: u64,
         state: Option<&Entity<PullRequestState>>,
-        cx: &App,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let details = state.map(|state| state.read(cx).details());
+        let Some(state) = state else {
+            return Label::new(format!("{repo}#{number}"))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element();
+        };
+        let (details, summaries, hidden_bot_summaries, load_errors) = {
+            let pull_request = state.read(cx);
+            (
+                pull_request.details().clone(),
+                pull_request
+                    .visible_summaries()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                pull_request.hidden_bot_summaries(),
+                pull_request.load_errors().to_vec(),
+            )
+        };
         // Another branch checked out, or the pull request moved on.
         let local_head = self
             .view
             .upgrade()
             .and_then(|view| view.read(cx).head_sha(cx));
-        let moved_head = details.zip(local_head).and_then(|(details, local_head)| {
+        let moved_head = local_head.and_then(|local_head| {
             (details.head_oid.to_string() != local_head.as_ref()).then(|| {
                 format!(
                     "Checked out {}, pull request head {}",
@@ -261,45 +353,258 @@ impl ReviewTopBlock {
                 )
             })
         });
-        h_flex()
+        let state_badge = if details.is_draft {
+            Some(("Draft", Color::Muted))
+        } else {
+            match details.state {
+                PullRequestStatus::Open => None,
+                PullRequestStatus::Closed => Some(("Closed", Color::Error)),
+                PullRequestStatus::Merged => Some(("Merged", Color::Accent)),
+            }
+        };
+        let decision = details.review_decision.map(|decision| match decision {
+            ReviewDecision::Approved => ("Approved", Color::Success),
+            ReviewDecision::ChangesRequested => ("Changes requested", Color::Error),
+            ReviewDecision::ReviewRequired => ("Review required", Color::Muted),
+        });
+        let url = details.url.clone();
+        let header = h_flex()
             .gap_1()
             .min_w_0()
             .child(
-                Label::new(format!("{repo}#{number}"))
+                Disclosure::new("review-pull-request-description", self.expanded)
+                    .tooltip(Tooltip::text(if self.expanded {
+                        "Hide Description"
+                    } else {
+                        "Show Description"
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
+            )
+            .child(
+                Label::new(details.title.clone())
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::SEMIBOLD)
+                    .truncate(),
+            )
+            .child(
+                Label::new(format!("#{number}"))
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .flex_none(),
             )
-            .when_some(details, |line, details| {
-                line.child(
-                    Label::new(details.title.clone())
-                        .size(LabelSize::Small)
-                        .truncate(),
-                )
-                .child(
-                    Label::new(format!(
-                        "{} wants to merge {} into {}",
-                        details.author.login, details.head_ref, details.base_ref
+            .children(state_badge.map(|(label, color)| badge(label, color, cx)))
+            .child(
+                Label::new(format!(
+                    "{} wants to merge {} into {}",
+                    details.author.login, details.head_ref, details.base_ref
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .truncate(),
+            )
+            .children(decision.map(|(label, color)| badge(label, color, cx)))
+            .child(div().flex_1())
+            .child(
+                IconButton::new("review-pull-request-open", IconName::ArrowUpRight)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Open on GitHub"))
+                    .on_click({
+                        let url = url.clone();
+                        move |_, _, cx| cx.open_url(&url)
+                    }),
+            );
+        let warnings = moved_head
+            .into_iter()
+            .chain(
+                details
+                    .pending_review
+                    .is_some()
+                    .then(|| "You have a pending review on GitHub".to_string()),
+            )
+            .map(|warning| {
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Label::new(warning)
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        let body = self.expanded.then(|| {
+            let markdown_style = hover_markdown_style(window, cx);
+            let timezone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+            let description = self
+                .markdown
+                .get(DESCRIPTION_KEY)
+                .filter(|_| !details.body.trim().is_empty())
+                .cloned();
+            let summaries = summaries
+                .iter()
+                .filter_map(|summary| {
+                    let markdown = self.markdown.get(&summary.id)?.clone();
+                    Some(render_summary(
+                        summary,
+                        markdown,
+                        timezone,
+                        markdown_style.clone(),
+                        cx,
                     ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .truncate(),
-                )
-            })
-            .when_some(moved_head, |line, moved_head| {
-                line.child(
-                    Icon::new(IconName::Warning)
-                        .size(IconSize::XSmall)
-                        .color(Color::Warning),
+                })
+                .collect::<Vec<_>>();
+            v_flex()
+                .gap_1()
+                .child(
+                    Button::new("review-pull-request-url", url.clone())
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .tooltip(Tooltip::text("Open on GitHub"))
+                        .on_click({
+                            let url = url.clone();
+                            move |_, _, cx| cx.open_url(&url)
+                        }),
                 )
                 .child(
-                    Label::new(moved_head)
+                    div()
+                        .relative()
+                        .w_full()
+                        .child(
+                            v_flex()
+                                .id("review-pull-request-description-text")
+                                .w_full()
+                                .gap_1()
+                                .max_h(window.line_height() * 12.)
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll_handle)
+                                .child(match description {
+                                    Some(description) => div()
+                                        .w_full()
+                                        .text_sm()
+                                        .child(MarkdownElement::new(description, markdown_style))
+                                        .into_any_element(),
+                                    None => Label::new("No description provided.")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .into_any_element(),
+                                })
+                                .when(!summaries.is_empty(), |list| {
+                                    list.child(
+                                        Label::new("Reviews")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(summaries)
+                                })
+                                .when(hidden_bot_summaries > 0, |list| {
+                                    list.child(
+                                        Label::new(if hidden_bot_summaries == 1 {
+                                            "1 bot review hidden".to_string()
+                                        } else {
+                                            format!("{hidden_bot_summaries} bot reviews hidden")
+                                        })
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                }),
+                        )
+                        .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+                )
+                .child(self.render_thread_filters(state, cx))
+                .children(load_errors.iter().map(|error| {
+                    Label::new(error.clone())
                         .size(LabelSize::Small)
-                        .color(Color::Warning)
-                        .flex_none(),
+                        .color(Color::Error)
+                }))
+        });
+
+        v_flex()
+            .gap_1()
+            .child(header)
+            .children(warnings)
+            .children(body)
+            .into_any_element()
+    }
+
+    /// "Show threads: Resolved (n) · Outdated (n) · Bots (n)", and Reload.
+    fn render_thread_filters(
+        &self,
+        state: &Entity<PullRequestState>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let pull_request = state.read(cx);
+        let filters = pull_request.filters();
+        let counts = pull_request.thread_counts();
+        let is_loading = pull_request.is_loading();
+        let toggle =
+            |id: &'static str, label: String, checked: bool, update: fn(&mut ThreadFilters)| {
+                let state = state.downgrade();
+                Checkbox::new(id, ToggleState::from(checked))
+                    .label(label)
+                    .label_size(LabelSize::Small)
+                    .on_click(move |_, _, cx| {
+                        state
+                            .update(cx, |pull_request, cx| {
+                                let mut filters = pull_request.filters();
+                                update(&mut filters);
+                                pull_request.set_filters(filters, cx);
+                            })
+                            .log_err();
+                    })
+            };
+        h_flex()
+            .gap_3()
+            .child(
+                Label::new("Show:")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(toggle(
+                "review-show-resolved-threads",
+                format!("Resolved threads ({})", counts.resolved),
+                filters.show_resolved,
+                |filters| filters.show_resolved = !filters.show_resolved,
+            ))
+            .child(toggle(
+                "review-show-outdated-threads",
+                format!("Outdated threads ({})", counts.outdated),
+                filters.show_outdated,
+                |filters| filters.show_outdated = !filters.show_outdated,
+            ))
+            .child(toggle(
+                "review-show-bot-reviews",
+                format!("Bots ({})", counts.bots),
+                filters.show_bots,
+                |filters| filters.show_bots = !filters.show_bots,
+            ))
+            .child(div().flex_1())
+            .when(is_loading, |row| {
+                row.child(
+                    Label::new("Loading from GitHub…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 )
             })
-            .into_any_element()
+            .child(
+                Button::new("review-reload-pull-request", "Reload")
+                    .label_size(LabelSize::Small)
+                    .disabled(is_loading)
+                    .tooltip(Tooltip::text("Load the Pull Request from GitHub Again"))
+                    .on_click({
+                        let state = state.downgrade();
+                        move |_, _, cx| {
+                            state
+                                .update(cx, |pull_request, cx| pull_request.reload(cx))
+                                .log_err();
+                        }
+                    }),
+            )
     }
 
     fn render_commits(
@@ -376,6 +681,71 @@ impl ReviewTopBlock {
     }
 }
 
+fn badge(label: &'static str, color: Color, cx: &App) -> impl IntoElement {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(color.color(cx).opacity(0.6))
+        .child(Label::new(label).size(LabelSize::XSmall).color(color))
+}
+
+fn render_summary(
+    summary: &RemoteReviewSummary,
+    markdown: Entity<Markdown>,
+    timezone: UtcOffset,
+    markdown_style: markdown::MarkdownStyle,
+    cx: &App,
+) -> AnyElement {
+    let state = match summary.state {
+        ReviewState::Commented => "commented",
+        ReviewState::Approved => "approved",
+        ReviewState::ChangesRequested => "requested changes",
+        ReviewState::Dismissed => "review dismissed",
+    };
+    let time = summary.submitted_at.map(|submitted_at| {
+        time_format::format_localized_timestamp(
+            submitted_at,
+            OffsetDateTime::now_utc(),
+            timezone,
+            time_format::TimestampFormat::Relative,
+        )
+    });
+    v_flex()
+        .w_full()
+        .py_1()
+        .border_t_1()
+        .border_color(cx.theme().colors().border_variant)
+        .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Label::new(summary.author.login.clone())
+                        .size(LabelSize::Small)
+                        .weight(FontWeight::SEMIBOLD),
+                )
+                .when(summary.author.is_bot, |line| {
+                    line.child(badge("Bot", Color::Muted, cx))
+                })
+                .child(
+                    Label::new(match time {
+                        Some(time) => format!("{state} · {time}"),
+                        None => state.to_string(),
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                ),
+        )
+        .child(
+            div()
+                .pt_0p5()
+                .text_sm()
+                .child(MarkdownElement::new(markdown, markdown_style)),
+        )
+        .into_any_element()
+}
+
 fn render_commit(
     commit: &TopBlockCommit,
     timezone: UtcOffset,
@@ -443,7 +813,10 @@ impl Render for ReviewTopBlock {
                 repo,
                 number,
                 state,
-            } => Some(self.render_pull_request(repo, *number, state.as_ref(), cx)),
+            } => {
+                let (repo, number, state) = (repo.clone(), *number, state.clone());
+                Some(self.render_pull_request(&repo, number, state.as_ref(), window, cx))
+            }
         };
         let review_comments = self.comments.read(cx).review_comment_views(cx);
         if content.is_none() && review_comments.is_empty() {

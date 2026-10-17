@@ -1,13 +1,14 @@
 use crate::{
     ClearExcludeFilter, ClearFilters, ClearIncludeFilter, CollapseSelectedEntry, CopyBranchName,
-    EditExcludeFilter, EditIncludeFilter, ExpandSelectedEntry, FocusPanel, ReviewUncommitted,
-    ReviewView, SearchPaths, SelectNextMatch, SelectPreviousMatch, ToggleFileReviewed, ToggleFocus,
-    ToggleHideReviewed, TogglePanel, ToggleSelectedDirectory, ToggleShowGenerated,
-    ToggleShowVendored,
-    comments::CommentId,
+    CopyPullRequestUrl, EditExcludeFilter, EditIncludeFilter, ExpandSelectedEntry, FocusPanel,
+    OpenPullRequestInBrowser, ReloadPullRequest, ReviewUncommitted, ReviewView, SearchPaths,
+    SelectNextMatch, SelectPreviousMatch, ToggleBotReviews, ToggleFileReviewed, ToggleFocus,
+    ToggleHideReviewed, ToggleOutdatedThreads, TogglePanel, ToggleResolvedThreads,
+    ToggleSelectedDirectory, ToggleShowGenerated, ToggleShowVendored,
+    comments::ItemKey,
     view::{
-        PanelComment, PanelFile, ReviewFilters, ReviewSummary, current_review, filter_regex,
-        focus_diff,
+        PanelComment, PanelCommentKey, PanelFile, ReviewFilters, ReviewSummary,
+        current_pull_request, current_review, filter_regex, focus_diff,
     },
 };
 use anyhow::Result;
@@ -79,7 +80,7 @@ pub(crate) fn register(workspace: &mut Workspace) {
         let Some(review) = current_review(workspace, cx) else {
             return;
         };
-        match review.read(cx).branch_name(cx) {
+        match review.read(cx).branch_name_to_copy(cx) {
             Some(branch) => cx.write_to_clipboard(ClipboardItem::new_string(branch.to_string())),
             None => workspace.show_toast(
                 Toast::new(
@@ -89,6 +90,12 @@ pub(crate) fn register(workspace: &mut Workspace) {
                 .autohide(),
                 cx,
             ),
+        }
+    });
+    workspace.register_action(|workspace, _: &CopyPullRequestUrl, _, cx| {
+        if let Some(pull_request) = current_pull_request(workspace, cx) {
+            let url = pull_request.read(cx).details().url.to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(url));
         }
     });
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -196,7 +203,7 @@ impl TreeEntry {
             TreeEntry::Directory { path, .. } => EntryKey::Directory(path.clone()),
             TreeEntry::File { file, .. } => EntryKey::File(file.path_key.clone()),
             TreeEntry::CommentsHeader { .. } => EntryKey::CommentsHeader,
-            TreeEntry::Comment(comment) => EntryKey::Comment(comment.id),
+            TreeEntry::Comment(comment) => EntryKey::Comment(comment.key.clone()),
         }
     }
 
@@ -210,7 +217,7 @@ enum EntryKey {
     Directory(RepoPath),
     File(PathKey),
     CommentsHeader,
-    Comment(CommentId),
+    Comment(PanelCommentKey),
 }
 
 #[derive(Default)]
@@ -581,8 +588,8 @@ impl ReviewPanel {
         }
     }
 
-    /// Like `]t`: the diff moves to a line or file comment and takes the focus. A review comment
-    /// opens for editing.
+    /// Like `]t`: the diff moves to a line or file comment, or a thread, and takes the focus. A
+    /// review comment opens for editing.
     fn open_comment(
         &mut self,
         comment: &PanelComment,
@@ -598,12 +605,13 @@ impl ReviewPanel {
             });
         }
         let blocks = review.read(cx).comments().clone();
-        let id = comment.id;
-        if comment.is_review {
+        if comment.is_review
+            && let ItemKey::Comment(id) = comment.item
+        {
             blocks.update(cx, |blocks, cx| blocks.edit(id, window, cx));
             return;
         }
-        let landed = blocks.update(cx, |blocks, cx| blocks.land_on(id, window, cx));
+        let landed = blocks.update(cx, |blocks, cx| blocks.land_on(&comment.item, window, cx));
         if !landed {
             self.show_toast("This comment's lines aren't in the diff", cx);
         }
@@ -925,7 +933,13 @@ impl ReviewPanel {
             .unwrap_or_default();
         let has_branch = review
             .as_ref()
-            .is_some_and(|review| review.read(cx).branch_name(cx).is_some());
+            .is_some_and(|review| review.read(cx).branch_name_to_copy(cx).is_some());
+        let thread_filters = review.as_ref().and_then(|review| {
+            review
+                .read(cx)
+                .pull_request()
+                .map(|pull_request| pull_request.read(cx).filters())
+        });
         let project_path = file
             .as_ref()
             .zip(review.as_ref())
@@ -992,12 +1006,48 @@ impl ReviewPanel {
                 "Clear Filters",
                 ClearFilters.boxed_clone(),
             )
+            .when_some(thread_filters, |menu, thread_filters| {
+                menu.separator()
+                    .toggleable_entry(
+                        "Show Resolved Threads",
+                        thread_filters.show_resolved,
+                        IconPosition::Start,
+                        Some(ToggleResolvedThreads.boxed_clone()),
+                        |window, cx| {
+                            window.dispatch_action(ToggleResolvedThreads.boxed_clone(), cx)
+                        },
+                    )
+                    .toggleable_entry(
+                        "Show Outdated Threads",
+                        thread_filters.show_outdated,
+                        IconPosition::Start,
+                        Some(ToggleOutdatedThreads.boxed_clone()),
+                        |window, cx| {
+                            window.dispatch_action(ToggleOutdatedThreads.boxed_clone(), cx)
+                        },
+                    )
+                    .toggleable_entry(
+                        "Show Bot Reviews",
+                        thread_filters.show_bots,
+                        IconPosition::Start,
+                        Some(ToggleBotReviews.boxed_clone()),
+                        |window, cx| window.dispatch_action(ToggleBotReviews.boxed_clone(), cx),
+                    )
+                    .action("Reload Pull Request", ReloadPullRequest.boxed_clone())
+                    .action(
+                        "Open Pull Request in Browser",
+                        OpenPullRequestInBrowser.boxed_clone(),
+                    )
+            })
             .separator()
             .action_disabled_when(
                 !has_branch,
                 "Copy Branch Name",
                 CopyBranchName.boxed_clone(),
             )
+            .when(thread_filters.is_some(), |menu| {
+                menu.action("Copy Pull Request URL", CopyPullRequestUrl.boxed_clone())
+            })
         })
     }
 
@@ -1159,7 +1209,16 @@ impl ReviewPanel {
                 )
                 .into_any_element(),
             TreeEntry::Comment(comment) => {
-                let muted = comment.outdated || comment.submitted;
+                let muted = comment.outdated || comment.submitted || comment.remote;
+                let state = if comment.remote && comment.resolved {
+                    Some(("resolved", Color::Muted))
+                } else if comment.outdated {
+                    Some(("outdated", Color::Warning))
+                } else if comment.submitted {
+                    Some(("submitted", Color::Muted))
+                } else {
+                    None
+                };
                 ListItem::new(("review-comment", index))
                     .spacing(ListItemSpacing::Sparse)
                     .toggle_state(selected)
@@ -1170,20 +1229,27 @@ impl ReviewPanel {
                             .color(comment_type.color())
                             .buffer_font(cx)
                             .into_any_element(),
-                        None => Icon::new(IconName::Chat)
-                            .size(IconSize::Small)
-                            .color(Color::Muted)
-                            .into_any_element(),
+                        None => Icon::new(if comment.remote {
+                            IconName::Github
+                        } else {
+                            IconName::Chat
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .into_any_element(),
                     })
                     .child(
                         h_flex()
                             .min_w_0()
                             .gap_1()
+                            // Where the comment is matters more than how it starts.
                             .child(
-                                Label::new(comment.location.clone())
-                                    .size(LabelSize::Small)
-                                    .color(if muted { Color::Muted } else { Color::Default })
-                                    .truncate(),
+                                div().flex_none().max_w(relative(0.6)).child(
+                                    Label::new(comment.location.clone())
+                                        .size(LabelSize::Small)
+                                        .color(if muted { Color::Muted } else { Color::Default })
+                                        .truncate(),
+                                ),
                             )
                             .child(
                                 Label::new(comment.first_line.clone())
@@ -1192,23 +1258,15 @@ impl ReviewPanel {
                                     .truncate(),
                             ),
                     )
-                    .when(comment.outdated || comment.submitted, |item| {
-                        item.end_slot(
-                            Label::new(if comment.outdated {
-                                "outdated"
-                            } else {
-                                "submitted"
-                            })
-                            .size(LabelSize::XSmall)
-                            .color(if comment.outdated {
-                                Color::Warning
-                            } else {
-                                Color::Muted
-                            }),
-                        )
+                    .when_some(state, |item, (state, color)| {
+                        item.end_slot(Label::new(state).size(LabelSize::XSmall).color(color))
                     })
                     .tooltip({
-                        let location = comment.location.clone();
+                        let location = if comment.remote {
+                            SharedString::from(format!("{} (on GitHub)", comment.location))
+                        } else {
+                            comment.location.clone()
+                        };
                         move |_, cx| Tooltip::simple(location.clone(), cx)
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {

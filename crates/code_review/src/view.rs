@@ -1,11 +1,15 @@
 use crate::{
     AddComment, AddFileComment, AddReviewComment, ChangeBase, CopyCommentAtCursor,
     CopyReviewAsMarkdown, CopySelectedLines, DeleteComment, EditComment, FocusDiff, FocusPanel,
-    NextComment, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor, PreviousComment,
-    PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
-    ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
-    ToggleHunkReviewed, ToggleSingleFileMode,
-    comments::{CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType},
+    NextComment, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
+    OpenPullRequestInBrowser, PreviousComment, PreviousFile, PreviousHunk, PreviousUnreviewedFile,
+    ReloadPullRequest, ReviewBranch, ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft,
+    ScrollRight, ToggleBotReviews, ToggleFileReviewed, ToggleHeader, ToggleHunkReviewed,
+    ToggleOutdatedThreads, ToggleResolvedThreads, ToggleSingleFileMode,
+    comments::{
+        CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
+        RemoteItem, RemoteKey, RemoteThreadContent, Side, thread_location,
+    },
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
         resolve_commit_spec,
@@ -15,7 +19,9 @@ use crate::{
     gitattributes::{FileAttributes, GitAttributes},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
-    pull_request::PullRequestState,
+    pull_request::{
+        PullRequestEvent, PullRequestState, ThreadFilters, ThreadPlacement, place_thread,
+    },
     reviewed::paint_reviewed_hunks,
     session::{ReviewKey, ReviewSession, ReviewSessionEvent},
     target::{BranchBase, ReviewTarget, parse_commit_spec},
@@ -28,7 +34,7 @@ use editor::{
     actions::{OpenExcerpts, ReloadFile, ToggleSoftWrap},
     scroll::Autoscroll,
 };
-use git::{repository::RepoPath, status::FileStatus};
+use git::{Oid, repository::RepoPath, status::FileStatus};
 use git_ui::branch_picker::{self, SelectBranchCallback};
 use gpui::{
     Action as _, AnyEntity, ClipboardItem, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
@@ -43,6 +49,7 @@ use project::{
 use regex::{Regex, RegexBuilder};
 use std::{
     any::{Any, TypeId},
+    collections::BTreeMap,
     sync::Arc,
 };
 use ui::{KeyBinding, prelude::*};
@@ -87,6 +94,67 @@ pub(crate) fn register(workspace: &mut Workspace) {
             cx,
         );
     });
+    workspace.register_action(|workspace, _: &ToggleResolvedThreads, _, cx| {
+        update_thread_filters(workspace, cx, |filters| {
+            filters.show_resolved = !filters.show_resolved
+        });
+    });
+    workspace.register_action(|workspace, _: &ToggleOutdatedThreads, _, cx| {
+        update_thread_filters(workspace, cx, |filters| {
+            filters.show_outdated = !filters.show_outdated
+        });
+    });
+    workspace.register_action(|workspace, _: &ToggleBotReviews, _, cx| {
+        update_thread_filters(workspace, cx, |filters| {
+            filters.show_bots = !filters.show_bots
+        });
+    });
+    workspace.register_action(|workspace, _: &ReloadPullRequest, _, cx| {
+        if let Some(pull_request) = current_pull_request(workspace, cx) {
+            pull_request.update(cx, |pull_request, cx| pull_request.reload(cx));
+        }
+    });
+    workspace.register_action(|workspace, _: &OpenPullRequestInBrowser, _, cx| {
+        if let Some(pull_request) = current_pull_request(workspace, cx) {
+            let url = pull_request.read(cx).details().url.clone();
+            cx.open_url(&url);
+        }
+    });
+}
+
+/// The pull request of the current review, or a toast saying it isn't a pull request review.
+pub(crate) fn current_pull_request(
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<PullRequestState>> {
+    let pull_request =
+        current_review(workspace, cx).and_then(|review| review.read(cx).pull_request().cloned());
+    if pull_request.is_none() {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::unique::<PullRequestState>(),
+                "Open a pull request review first",
+            )
+            .autohide(),
+            cx,
+        );
+    }
+    pull_request
+}
+
+/// Changes which threads the current pull request review shows, in all its tabs.
+fn update_thread_filters(
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+    update: impl FnOnce(&mut ThreadFilters),
+) {
+    if let Some(pull_request) = current_pull_request(workspace, cx) {
+        pull_request.update(cx, |pull_request, cx| {
+            let mut filters = pull_request.filters();
+            update(&mut filters);
+            pull_request.set_filters(filters, cx);
+        });
+    }
 }
 
 /// The repository reviews act on, or a toast saying there is none.
@@ -288,6 +356,56 @@ fn block_write_action(window: &mut Window, cx: &mut App) {
     discard_vim_count(window, cx);
 }
 
+/// The repository's HEAD commit, as Zed last saw it.
+fn head_oid(repo: &Entity<Repository>, cx: &App) -> Option<Oid> {
+    repo.read(cx)
+        .head_commit
+        .as_ref()
+        .and_then(|commit| commit.sha.parse().ok())
+}
+
+/// The pull request's threads the filters let through, where a review with `local_head` checked
+/// out shows them: below their lines, or in their file's item of outdated and moved threads
+/// (after the inline ones, by path).
+fn remote_items(
+    pull_request: &Entity<PullRequestState>,
+    local_head: Option<Oid>,
+    cx: &App,
+) -> Vec<RemoteItem> {
+    let pull_request = pull_request.read(cx);
+    let filters = pull_request.filters();
+    let commentable = pull_request.commentable();
+    let mut items = Vec::new();
+    let mut moved = BTreeMap::<RepoPath, Vec<RemoteThreadContent>>::new();
+    for thread in pull_request.threads() {
+        match place_thread(thread, local_head, commentable, filters) {
+            None => {}
+            Some(ThreadPlacement::Inline(target)) => items.push(RemoteItem {
+                key: RemoteKey::Thread(thread.id.clone()),
+                target,
+                title: None,
+                threads: vec![RemoteThreadContent {
+                    thread: thread.clone(),
+                    location: thread_location(thread, false),
+                }],
+            }),
+            Some(ThreadPlacement::Moved { path }) => {
+                moved.entry(path).or_default().push(RemoteThreadContent {
+                    thread: thread.clone(),
+                    location: thread_location(thread, true),
+                })
+            }
+        }
+    }
+    items.extend(moved.into_iter().map(|(path, threads)| RemoteItem {
+        key: RemoteKey::Moved(path.clone()),
+        target: CommentTarget::File { path },
+        title: Some(format!("Outdated / moved threads ({})", threads.len()).into()),
+        threads,
+    }));
+    items
+}
+
 /// A file as the review panel lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PanelFile {
@@ -298,16 +416,27 @@ pub(crate) struct PanelFile {
     pub attributes: FileAttributes,
 }
 
-/// A comment as the review panel lists it.
+/// A comment, or a thread of the pull request, as the review panel lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PanelComment {
-    pub id: CommentId,
+    pub key: PanelCommentKey,
+    /// What Enter lands on: a file's outdated and moved threads share one block.
+    pub item: ItemKey,
     pub is_review: bool,
     pub comment_type: Option<CommentType>,
     pub location: SharedString,
     pub first_line: SharedString,
     pub outdated: bool,
     pub submitted: bool,
+    /// A thread on GitHub (read-only).
+    pub remote: bool,
+    pub resolved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PanelCommentKey {
+    Comment(CommentId),
+    Thread(SharedString),
 }
 
 /// Which files a review tab shows. Per tab and not persisted (like tuicr's filters).
@@ -495,8 +624,17 @@ impl ReviewView {
             )
         });
         let view = cx.weak_entity();
-        let top_block =
-            cx.new(|cx| ReviewTopBlock::new(content, view, diff.clone(), comments.clone(), cx));
+        let language_registry = project.read(cx).languages().clone();
+        let top_block = cx.new(|cx| {
+            ReviewTopBlock::new(
+                content,
+                view,
+                diff.clone(),
+                comments.clone(),
+                language_registry,
+                cx,
+            )
+        });
         let load_commits_task = match &target {
             ReviewTarget::Commits(range) => {
                 let chain = first_parent_chain(
@@ -557,8 +695,14 @@ impl ReviewView {
                             this.diff.update(cx, |diff, cx| diff.check_base(cx));
                             this.update_session(window, cx);
                         }
+                        // Threads are placed by the checked-out commit, and the pull request may
+                        // have moved on too.
                         ReviewTarget::PullRequest(_) => {
                             this.diff.update(cx, |diff, cx| diff.check_base(cx));
+                            this.update_remote_items(window, cx);
+                            if let Some(pull_request) = &this.pull_request {
+                                pull_request.update(cx, |pull_request, cx| pull_request.reload(cx));
+                            }
                         }
                         ReviewTarget::Uncommitted | ReviewTarget::Commits(_) => return,
                     }
@@ -572,6 +716,15 @@ impl ReviewView {
                 cx.emit(EditorEvent::TitleChanged);
                 cx.notify();
             }));
+            subscriptions.push(cx.subscribe_in(
+                pull_request,
+                window,
+                |this, _, _: &PullRequestEvent, window, cx| this.update_remote_items(window, cx),
+            ));
+            let items = remote_items(pull_request, head_oid(&repo, cx), cx);
+            comments.update(cx, |comments, cx| {
+                comments.set_remote_items(items, window, cx)
+            });
         }
         let splittable = diff.read(cx).editor().clone();
         subscriptions.extend([
@@ -621,6 +774,19 @@ impl ReviewView {
 
     pub(crate) fn session(&self) -> &Entity<ReviewSession> {
         &self.session
+    }
+
+    /// Shows the pull request's threads again (they, the filters or the checked-out commit
+    /// changed).
+    fn update_remote_items(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pull_request) = &self.pull_request else {
+            return;
+        };
+        let items = remote_items(pull_request, head_oid(&self.repo, cx), cx);
+        self.comments.update(cx, |comments, cx| {
+            comments.set_remote_items(items, window, cx)
+        });
+        cx.notify();
     }
 
     /// Switches to the session of the review's current key (the base or branch changed).
@@ -1208,9 +1374,18 @@ impl ReviewView {
         }
     }
 
-    #[cfg(test)]
+    /// The pull request a pull request review is of.
     pub(crate) fn pull_request(&self) -> Option<&Entity<PullRequestState>> {
         self.pull_request.as_ref()
+    }
+
+    /// The branch name "Copy Branch Name" copies: a pull request's head branch, else the
+    /// repository's current branch (`None` when HEAD is detached).
+    pub(crate) fn branch_name_to_copy(&self, cx: &App) -> Option<SharedString> {
+        match &self.pull_request {
+            Some(pull_request) => Some(pull_request.read(cx).details().head_ref.clone()),
+            None => self.branch_name(cx),
+        }
     }
 
     /// Moves a pull request review to the pull request's base commit in `target`, when it's
@@ -1829,46 +2004,111 @@ impl ReviewView {
         );
     }
 
-    /// The comments the review panel lists: review comments first, then by file in review order,
-    /// file comments before line comments, those by their last line. Comments still being
-    /// written for the first time (without text) aren't listed.
+    /// The comments and threads the review panel lists: review comments first, then by file in
+    /// review order, file comments and threads before line ones, those by their last line (a
+    /// thread before a comment). Comments still being written for the first time (without text)
+    /// aren't listed.
     pub(crate) fn panel_comments(&self, cx: &App) -> Vec<PanelComment> {
-        let mut comments = self
+        let line_of = |target: &CommentTarget| match target {
+            CommentTarget::Lines { lines, .. } => Some(*lines.end()),
+            CommentTarget::Review | CommentTarget::File { .. } => None,
+        };
+        let mut rows = self
             .session
             .read(cx)
             .comments()
             .iter()
             .filter(|comment| !comment.body.is_empty())
-            .collect::<Vec<_>>();
-        comments.sort_by_key(|comment| {
-            let path_key = comment.target.path().map(review_path_key);
-            let line = match &comment.target {
-                CommentTarget::Lines { lines, .. } => Some(*lines.end()),
-                CommentTarget::Review | CommentTarget::File { .. } => None,
-            };
-            (path_key, line, comment.id)
-        });
-        comments
-            .into_iter()
-            .map(|comment| PanelComment {
-                id: comment.id,
-                is_review: comment.target == CommentTarget::Review,
-                comment_type: comment.comment_type,
-                location: comment
-                    .location()
-                    .unwrap_or_else(|| "Review".to_string())
-                    .into(),
-                first_line: comment
-                    .body
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string()
-                    .into(),
-                outdated: comment.is_outdated(),
-                submitted: comment.is_submitted(),
+            .map(|comment| {
+                let sort_key = (
+                    comment.target.path().map(review_path_key),
+                    line_of(&comment.target),
+                    true,
+                    comment.id.0,
+                );
+                let row = PanelComment {
+                    key: PanelCommentKey::Comment(comment.id),
+                    item: ItemKey::Comment(comment.id),
+                    is_review: comment.target == CommentTarget::Review,
+                    comment_type: comment.comment_type,
+                    location: comment
+                        .location()
+                        .unwrap_or_else(|| "Review".to_string())
+                        .into(),
+                    first_line: comment
+                        .body
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                        .into(),
+                    outdated: comment.is_outdated(),
+                    submitted: comment.is_submitted(),
+                    remote: false,
+                    resolved: false,
+                };
+                (sort_key, row)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let comments = self.comments.read(cx);
+        let mut thread_index = 0u64;
+        for (key, target, view) in comments.remote_items() {
+            let is_moved = matches!(key, RemoteKey::Moved(_));
+            for thread in view.read(cx).threads() {
+                let location = match target {
+                    CommentTarget::Lines { path, side, lines } if !is_moved => {
+                        let marker = match side {
+                            Side::Old => "~",
+                            Side::New => "",
+                        };
+                        let path = path.as_unix_str();
+                        if lines.start() == lines.end() {
+                            format!("{path}:{marker}{}", lines.end())
+                        } else {
+                            format!("{path}:{marker}{}-{marker}{}", lines.start(), lines.end())
+                        }
+                    }
+                    _ => target
+                        .path()
+                        .map(|path| path.as_unix_str().to_string())
+                        .unwrap_or_default(),
+                };
+                let first_comment = thread.comments.first();
+                let first_line = first_comment
+                    .map(|comment| {
+                        format!(
+                            "{}: {}",
+                            comment.author.login,
+                            comment.body.lines().next().unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default();
+                let sort_key = (
+                    target.path().map(review_path_key),
+                    if is_moved { None } else { line_of(target) },
+                    false,
+                    thread_index,
+                );
+                thread_index += 1;
+                rows.push((
+                    sort_key,
+                    PanelComment {
+                        key: PanelCommentKey::Thread(thread.id.clone()),
+                        item: ItemKey::Remote(key.clone()),
+                        is_review: false,
+                        comment_type: None,
+                        location: location.into(),
+                        first_line: first_line.into(),
+                        outdated: thread.is_outdated || is_moved,
+                        submitted: false,
+                        remote: true,
+                        resolved: thread.is_resolved,
+                    },
+                ));
+            }
+        }
+        rows.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
+        rows.into_iter().map(|(_, row)| row).collect()
     }
 
     /// Compares anchors: a cursor on a folded file's header resolves to the whole folded file.

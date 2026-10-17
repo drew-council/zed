@@ -1849,6 +1849,24 @@ pub(crate) mod test_support {
         (client, requests)
     }
 
+    /// A pull request's files as `GET pulls/N/files` lists them (one page).
+    pub(crate) fn changed_files_fixture(text: &str) -> CommentableLines {
+        let entries: Vec<FileEntry> = serde_json::from_str(text).unwrap();
+        CommentableLines::new(entries.into_iter().map(changed_file), false)
+    }
+
+    /// PR A's review threads, parsed.
+    pub(crate) fn pr1_threads() -> Vec<RemoteThread> {
+        let (http, _) = fake_github(|_| Reply::json(PR1_THREADS));
+        let client = GitHubClient::new(http, "github.com".into(), GitHubToken::new(TOKEN));
+        let repo = ForgeRepo {
+            host: "github.com".into(),
+            owner: "drew-council".into(),
+            name: "code-review-sandbox".into(),
+        };
+        futures::executor::block_on(client.review_threads(&repo, 1)).unwrap()
+    }
+
     pub(crate) fn repository_context_reply(request: &SentRequest) -> Reply {
         let variables = request.variables();
         let repository = |name_with_owner: &str, parent: Value| {

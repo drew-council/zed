@@ -1,5 +1,6 @@
 use super::{
     Comment, CommentEvent, CommentId, CommentTarget, CommentType, NewComment, Side,
+    remote::{RemoteThreadContent, RemoteThreadView},
     view::{CommentView, EditingState, Leave},
 };
 use crate::{
@@ -18,7 +19,7 @@ use editor::{
 use futures::FutureExt as _;
 use git::repository::RepoPath;
 use gpui::{
-    DispatchPhase, Entity, EntityId, EventEmitter, Focusable as _, Global, PromptLevel,
+    AnyView, DispatchPhase, Entity, EntityId, EventEmitter, Focusable as _, Global, PromptLevel,
     Subscription, WeakEntity,
 };
 use language::{
@@ -51,8 +52,11 @@ pub(crate) struct CommentBlocks {
     workspace: WeakEntity<Workspace>,
     language_registry: Arc<LanguageRegistry>,
     views: HashMap<CommentId, Entity<CommentView>>,
-    /// The blocks showing line and file comments in the diff.
-    hosted: HashMap<CommentId, HostedBlock>,
+    /// The pull request's threads this tab shows (pull request reviews only), with their anchors
+    /// in this tab's buffers.
+    remote: HashMap<RemoteKey, RemoteBlock>,
+    /// The blocks showing line and file comments, and threads, in the diff.
+    hosted: HashMap<ItemKey, HostedBlock>,
     anchors: TabAnchors,
     /// The anchors of the sessions this tab showed before (another base or branch), by session,
     /// for when it switches back: they followed the edits made meanwhile.
@@ -60,14 +64,54 @@ pub(crate) struct CommentBlocks {
     /// The left side of a split diff is recreated on every split (also when the pane gets wide
     /// enough) and dropped on unsplit; its blocks go with it.
     lhs_editor_id: Option<EntityId>,
-    /// The comment `]t`/`[t` moved to, which tells comments below the same row apart while the
-    /// cursor stays on it.
-    selected: Option<CommentId>,
-    targeted: Option<CommentId>,
+    /// The comment or thread `]t`/`[t` moved to, which tells those below the same row apart while
+    /// the cursor stays on it.
+    selected: Option<ItemKey>,
+    targeted: Option<ItemKey>,
     focus_guard: Option<Subscription>,
     _session_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
 }
+
+/// What a block of the diff shows: a comment of the review, or threads of the pull request on
+/// GitHub. Threads come first where both are at the same place.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ItemKey {
+    Remote(RemoteKey),
+    Comment(CommentId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum RemoteKey {
+    Thread(SharedString),
+    /// A file's outdated and moved threads, in one block at the file.
+    Moved(RepoPath),
+}
+
+/// Threads of the pull request at one place of the diff, as the review tab is told to show
+/// them: one thread below its lines or at its file, or a file's outdated and moved threads at the
+/// file.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RemoteItem {
+    pub key: RemoteKey,
+    /// Lines (numbered in the checked-out files) or a file.
+    pub target: CommentTarget,
+    pub title: Option<SharedString>,
+    pub threads: Vec<RemoteThreadContent>,
+}
+
+struct RemoteBlock {
+    target: CommentTarget,
+    view: Entity<RemoteThreadView>,
+    /// A line thread's lines in this tab's buffer of their side, anchored when its file is first
+    /// shown, so that they follow edits.
+    anchor: Option<Range<language::Anchor>>,
+    /// Blocks at the same place are in this order.
+    order: usize,
+}
+
+/// Comments come after the threads at the same place, in creation order.
+const COMMENT_BLOCK_PRIORITY: usize = 1 << 20;
 
 /// The side of the diff a block is in. Old-side comments are on the left side of a split diff
 /// and on the removed rows of a unified one; everything else is on the right side.
@@ -209,6 +253,7 @@ impl CommentBlocks {
             workspace,
             language_registry,
             views: HashMap::default(),
+            remote: HashMap::default(),
             hosted: HashMap::default(),
             anchors: TabAnchors::default(),
             parked_anchors: HashMap::default(),
@@ -345,9 +390,65 @@ impl CommentBlocks {
             }
             cx.emit(CommentBlocksEvent::EditingChanged);
         }
-        if self.targeted == Some(id) {
+        if self.targeted == Some(ItemKey::Comment(id)) {
             self.targeted = None;
         }
+    }
+
+    /// Shows the pull request's threads (`items`) instead of those shown so far.
+    pub(crate) fn set_remote_items(
+        &mut self,
+        items: Vec<RemoteItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut previous = std::mem::take(&mut self.remote);
+        for (order, item) in items.into_iter().enumerate() {
+            let block = match previous.remove(&item.key) {
+                Some(mut block) => {
+                    block.view.update(cx, |view, cx| {
+                        view.set_threads(item.title, item.threads, cx)
+                    });
+                    if block.target != item.target {
+                        block.target = item.target;
+                        block.anchor = None;
+                    }
+                    block.order = order;
+                    block
+                }
+                None => {
+                    let language_registry = self.language_registry.clone();
+                    let view = cx.new(|cx| {
+                        RemoteThreadView::new(item.title, item.threads, language_registry, cx)
+                    });
+                    RemoteBlock {
+                        target: item.target,
+                        view,
+                        anchor: None,
+                        order,
+                    }
+                }
+            };
+            self.remote.insert(item.key, block);
+        }
+        if self.selected.as_ref().is_some_and(
+            |key| matches!(key, ItemKey::Remote(remote) if !self.remote.contains_key(remote)),
+        ) {
+            self.selected = None;
+        }
+        self.reconcile(window, cx);
+        cx.notify();
+    }
+
+    /// The pull request's threads this tab shows, in the order they were given.
+    pub(crate) fn remote_items(
+        &self,
+    ) -> impl Iterator<Item = (&RemoteKey, &CommentTarget, &Entity<RemoteThreadView>)> {
+        let mut items = self.remote.iter().collect::<Vec<_>>();
+        items.sort_by_key(|(_, block)| block.order);
+        items
+            .into_iter()
+            .map(|(key, block)| (key, &block.target, &block.view))
     }
 
     fn rhs_editor(&self, cx: &App) -> Entity<Editor> {
@@ -431,6 +532,20 @@ impl CommentBlocks {
         })
     }
 
+    fn item_target(&self, key: &ItemKey, cx: &App) -> Option<CommentTarget> {
+        match key {
+            ItemKey::Comment(id) => Some(self.session.read(cx).comments().get(*id)?.target.clone()),
+            ItemKey::Remote(key) => Some(self.remote.get(key)?.target.clone()),
+        }
+    }
+
+    fn item_view(&self, key: &ItemKey) -> Option<AnyView> {
+        match key {
+            ItemKey::Comment(id) => Some(self.views.get(id)?.clone().into()),
+            ItemKey::Remote(key) => Some(self.remote.get(key)?.view.clone().into()),
+        }
+    }
+
     fn remove_all_blocks(&mut self, cx: &mut App) {
         let mut blocks_by_editor = HashMap::<EntityId, (WeakEntity<Editor>, HashSet<_>)>::default();
         for (_, hosted) in self.hosted.drain() {
@@ -460,7 +575,7 @@ impl CommentBlocks {
             let session = self.session.read(cx);
             let diff = self.diff.read(cx);
             let hosts = Hosts::new(&rhs, lhs.as_ref(), cx);
-            session
+            let comments = session
                 .comments()
                 .iter()
                 .filter(|comment| self.is_listed(comment, cx))
@@ -470,10 +585,15 @@ impl CommentBlocks {
                         .lines
                         .get(&comment.id)
                         .map(|anchor| &anchor.range);
-                    let (host, placement) = placement(comment, anchor, &hosts, diff, cx)?;
-                    Some((comment.id, (host, placement)))
-                })
-                .collect::<HashMap<_, _>>()
+                    let (host, placement) = placement(&comment.target, anchor, &hosts, diff, cx)?;
+                    Some((ItemKey::Comment(comment.id), (host, placement)))
+                });
+            let remote = self.remote.iter().filter_map(|(key, block)| {
+                let (host, placement) =
+                    placement(&block.target, block.anchor.as_ref(), &hosts, diff, cx)?;
+                Some((ItemKey::Remote(key.clone()), (host, placement)))
+            });
+            comments.chain(remote).collect::<HashMap<_, _>>()
         };
         let current_editor = |host: Host| match host {
             Host::Rhs => Some(rhs.entity_id()),
@@ -491,7 +611,9 @@ impl CommentBlocks {
                     .or_insert_with(|| (hosted.editor.clone(), HashSet::default()))
                     .1
                     .insert(hosted.block);
-                if !desired.contains_key(id) {
+                if let ItemKey::Comment(id) = id
+                    && !desired.contains_key(&ItemKey::Comment(*id))
+                {
                     unhosted.push(*id);
                 }
             }
@@ -499,15 +621,29 @@ impl CommentBlocks {
         });
         let mut new_blocks = desired
             .into_iter()
-            .filter(|(id, _)| !self.hosted.contains_key(id))
-            .filter_map(|(id, (host, placement))| {
-                Some((host, id, placement, self.views.get(&id)?.clone()))
+            .filter(|(key, _)| !self.hosted.contains_key(key))
+            .filter_map(|(key, (host, placement))| {
+                let priority = match &key {
+                    ItemKey::Comment(id) => usize::try_from(id.0)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(COMMENT_BLOCK_PRIORITY),
+                    ItemKey::Remote(remote) => self.remote.get(remote)?.order,
+                };
+                Some((
+                    host,
+                    key.clone(),
+                    placement,
+                    self.item_view(&key)?,
+                    priority,
+                ))
             })
             .collect::<Vec<_>>();
         if stale.is_empty() && new_blocks.is_empty() {
             return;
         }
-        new_blocks.sort_by_key(|(host, id, _, _)| (*host, *id));
+        new_blocks.sort_by(|(host_a, key_a, ..), (host_b, key_b, ..)| {
+            (host_a, key_a).cmp(&(host_b, key_b))
+        });
 
         for (editor, blocks) in stale.into_values() {
             // A left side that was dropped took its blocks with it.
@@ -528,16 +664,16 @@ impl CommentBlocks {
             };
             let block_ids = editor.update(cx, |editor, cx| {
                 editor.insert_blocks(
-                    blocks.iter().map(|(_, id, placement, view)| {
-                        block_properties(*id, *placement, view.clone())
+                    blocks.iter().map(|(_, _, placement, view, priority)| {
+                        block_properties(*placement, view.clone(), *priority)
                     }),
                     None,
                     cx,
                 )
             });
-            for ((_, id, placement, _), block) in blocks.into_iter().zip(block_ids) {
+            for ((_, key, placement, _, _), block) in blocks.into_iter().zip(block_ids) {
                 self.hosted.insert(
-                    *id,
+                    key.clone(),
                     HostedBlock {
                         host,
                         editor: editor.downgrade(),
@@ -640,6 +776,33 @@ impl CommentBlocks {
                     anchor.lines = lines.clone();
                     anchor.text = text.clone();
                     moves.push((id, lines, text));
+                }
+            }
+
+            // Threads are anchored on their line numbers once, then follow the edits like
+            // comments do; lines past the end of the local file aren't shown.
+            for block in self.remote.values_mut() {
+                let CommentTarget::Lines { path, side, lines } = &block.target else {
+                    continue;
+                };
+                let Some(buffer) = side_buffer(diff, path, *side, cx) else {
+                    continue;
+                };
+                let buffer = snapshots
+                    .entry(buffer.entity_id())
+                    .or_insert_with(|| buffer.read(cx).snapshot());
+                if block.anchor.as_ref().is_some_and(|anchor| {
+                    !buffer.can_resolve(&anchor.start) || !buffer.can_resolve(&anchor.end)
+                }) {
+                    block.anchor = None;
+                }
+                if block.anchor.is_none() {
+                    let end_row = lines.end().saturating_sub(1);
+                    if end_row > buffer.max_point().row {
+                        continue;
+                    }
+                    let start_row = lines.start().saturating_sub(1).min(end_row);
+                    block.anchor = Some(line_anchor_and_text(buffer, start_row..=end_row).0);
                 }
             }
         }
@@ -753,9 +916,14 @@ impl CommentBlocks {
 
     /// A comment being written for the first time has no text yet.
     pub(crate) fn body_at_cursor(&self, cx: &mut App) -> Option<String> {
-        let id = self.comment_at_cursor(cx)?;
-        let body = &self.session.read(cx).comments().get(id)?.body;
-        (!body.is_empty()).then(|| body.clone())
+        let body = match self.item_at_cursor(cx)? {
+            ItemKey::Comment(id) => self.session.read(cx).comments().get(id)?.body.clone(),
+            ItemKey::Remote(key) => {
+                let view = self.remote.get(&key)?.view.read(cx);
+                view.threads().next()?.comments.first()?.body.to_string()
+            }
+        };
+        (!body.is_empty()).then_some(body)
     }
 
     pub(crate) fn add_file_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -975,7 +1143,7 @@ impl CommentBlocks {
 
     /// Scrolls the diff so that the comment's block shows.
     fn reveal(&self, id: CommentId, cx: &mut Context<Self>) {
-        let Some(hosted) = self.hosted.get(&id) else {
+        let Some(hosted) = self.hosted.get(&ItemKey::Comment(id)) else {
             return;
         };
         let Some(editor) = hosted.editor.upgrade() else {
@@ -1090,7 +1258,7 @@ impl CommentBlocks {
             return;
         }
         let hosted = comment
-            .and_then(|id| self.hosted.get(&id))
+            .and_then(|id| self.hosted.get(&ItemKey::Comment(id)))
             .and_then(|hosted| Some((hosted.editor.upgrade()?, hosted.placement.row)));
         match hosted {
             Some((editor, row)) => {
@@ -1158,6 +1326,9 @@ impl CommentBlocks {
     pub(crate) fn delete_comment_at_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.comment_at_cursor(cx) {
             Some(id) => self.confirm_delete(id, window, cx),
+            None if self.item_at_cursor(cx).is_some() => {
+                self.show_toast("Threads on GitHub can't be changed in the review", cx)
+            }
             None => self.show_toast("No comment at the cursor", cx),
         }
     }
@@ -1213,12 +1384,13 @@ impl CommentBlocks {
     fn go_to_comment(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
         let items = self.comment_order(cx);
         if items.is_empty() {
-            let has_comments = self
-                .session
-                .read(cx)
-                .comments()
-                .iter()
-                .any(|comment| self.is_listed(comment, cx));
+            let has_comments = !self.remote.is_empty()
+                || self
+                    .session
+                    .read(cx)
+                    .comments()
+                    .iter()
+                    .any(|comment| self.is_listed(comment, cx));
             self.show_toast(
                 if has_comments {
                     "No comments in the diff"
@@ -1231,13 +1403,13 @@ impl CommentBlocks {
         }
         let order = self.diff.read(cx).file_order();
         let current = self
-            .comments_at_cursor(cx)
-            .and_then(|(_, at_cursor)| self.selected.filter(|id| at_cursor.contains(id)))
-            .and_then(|id| items.iter().find(|item| item.3 == id).copied());
-        let target = match current {
+            .items_at_cursor(cx)
+            .and_then(|at_cursor| self.selected.clone().filter(|key| at_cursor.contains(key)))
+            .and_then(|key| items.iter().find(|item| item.3 == key).cloned());
+        let target = match &current {
             Some(current) => match direction {
-                Direction::Next => items.iter().find(|item| **item > current),
-                Direction::Previous => items.iter().rev().find(|item| **item < current),
+                Direction::Next => items.iter().find(|item| *item > current),
+                Direction::Previous => items.iter().rev().find(|item| *item < current),
             },
             None => {
                 // A comment sits below its row, so the comment on the cursor row is the next one.
@@ -1261,69 +1433,80 @@ impl CommentBlocks {
             Direction::Next => target.or(items.first()),
             Direction::Previous => target.or(items.last()),
         };
-        if let Some((.., id)) = target.copied() {
-            self.land_on(id, window, cx);
+        if let Some((.., key)) = target.cloned() {
+            self.land_on(&key, window, cx);
         }
     }
 
-    /// The line and file comments in the order of the diff: by file, file comments first, then
-    /// by the new file's line (old lines at the new line they face). Comments in files the
-    /// filters hide, and comments on lines the diff doesn't show, are left out.
-    fn comment_order(&self, cx: &App) -> Vec<(usize, i64, Side, CommentId)> {
+    /// The line and file comments and the threads in the order of the diff: by file, file
+    /// comments first, then by the new file's line (old lines at the new line they face).
+    /// Comments in files the filters hide, and comments on lines the diff doesn't show, are left
+    /// out.
+    fn comment_order(&self, cx: &App) -> Vec<(usize, i64, Side, ItemKey)> {
         let diff = self.diff.read(cx);
         let order = diff.file_order();
         let rhs = self.rhs_editor(cx);
         let lhs = self.lhs_editor(cx);
         let hosts = Hosts::new(&rhs, lhs.as_ref(), cx);
-        let mut items = self
+        let position = |target: &CommentTarget, anchor: Option<&Range<language::Anchor>>| {
+            let path_key = review_path_key(target.path()?);
+            let file_index = order.iter().position(|key| key == &path_key)?;
+            let (row, side) = match target {
+                CommentTarget::File { .. } => (-1, Side::Old),
+                CommentTarget::Lines { side, .. } => {
+                    let anchor = anchor?;
+                    // Files hidden by single-file mode have no excerpts to check.
+                    if diff.is_shown(&path_key) {
+                        line_row_anchor(target, anchor, &hosts, diff, cx)?;
+                    }
+                    let (buffer, file_diff) = diff.file_diff(&path_key)?;
+                    let buffer = buffer.read(cx).snapshot();
+                    // An anchor into a buffer that was replaced since (the file left the
+                    // review and came back) can't be resolved.
+                    let row = match side {
+                        Side::New => {
+                            if !buffer.can_resolve(&anchor.end) {
+                                return None;
+                            }
+                            anchor.end.to_point(&buffer).row
+                        }
+                        Side::Old => {
+                            let file_diff = file_diff.read(cx).snapshot(cx);
+                            if !file_diff.base_text().can_resolve(&anchor.end) {
+                                return None;
+                            }
+                            let point = anchor.end.to_point(file_diff.base_text());
+                            file_diff
+                                .base_text_point_to_buffer_point(Point::new(point.row, 0), &buffer)
+                                .row
+                        }
+                    };
+                    (i64::from(row), *side)
+                }
+                CommentTarget::Review => return None,
+            };
+            Some((file_index, row, side))
+        };
+        let comments = self
             .session
             .read(cx)
             .comments()
             .iter()
             .filter(|comment| self.is_listed(comment, cx))
             .filter_map(|comment| {
-                let path_key = review_path_key(comment.target.path()?);
-                let file_index = order.iter().position(|key| key == &path_key)?;
-                let (row, side) = match &comment.target {
-                    CommentTarget::File { .. } => (-1, Side::Old),
-                    CommentTarget::Lines { side, .. } => {
-                        let anchor = &self.anchors.lines.get(&comment.id)?.range;
-                        // Files hidden by single-file mode have no excerpts to check.
-                        if diff.is_shown(&path_key) {
-                            line_row_anchor(comment, anchor, &hosts, diff, cx)?;
-                        }
-                        let (buffer, file_diff) = diff.file_diff(&path_key)?;
-                        let buffer = buffer.read(cx).snapshot();
-                        // An anchor into a buffer that was replaced since (the file left the
-                        // review and came back) can't be resolved.
-                        let row = match side {
-                            Side::New => {
-                                if !buffer.can_resolve(&anchor.end) {
-                                    return None;
-                                }
-                                anchor.end.to_point(&buffer).row
-                            }
-                            Side::Old => {
-                                let file_diff = file_diff.read(cx).snapshot(cx);
-                                if !file_diff.base_text().can_resolve(&anchor.end) {
-                                    return None;
-                                }
-                                let point = anchor.end.to_point(file_diff.base_text());
-                                file_diff
-                                    .base_text_point_to_buffer_point(
-                                        Point::new(point.row, 0),
-                                        &buffer,
-                                    )
-                                    .row
-                            }
-                        };
-                        (i64::from(row), *side)
-                    }
-                    CommentTarget::Review => return None,
-                };
-                Some((file_index, row, side, comment.id))
-            })
-            .collect::<Vec<_>>();
+                let anchor = self
+                    .anchors
+                    .lines
+                    .get(&comment.id)
+                    .map(|anchor| &anchor.range);
+                let (file_index, row, side) = position(&comment.target, anchor)?;
+                Some((file_index, row, side, ItemKey::Comment(comment.id)))
+            });
+        let remote = self.remote.iter().filter_map(|(key, block)| {
+            let (file_index, row, side) = position(&block.target, block.anchor.as_ref())?;
+            Some((file_index, row, side, ItemKey::Remote(key.clone())))
+        });
+        let mut items = comments.chain(remote).collect::<Vec<_>>();
         items.sort();
         items
     }
@@ -1332,23 +1515,19 @@ impl CommentBlocks {
     /// and focuses that side of the diff. Returns whether the comment is in the diff.
     pub(crate) fn land_on(
         &mut self,
-        id: CommentId,
+        key: &ItemKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(path_key) = self
-            .session
-            .read(cx)
-            .comments()
-            .get(id)
-            .and_then(|comment| comment.target.path())
-            .map(review_path_key)
+            .item_target(key, cx)
+            .and_then(|target| target.path().map(review_path_key))
         else {
             return false;
         };
         self.show_file(&path_key, window, cx);
         self.reconcile(window, cx);
-        let Some(hosted) = self.hosted.get(&id) else {
+        let Some(hosted) = self.hosted.get(key) else {
             return false;
         };
         let Some(editor) = hosted.editor.upgrade() else {
@@ -1366,7 +1545,7 @@ impl CommentBlocks {
             );
         });
         self.focus_diff_editor(&editor, window, cx);
-        self.selected = Some(id);
+        self.selected = Some(key.clone());
         self.update_targeted(cx);
         true
     }
@@ -1392,20 +1571,42 @@ impl CommentBlocks {
 
     /// The comment `i`, `Enter` and `dd` act on: the one `]t`/`[t` moved to, else the first line
     /// comment below the cursor row (on the focused side first), else the file comment above it.
+    /// Threads on the cursor row don't count.
     fn comment_at_cursor(&self, cx: &mut App) -> Option<CommentId> {
-        let (first, at_cursor) = self.comments_at_cursor(cx)?;
-        Some(
-            self.selected
-                .filter(|id| at_cursor.contains(id))
-                .unwrap_or(first),
-        )
+        let at_cursor = self.items_at_cursor(cx)?;
+        let comment = |key: &ItemKey| match key {
+            ItemKey::Comment(id) => Some(*id),
+            ItemKey::Remote(_) => None,
+        };
+        self.selected
+            .as_ref()
+            .filter(|key| at_cursor.contains(key))
+            .and_then(comment)
+            .or_else(|| at_cursor.iter().find_map(comment))
     }
 
-    /// The comments shown at the cursor row: the first one `i` would act on, and all of them.
-    fn comments_at_cursor(&self, cx: &mut App) -> Option<(CommentId, Vec<CommentId>)> {
+    /// The comment or thread at the cursor row: the one `]t`/`[t` moved to, else the review's
+    /// own comment there (which `i` edits), else a thread.
+    fn item_at_cursor(&self, cx: &mut App) -> Option<ItemKey> {
+        let at_cursor = self.items_at_cursor(cx)?;
+        self.selected
+            .clone()
+            .filter(|key| at_cursor.contains(key))
+            .or_else(|| {
+                at_cursor
+                    .iter()
+                    .find(|key| matches!(key, ItemKey::Comment(_)))
+                    .cloned()
+            })
+            .or_else(|| at_cursor.first().cloned())
+    }
+
+    /// The comments and threads shown at the cursor row: line ones before file ones, the focused
+    /// side's first.
+    fn items_at_cursor(&self, cx: &mut App) -> Option<Vec<ItemKey>> {
         let rows = self.cursor_rows(cx)?;
         let mut at_cursor = Vec::new();
-        for (id, hosted) in &self.hosted {
+        for (key, hosted) in &self.hosted {
             let Some(cursor_row) = rows.row(hosted.host) else {
                 continue;
             };
@@ -1414,12 +1615,19 @@ impl CommentBlocks {
             };
             let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
             if hosted.placement.row.to_point(&snapshot).row == cursor_row {
-                at_cursor.push((hosted.placement.is_file, hosted.host != rows.focused, *id));
+                at_cursor.push((hosted.placement.is_file, hosted.host != rows.focused, key));
             }
         }
+        if at_cursor.is_empty() {
+            return None;
+        }
         at_cursor.sort();
-        let (_, _, first) = *at_cursor.first()?;
-        Some((first, at_cursor.into_iter().map(|(_, _, id)| id).collect()))
+        Some(
+            at_cursor
+                .into_iter()
+                .map(|(_, _, key)| key.clone())
+                .collect(),
+        )
     }
 
     /// The cursor's row on the focused side, and the row facing it on the other side of a split
@@ -1487,23 +1695,36 @@ impl CommentBlocks {
     }
 
     fn update_targeted(&mut self, cx: &mut Context<Self>) {
-        let targeted = self.comment_at_cursor(cx);
+        let targeted = self.item_at_cursor(cx);
         if targeted == self.targeted {
             return;
         }
-        for (id, targeted) in [(self.targeted, false), (targeted, true)] {
-            if let Some(view) = id.and_then(|id| self.views.get(&id)) {
-                view.update(cx, |view, cx| view.set_targeted(targeted, cx));
+        for (key, is_targeted) in [(self.targeted.clone(), false), (targeted.clone(), true)] {
+            match key {
+                Some(ItemKey::Comment(id)) => {
+                    if let Some(view) = self.views.get(&id) {
+                        view.update(cx, |view, cx| view.set_targeted(is_targeted, cx));
+                    }
+                }
+                Some(ItemKey::Remote(key)) => {
+                    if let Some(block) = self.remote.get(&key) {
+                        block
+                            .view
+                            .update(cx, |view, cx| view.set_targeted(is_targeted, cx));
+                    }
+                }
+                None => {}
             }
         }
         self.targeted = targeted;
     }
 
-    fn show_toast(&self, message: &'static str, cx: &mut App) {
+    fn show_toast(&self, message: impl Into<SharedString>, cx: &mut App) {
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.show_toast(
-                    Toast::new(NotificationId::unique::<Self>(), message).autohide(),
+                    Toast::new(NotificationId::unique::<Self>(), message.into().to_string())
+                        .autohide(),
                     cx,
                 )
             })
@@ -1521,6 +1742,10 @@ impl CommentBlocks {
         let mut rows = self
             .hosted
             .iter()
+            .filter_map(|(key, hosted)| match key {
+                ItemKey::Comment(id) => Some((id, hosted)),
+                ItemKey::Remote(_) => None,
+            })
             .map(|(id, hosted)| {
                 let block = hosted.block;
                 let row = hosted
@@ -1537,6 +1762,39 @@ impl CommentBlocks {
             .collect::<Vec<_>>();
         rows.sort();
         rows
+    }
+
+    /// Each hosted thread block's row, and whether it is on the left side.
+    #[cfg(test)]
+    pub(crate) fn hosted_remote_rows(&self, cx: &mut App) -> Vec<(RemoteKey, bool, u32)> {
+        let mut rows = self
+            .hosted
+            .iter()
+            .filter_map(|(key, hosted)| match key {
+                ItemKey::Remote(key) => Some((key, hosted)),
+                ItemKey::Comment(_) => None,
+            })
+            .map(|(key, hosted)| {
+                let block = hosted.block;
+                let row = hosted
+                    .editor
+                    .update(cx, |editor, cx| editor.row_for_block(block, cx))
+                    .ok()
+                    .flatten();
+                (
+                    key.clone(),
+                    hosted.host == Host::Lhs,
+                    row.map_or(u32::MAX, |row| row.0),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_view(&self, key: &RemoteKey) -> Option<&Entity<RemoteThreadView>> {
+        self.remote.get(key).map(|block| &block.view)
     }
 
     /// Each hosted comment's block row (either side).
@@ -1656,16 +1914,16 @@ fn save_text(
 /// side on the left side of a split diff (or below the removed row of a unified one),
 /// everything else on the right side.
 fn placement(
-    comment: &Comment,
+    target: &CommentTarget,
     anchor: Option<&Range<language::Anchor>>,
     hosts: &Hosts,
     diff: &ReviewDiff,
     cx: &App,
 ) -> Option<(Host, Placement)> {
-    match &comment.target {
+    match target {
         CommentTarget::Review => None,
         CommentTarget::Lines { .. } => {
-            let (host, row) = line_row_anchor(comment, anchor?, hosts, diff, cx)?;
+            let (host, row) = line_row_anchor(target, anchor?, hosts, diff, cx)?;
             Some((
                 host,
                 Placement {
@@ -1700,13 +1958,13 @@ fn placement(
 /// The side showing a line comment's last line (`anchor` is where its lines are) and that row's
 /// anchor there, while the row is shown (in an excerpt, in a file that isn't folded).
 fn line_row_anchor(
-    comment: &Comment,
+    target: &CommentTarget,
     anchor: &Range<language::Anchor>,
     hosts: &Hosts,
     diff: &ReviewDiff,
     cx: &App,
 ) -> Option<(Host, Anchor)> {
-    let CommentTarget::Lines { path, side, .. } = &comment.target else {
+    let CommentTarget::Lines { path, side, .. } = target else {
         return None;
     };
     let buffer_id = diff.buffer_id_for(&review_path_key(path), cx)?;
@@ -1783,9 +2041,9 @@ fn block_below_row(row: Anchor, snapshot: &MultiBufferSnapshot) -> BlockAnchor {
 }
 
 fn block_properties(
-    id: CommentId,
     placement: Placement,
-    view: Entity<CommentView>,
+    view: AnyView,
+    priority: usize,
 ) -> BlockProperties<Anchor> {
     BlockProperties {
         placement: match placement.block {
@@ -1796,7 +2054,7 @@ fn block_properties(
         height: Some(3),
         // Not moved by the diff's horizontal scroll.
         style: BlockStyle::Sticky,
-        priority: usize::try_from(id.0).unwrap_or(usize::MAX),
+        priority,
         render: Arc::new(move |cx: &mut BlockContext| {
             // Opaque, so that a line cursor highlight reaching past an empty row doesn't show
             // through.
