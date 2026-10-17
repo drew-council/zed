@@ -139,7 +139,8 @@ enum Host {
 struct TabAnchors {
     lines: HashMap<CommentId, LineAnchor>,
     /// Comments whose lines were deleted, or whose buffer was replaced. They are anchored on
-    /// their line numbers again, and flagged outdated unless those lines still have their text.
+    /// their line numbers again, and flagged outdated unless those lines still have their text
+    /// (an outdated one is no longer outdated when they do).
     lost: HashSet<CommentId>,
 }
 
@@ -152,6 +153,11 @@ struct LineAnchor {
     /// each other's.
     lines: RangeInclusive<u32>,
     text: String,
+    /// Where the lines of a comment that this tab flagged outdated because they were deleted
+    /// used to be: the comment's text coming back there (an undo, a stash popped) makes it
+    /// current again. Its anchor on the line numbers moves away from that place when the lines
+    /// are put back right before it.
+    deleted_from: Option<Range<language::Anchor>>,
 }
 
 struct HostedBlock {
@@ -764,6 +770,9 @@ impl CommentBlocks {
                 let buffer = snapshots
                     .entry(buffer.entity_id())
                     .or_insert_with(|| buffer.read(cx).snapshot());
+                // As it will be once this update's checks are applied.
+                let mut is_outdated = comment.is_outdated();
+                let mut deleted_from = None;
 
                 if let Some(anchor) = anchors.lines.get(&id) {
                     let start = &anchor.range.start;
@@ -771,12 +780,22 @@ impl CommentBlocks {
                     // The buffer was replaced: the file left the review and came back, or its
                     // diff base or snapshot was rebuilt.
                     let replaced = !buffer.can_resolve(start) || !buffer.can_resolve(end);
-                    // Deleting the lines collapses both ends onto the deletion; text inserted
-                    // there later (a stash popped) goes between them, the wrong way around.
-                    // An empty line has nothing to delete.
+                    // Deleting the lines collapses both ends onto the deletion (text inserted
+                    // there later, as a stash pop does, goes after them). An empty line has
+                    // nothing to delete.
                     let deleted = !replaced
                         && !anchor.text.is_empty()
                         && start.to_offset(buffer) >= end.to_offset(buffer);
+                    if deleted {
+                        // Lines deleted again while outdated: the first place is the one that
+                        // had the comment's text.
+                        deleted_from = Some(
+                            anchor
+                                .deleted_from
+                                .clone()
+                                .unwrap_or_else(|| anchor.range.clone()),
+                        );
+                    }
                     if replaced || deleted {
                         anchors.lines.remove(&id);
                         anchors.lost.insert(id);
@@ -789,13 +808,18 @@ impl CommentBlocks {
                     let start_row = lines.start().saturating_sub(1).min(max_row);
                     let end_row = last_row.min(max_row).max(start_row);
                     let (range, text) = line_anchor_and_text(buffer, start_row..=end_row);
-                    if session.needs_check(id) || anchors.lost.remove(&id) {
-                        let outdated = last_row > max_row
-                            || comment
-                                .line_text
-                                .as_ref()
-                                .is_some_and(|line_text| *line_text != text);
+                    let outdated = last_row > max_row
+                        || comment
+                            .line_text
+                            .as_ref()
+                            .is_some_and(|line_text| *line_text != text);
+                    let was_lost = anchors.lost.remove(&id);
+                    // Other tabs anchor a checked comment on its lines without comparing, but an
+                    // outdated one whose lines have its text again (changed back while no tab
+                    // showed them) is current again.
+                    if session.needs_check(id) || was_lost || (is_outdated && !outdated) {
                         checked.push((id, outdated));
+                        is_outdated = outdated && !comment.is_submitted();
                     }
                     // As stored, so that a position that had to be clamped is recorded below.
                     anchors.lines.insert(
@@ -804,6 +828,7 @@ impl CommentBlocks {
                             range,
                             lines: lines.clone(),
                             text: comment.line_text.clone().unwrap_or_default(),
+                            deleted_from: deleted_from.filter(|_| is_outdated),
                         },
                     );
                 }
@@ -811,6 +836,22 @@ impl CommentBlocks {
                 let Some(anchor) = anchors.lines.get_mut(&id) else {
                     continue;
                 };
+                if !is_outdated {
+                    anchor.deleted_from = None;
+                } else if let Some((range, line_text)) = anchor
+                    .deleted_from
+                    .as_ref()
+                    .zip(comment.line_text.as_deref())
+                {
+                    if !buffer.can_resolve(&range.start) || !buffer.can_resolve(&range.end) {
+                        anchor.deleted_from = None;
+                    } else if let Some(restored) = restored_lines(buffer, range, line_text) {
+                        anchor.range = restored;
+                        anchor.deleted_from = None;
+                        checked.push((id, false));
+                        is_outdated = false;
+                    }
+                }
                 // Typing on an empty commented line moves the range's start past its end; the
                 // block stays below the end.
                 let end_row = anchor.range.end.to_point(buffer).row;
@@ -818,6 +859,16 @@ impl CommentBlocks {
                 let (_, text) = line_anchor_and_text(buffer, start_row..=end_row);
                 let lines = start_row + 1..=end_row + 1;
                 if anchor.lines != lines || anchor.text != text {
+                    // This tab's lines got the text the outdated comment was about back. Only a
+                    // change seen in this tab counts: another window whose buffer never lost
+                    // the text doesn't overrule the tab that saw it go.
+                    if is_outdated
+                        && anchor.text != text
+                        && comment.line_text.as_deref() == Some(text.as_str())
+                    {
+                        anchor.deleted_from = None;
+                        checked.push((id, false));
+                    }
                     anchor.lines = lines.clone();
                     anchor.text = text.clone();
                     moves.push((id, lines, text));
@@ -900,7 +951,12 @@ impl CommentBlocks {
                     },
                     line_text: Some(text.clone()),
                 };
-                let anchor = LineAnchor { range, lines, text };
+                let anchor = LineAnchor {
+                    range,
+                    lines,
+                    text,
+                    deleted_from: None,
+                };
                 self.add_comment(new_comment, Some(anchor), editor, window, cx);
             }
         }
@@ -1951,6 +2007,27 @@ fn line_anchor_and_text(
         buffer.anchor_after(start)..buffer.anchor_before(end),
         buffer.text_for_range(start..end).collect(),
     )
+}
+
+/// The lines starting where deleted lines were (`deleted_from`, collapsed by the deletion, or
+/// whole again after an undo), when they have `line_text` again.
+fn restored_lines(
+    buffer: &BufferSnapshot,
+    deleted_from: &Range<language::Anchor>,
+    line_text: &str,
+) -> Option<Range<language::Anchor>> {
+    let start = deleted_from
+        .start
+        .to_offset(buffer)
+        .min(deleted_from.end.to_offset(buffer));
+    let start_row = buffer.offset_to_point(start).row;
+    let line_count = u32::try_from(line_text.split('\n').count()).ok()?;
+    let end_row = start_row.checked_add(line_count.saturating_sub(1))?;
+    if end_row > buffer.max_point().row {
+        return None;
+    }
+    let (range, text) = line_anchor_and_text(buffer, start_row..=end_row);
+    (text == line_text).then_some(range)
 }
 
 /// Saves a left editor's text: trimmed, and only when not empty. A new comment that is
@@ -3342,6 +3419,113 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_outdated_comments_come_back_with_their_text(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("v j c");
+        cx.simulate_input("range");
+        cx.simulate_keystrokes("ctrl-enter");
+        move_to_row_with_text(&rhs, "line 1", cx);
+        cx.simulate_keystrokes("c");
+        cx.simulate_input("single");
+        cx.simulate_keystrokes("ctrl-enter");
+        let [range, single] = comment_ids(&review, cx)[..] else {
+            panic!("two comments expected");
+        };
+        let buffer = display_buffer(&review, "a.rs", cx);
+        // Each edit undoes on its own.
+        buffer.update(cx, |buffer, _| {
+            buffer.set_group_interval(std::time::Duration::ZERO)
+        });
+        let commented = "line 3\nline 4\n";
+        let offset_of = |buffer: &Buffer, text: &str| buffer.text().find(text).unwrap();
+        let line_text = |cx: &VisualTestContext| {
+            review.read_with(cx, |review, cx| {
+                let session = review.session().read(cx);
+                session.comments().get(range).unwrap().line_text.clone()
+            })
+        };
+
+        // A stash takes the lines away, its pop puts them back where they were: the comment
+        // is current again, on its lines (not below them, where its anchor on the line numbers
+        // went).
+        let offset = buffer.read_with(cx, |buffer, _| offset_of(buffer, commented));
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(offset..offset + commented.len(), "")], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, range, cx), (lines("a.rs", 3..=4), true));
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(offset..offset, commented)], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            line_state(&review, range, cx),
+            (lines("a.rs", 3..=4), false)
+        );
+        assert_eq!(line_text(cx).as_deref(), Some("line 3\nline 4"));
+        blocks(&review, cx).read_with(cx, |blocks, cx| {
+            assert!(!blocks.view(range).unwrap().read(cx).is_outdated());
+        });
+
+        // The text coming back somewhere else doesn't count.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(offset..offset + commented.len(), "")], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, range, cx), (lines("a.rs", 3..=4), true));
+        buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, commented)], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, range, cx), (lines("a.rs", 3..=4), true));
+        assert_eq!(line_text(cx).as_deref(), Some("line 3\nline 4"));
+
+        // Nor does other text at the place; an undo of the deletion does.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(offset..offset, "other\n")], None, cx)
+        });
+        cx.run_until_parked();
+        assert!(line_state(&review, range, cx).1);
+        buffer.update(cx, |buffer, cx| {
+            buffer.undo(cx);
+            buffer.undo(cx);
+            buffer.undo(cx);
+        });
+        cx.run_until_parked();
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(offset_of(buffer, commented), offset);
+        });
+        assert_eq!(
+            line_state(&review, range, cx),
+            (lines("a.rs", 3..=4), false)
+        );
+
+        // A replaced line, and the line put back as it was.
+        let original = "line 1";
+        let offset = buffer.read_with(cx, |buffer, _| offset_of(buffer, "line 1\n"));
+        let replace = |text: &str, length: usize, cx: &mut VisualTestContext| {
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(offset..offset + length, text)], None, cx)
+            });
+            cx.run_until_parked();
+        };
+        replace("changed 1", original.len(), cx);
+        assert_eq!(
+            line_state(&review, single, cx),
+            (lines("a.rs", 1..=1), true)
+        );
+        replace(original, "changed 1".len(), cx);
+        assert_eq!(
+            line_state(&review, single, cx),
+            (lines("a.rs", 1..=1), false)
+        );
+    }
+
     /// Two projects on one repository (its root and a subfolder, in two windows) review the
     /// same thing, so they share the review's comments, but each has its own buffers.
     #[gpui::test]
@@ -3409,9 +3593,33 @@ mod tests {
             (lines("sub/x.rs", 4..=4), false)
         );
 
+        // The commented line deleted in one window outdates the comment; the other window,
+        // whose buffer still has the line, leaves it outdated. Putting the line back makes it
+        // current again, in both.
+        let buffer_a = display_buffer(&review_a, "sub/x.rs", cx_a);
+        let deleted = "line 4\n";
+        let offset = buffer_a.read_with(cx_a, |buffer, _| buffer.text().find(deleted).unwrap());
+        buffer_a.update(cx_a, |buffer, cx| {
+            buffer.edit([(offset..offset + deleted.len(), "")], None, cx)
+        });
+        cx_a.run_until_parked();
+        cx_b.run_until_parked();
+        cx_a.run_until_parked();
+        assert!(line_state(&review_a, id, cx_a).1);
+        assert!(line_state(&review_b, id, cx_b).1);
+        buffer_a.update(cx_a, |buffer, cx| {
+            buffer.edit([(offset..offset, deleted)], None, cx)
+        });
+        cx_a.run_until_parked();
+        cx_b.run_until_parked();
+        cx_a.run_until_parked();
+        assert_eq!(
+            line_state(&review_b, id, cx_b),
+            (lines("sub/x.rs", 4..=4), false)
+        );
+
         // An unsaved edit in one window moves the comment there; the other window's buffer
         // doesn't have it and doesn't move the comment back.
-        let buffer_a = display_buffer(&review_a, "sub/x.rs", cx_a);
         let buffer_b = display_buffer(&review_b, "sub/x.rs", cx_b);
         assert_ne!(buffer_a.entity_id(), buffer_b.entity_id());
         buffer_a.update(cx_a, |buffer, cx| buffer.edit([(0..0, "new\n")], None, cx));
@@ -3461,6 +3669,7 @@ mod tests {
         );
         assert_eq!(hosted_rows(&review_a, cx_a).len(), 1);
         assert_eq!(hosted_rows(&review_b, cx_b).len(), 1);
+
         drop((buffer_a, buffer_b));
     }
 
@@ -3560,6 +3769,74 @@ mod tests {
         move_to_row_with_text(&rhs, "line 3", cx);
         cx.simulate_keystrokes("] t ] t");
         assert_eq!(cursor_line(&rhs, cx), "line four");
+        drop(rhs);
+
+        let close = |review: Entity<ReviewView>, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.close_item_by_id(
+                        review.entity_id(),
+                        workspace::SaveIntent::Skip,
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx)
+                })
+            });
+            drop(review);
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        };
+        let reopen = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.dispatch_action(crate::ReviewUncommitted.boxed_clone(), cx)
+            });
+            cx.run_until_parked();
+            let review = workspace.update(cx, |workspace, cx| {
+                workspace.active_item_as::<ReviewView>(cx).unwrap()
+            });
+            cx.run_until_parked();
+            review
+        };
+
+        // The line changes back while the review is closed (a stash popped then): the comment
+        // is current again.
+        close(review, cx);
+        fs.insert_file(path!("/project/a.rs"), text.clone().into_bytes())
+            .await;
+        cx.run_until_parked();
+        let review = reopen(cx);
+        assert_eq!(
+            line_state(&review, changed, cx),
+            (lines("a.rs", 4..=4), false)
+        );
+
+        // So does editing the line back as it was while the review shows it.
+        close(review, cx);
+        fs.insert_file(
+            path!("/project/a.rs"),
+            text.replace("line 4\n", "line four\n").into_bytes(),
+        )
+        .await;
+        cx.run_until_parked();
+        let review = reopen(cx);
+        assert_eq!(
+            line_state(&review, changed, cx),
+            (lines("a.rs", 4..=4), true)
+        );
+        let buffer = display_buffer(&review, "a.rs", cx);
+        buffer.update(cx, |buffer, cx| {
+            let offset = buffer.text().find("line four").unwrap() + "line ".len();
+            buffer.edit([(offset..offset + "four".len(), "4")], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            line_state(&review, changed, cx),
+            (lines("a.rs", 4..=4), false)
+        );
+        blocks(&review, cx).read_with(cx, |blocks, cx| {
+            assert!(!blocks.view(changed).unwrap().read(cx).is_outdated());
+        });
     }
 
     #[gpui::test]

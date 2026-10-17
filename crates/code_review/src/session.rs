@@ -475,18 +475,22 @@ impl ReviewSession {
     }
 
     /// Records whether a line comment's lines still have the text it was about. A comment whose
-    /// text changed is outdated (stored, and sticky until it is deleted).
+    /// text changed is outdated (stored) until its lines have that text again (a stash popped,
+    /// an undo) or it is deleted.
     pub(crate) fn check_comment(&mut self, id: CommentId, outdated: bool, cx: &mut Context<Self>) {
         self.unchecked.remove(&id);
         let Some(comment) = self.comments.get_mut(id) else {
             return;
         };
-        if outdated && comment.state == CommentState::Draft {
-            comment.state = CommentState::Outdated;
-            self.save_comment(id, cx);
-            cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
-            cx.notify();
-        }
+        let state = match (outdated, &comment.state) {
+            (true, CommentState::Draft) => CommentState::Outdated,
+            (false, CommentState::Outdated) => CommentState::Draft,
+            _ => return,
+        };
+        comment.state = state;
+        self.save_comment(id, cx);
+        cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
+        cx.notify();
     }
 
     /// Records that the comments were posted to GitHub as part of the review `review_id`: they
@@ -999,6 +1003,26 @@ mod tests {
             let first = session.comments().get(first).unwrap();
             assert_eq!(first.state, CommentState::Outdated);
             assert_eq!(first.line_text.as_deref(), Some("line 3\nline 4"));
+        });
+
+        // Until its lines have that text again.
+        session.update(cx, |session, cx| {
+            session.check_comment(first, false, cx);
+            assert_eq!(
+                session.comments().get(first).unwrap().state,
+                CommentState::Draft
+            );
+            session.flush(cx);
+        });
+        drop(session);
+        cx.run_until_parked();
+        let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(
+                session.comments().get(first).unwrap().state,
+                CommentState::Draft
+            );
         });
 
         // Other reviews have their own comments.
