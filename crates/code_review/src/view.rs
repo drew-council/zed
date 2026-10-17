@@ -1,15 +1,22 @@
-use crate::{ReviewUncommitted, diff::ReviewDiff, line_cursor::LineCursor, target::ReviewTarget};
+use crate::{
+    FocusDiff, FocusPanel, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight,
+    diff::ReviewDiff,
+    line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
+    target::ReviewTarget,
+};
 use editor::{Editor, EditorEvent, SplittableEditor};
 use gpui::{
-    AnyEntity, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, WeakEntity,
+    Action as _, AnyEntity, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
+    WeakEntity,
 };
-use language::Capability;
+use language::{Capability, Point};
 use project::{Project, ProjectPath, git_store::Repository};
 use std::{
     any::{Any, TypeId},
     sync::Arc,
 };
 use ui::prelude::*;
+use util::ResultExt as _;
 use workspace::{
     ItemNavHistory, Toast, Workspace,
     item::{Item, ItemEvent},
@@ -21,13 +28,39 @@ pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ReviewUncommitted, window, cx| {
         ReviewView::deploy(workspace, ReviewTarget::Uncommitted, window, cx);
     });
+    workspace.register_action(|workspace, _: &FocusDiff, window, cx| {
+        focus_diff(workspace, window, cx);
+    });
+}
+
+/// Focuses the active review tab, else the review the panel shows, else any open review.
+pub(crate) fn focus_diff(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let review = workspace
+        .active_item_as::<ReviewView>(cx)
+        .or_else(|| {
+            workspace
+                .panel::<ReviewPanel>(cx)
+                .and_then(|panel| panel.read(cx).active_review())
+        })
+        .or_else(|| workspace.items_of_type::<ReviewView>(cx).next());
+    if let Some(review) = review {
+        workspace.activate_item(&review, true, true, window, cx);
+    }
+}
+
+/// Vim keeps a pending count after actions that aren't its own, where it would multiply the next
+/// motion. The review's own actions don't take counts.
+fn discard_vim_count(window: &mut Window, cx: &mut App) {
+    if let Some(action) = cx.build_action("vim::ClearOperators", None).log_err() {
+        window.dispatch_action(action, cx);
+    }
 }
 
 /// The review tab: a read-only diff of a [`ReviewTarget`] in one repository.
 pub struct ReviewView {
     target: ReviewTarget,
     diff: Entity<ReviewDiff>,
-    _line_cursor: Entity<LineCursor>,
+    line_cursor: Entity<LineCursor>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     _diff_subscription: Subscription,
@@ -93,7 +126,7 @@ impl ReviewView {
         Self {
             target,
             diff,
-            _line_cursor: line_cursor,
+            line_cursor,
             project,
             workspace: workspace.downgrade(),
             _diff_subscription: diff_subscription,
@@ -106,6 +139,35 @@ impl ReviewView {
 
     pub fn diff(&self) -> &Entity<ReviewDiff> {
         &self.diff
+    }
+
+    fn scroll_left(&mut self, _: &ScrollLeft, window: &mut Window, cx: &mut Context<Self>) {
+        let scroll = self.line_cursor.update(cx, |line_cursor, cx| {
+            line_cursor.scroll_horizontally(-HORIZONTAL_SCROLL_COLUMNS, window, cx)
+        });
+        // In visual mode `h` only scrolls, so the selection isn't lost to a focus change.
+        if matches!(scroll, HorizontalScroll::AtLeftEdge) && !self.has_visual_selection(cx) {
+            window.dispatch_action(FocusPanel.boxed_clone(), cx);
+        }
+        discard_vim_count(window, cx);
+    }
+
+    fn scroll_right(&mut self, _: &ScrollRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.line_cursor.update(cx, |line_cursor, cx| {
+            line_cursor.scroll_horizontally(HORIZONTAL_SCROLL_COLUMNS, window, cx)
+        });
+        discard_vim_count(window, cx);
+    }
+
+    fn has_visual_selection(&self, cx: &mut App) -> bool {
+        let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            !editor
+                .selections
+                .newest::<Point>(&snapshot)
+                .is_empty()
+        })
     }
 
     fn reviews(&self, target: &ReviewTarget, repo: &Entity<Repository>, cx: &App) -> bool {
@@ -127,9 +189,11 @@ impl Focusable for ReviewView {
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("CodeReview")
+            .on_action(cx.listener(Self::scroll_left))
+            .on_action(cx.listener(Self::scroll_right))
             .size_full()
             .child(self.diff.clone())
     }
@@ -266,7 +330,7 @@ impl Item for ReviewView {
 mod tests {
     use super::*;
     use editor::test::editor_test_context::assert_state_with_diff;
-    use gpui::{Action as _, TestAppContext};
+    use gpui::TestAppContext;
     use project::FakeFs;
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};

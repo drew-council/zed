@@ -23,6 +23,16 @@ actions!(
         ReviewUncommitted,
         /// Toggles focus on the review panel.
         ToggleFocus,
+        /// Opens the review panel and focuses it.
+        FocusPanel,
+        /// Focuses the diff of the active review.
+        FocusDiff,
+        /// Opens or closes the review panel.
+        TogglePanel,
+        /// Scrolls the review diff left. At the left edge, focuses the review panel instead.
+        ScrollLeft,
+        /// Scrolls the review diff right.
+        ScrollRight,
     ]
 );
 
@@ -94,8 +104,8 @@ pub(crate) fn init_test(cx: &mut gpui::TestAppContext) {
 pub(crate) mod test_support {
     use super::*;
     use gpui::{
-        Action as _, BorrowAppContext as _, Entity, TestAppContext, VisualContext as _,
-        VisualTestContext,
+        Action as _, AppContext as _, BorrowAppContext as _, Entity, TestAppContext,
+        VisualContext as _, VisualTestContext,
     };
     use project::{FakeFs, Project};
     use serde_json::json;
@@ -129,6 +139,17 @@ pub(crate) mod test_support {
             }
             cx.bind_keys(parse_keymap(VIM_KEYMAP, KeybindSource::Vim, cx).unwrap());
         });
+    }
+
+    pub(crate) fn add_review_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<ReviewPanel> {
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| ReviewPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        })
     }
 
     pub(crate) fn line(index: usize) -> String {
@@ -197,7 +218,10 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, Focusable as _, TestAppContext, VisualContext as _};
+    use gpui::{
+        Action as _, AppContext as _, Focusable as _, TestAppContext, VisualContext as _,
+        VisualTestContext,
+    };
     use project::{FakeFs, Project};
     use workspace::MultiWorkspace;
 
@@ -216,7 +240,7 @@ mod tests {
         let workspace =
             multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
         let panel = workspace.update_in(cx, |workspace, window, cx| {
-            let panel = cx.new(ReviewPanel::new);
+            let panel = cx.new(|cx| ReviewPanel::new(workspace, window, cx));
             workspace.add_panel(panel.clone(), window, cx);
             panel
         });
@@ -237,6 +261,54 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_panel_keys(cx: &mut TestAppContext) {
+        test_support::init_vim_test(cx, settings::DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = test_support::open_review_fixture(cx).await;
+        let panel = test_support::add_review_panel(&workspace, cx);
+        let editor = review.read_with(cx, |review, cx| {
+            review.diff().read(cx).editor().read(cx).rhs_editor().clone()
+        });
+        let panel_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| panel.read(cx).focus_handle(cx).contains_focused(window, cx))
+        };
+        let editor_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| editor.read(cx).focus_handle(cx).is_focused(window))
+        };
+        let dock_open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open())
+        };
+
+        // The panel follows the review tab.
+        panel.read_with(cx, |panel, _| assert_eq!(panel.active_review(), Some(review.clone())));
+
+        cx.simulate_keystrokes("; e");
+        assert!(dock_open(cx));
+        assert!(editor_focused(cx));
+        cx.simulate_keystrokes("; e");
+        assert!(!dock_open(cx));
+        assert!(editor_focused(cx));
+
+        cx.simulate_keystrokes("; h");
+        assert!(dock_open(cx));
+        assert!(panel_focused(cx));
+        cx.simulate_keystrokes("; l");
+        assert!(editor_focused(cx));
+
+        cx.simulate_keystrokes("; h");
+        assert!(panel_focused(cx));
+        cx.simulate_keystrokes("; e");
+        assert!(!dock_open(cx));
+        assert!(editor_focused(cx));
+
+        // Closing the review tab empties the panel.
+        cx.update(|window, cx| {
+            window.dispatch_action(workspace::CloseActiveItem::default().boxed_clone(), cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert_eq!(panel.active_review(), None));
+    }
+
+    #[gpui::test]
     fn test_keymaps_load_without_errors(cx: &mut TestAppContext) {
         // Unknown action names fail the whole keymap, so vim's actions must be registered.
         test_support::init_vim_test(cx, settings::DiffViewStyle::Unified);
@@ -246,7 +318,7 @@ mod tests {
             assert!(
                 vim_bindings
                     .iter()
-                    .any(|binding| binding.action().name() == "code_review::ToggleFocus")
+                    .any(|binding| binding.action().name() == "code_review::FocusPanel")
             );
         });
     }

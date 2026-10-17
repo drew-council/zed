@@ -4,15 +4,23 @@ use editor::{
     SplittableEditor,
     display_map::{DisplayRow, DisplaySnapshot},
 };
-use gpui::{Entity, EntityId, Hsla, Subscription};
+use gpui::{Entity, EntityId, Hsla, Subscription, point};
 use language::Point;
 use multi_buffer::MultiBufferRow;
 use std::ops::RangeInclusive;
 use ui::prelude::*;
 
+/// tuicr's horizontal scroll step, in columns.
+pub(crate) const HORIZONTAL_SCROLL_COLUMNS: f64 = 4.0;
+
 struct CursorRowContext;
 struct CursorRowAdded;
 struct CursorRowDeleted;
+
+pub(crate) enum HorizontalScroll {
+    Scrolled,
+    AtLeftEdge,
+}
 
 /// The review tab's line cursor: Zed's caret and selections are hidden, and the rows of the
 /// newest selection get a full-width highlight instead, mirrored on the other side of a split
@@ -123,6 +131,28 @@ impl LineCursor {
                 }
             });
         }
+    }
+
+    /// Scrolls the focused side (and with it the other side, which shares the horizontal offset)
+    /// by `columns`, negative to the left.
+    pub(crate) fn scroll_horizontally(
+        &self,
+        columns: f64,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> HorizontalScroll {
+        let editor = self.editor.read(cx).focused_editor().clone();
+        editor.update(cx, |editor, cx| {
+            // Reads are clamped to the widest line, so stepping from the read position never
+            // accumulates scroll beyond the right edge.
+            let position = editor.scroll_position(cx);
+            if columns < 0. && position.x <= 0. {
+                return HorizontalScroll::AtLeftEdge;
+            }
+            let x = (position.x + columns).max(0.);
+            editor.set_scroll_position(point(x, position.y), window, cx);
+            HorizontalScroll::Scrolled
+        })
     }
 }
 
@@ -265,7 +295,10 @@ fn deleted_row_color(cx: &App) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ReviewView, test_support::open_review_fixture};
+    use crate::{
+        ReviewView,
+        test_support::{add_review_panel, open_review_fixture},
+    };
     use editor::{SelectionEffects, ToPoint as _, ToggleSplitDiff};
     use gpui::{Focusable as _, TestAppContext, VisualTestContext};
     use settings::DiffViewStyle;
@@ -361,12 +394,16 @@ mod tests {
                 .unwrap()
         });
         editor.update_in(cx, |editor, window, cx| {
-            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
                 selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)])
             });
         });
         cx.run_until_parked();
         row
+    }
+
+    fn scroll_x(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> f64 {
+        editor.update(cx, |editor, cx| editor.scroll_position(cx).x)
     }
 
     #[gpui::test]
@@ -398,7 +435,7 @@ mod tests {
         let row = move_to_row_with_text(&editor, "line 4", cx);
         for keystrokes in [
             "w", "b", "e", "shift-w", "$", "^", "space", "backspace", "(", ")", "%", "f", "t",
-            "; ,", "h", "l", "left", "right", "end",
+            "; ,", "end",
         ] {
             cx.simulate_keystrokes(keystrokes);
             assert_eq!(
@@ -536,5 +573,44 @@ mod tests {
         let lhs_rows = cursor_rows(&new_lhs, cx);
         assert_eq!(lhs_rows.len(), 1);
         assert_eq!(row_text(&new_lhs, lhs_rows[0].0, cx), "three");
+    }
+
+    #[gpui::test]
+    async fn test_horizontal_scroll(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Split);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+        let panel_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| panel.read(cx).focus_handle(cx).contains_focused(window, cx))
+        };
+
+        let row = move_to_row_with_text(&rhs, &"y".repeat(300), cx);
+        cx.simulate_keystrokes("l");
+        assert_eq!(scroll_x(&rhs, cx), 4.);
+        assert_eq!(scroll_x(&lhs, cx), 4.);
+        cx.simulate_keystrokes("right l");
+        assert_eq!(scroll_x(&rhs, cx), 12.);
+
+        // Vertical motions keep the horizontal scroll.
+        cx.simulate_keystrokes("k j k");
+        assert_eq!(scroll_x(&rhs, cx), 12.);
+        assert_eq!(cursor_point(&rhs, cx).row, row - 1);
+
+        // Counts don't apply and don't leak into the next motion.
+        cx.simulate_keystrokes("3 l j");
+        assert_eq!(scroll_x(&rhs, cx), 16.);
+        assert_eq!(cursor_point(&rhs, cx).row, row);
+
+        cx.simulate_keystrokes("h left h h");
+        assert_eq!(scroll_x(&rhs, cx), 0.);
+        assert!(!panel_focused(cx));
+
+        // At the left edge, `h` focuses the panel, except in visual mode.
+        cx.simulate_keystrokes("shift-v h");
+        assert!(!panel_focused(cx));
+        cx.simulate_keystrokes("escape h");
+        assert!(panel_focused(cx));
     }
 }

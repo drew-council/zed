@@ -6,10 +6,10 @@
       "v": "vim::ToggleVisualLine",
       "ctrl-v": "vim::ToggleVisualLine",
       "ctrl-q": "vim::ToggleVisualLine",
-      "h": null,
-      "left": null,
-      "l": null,
-      "right": null,
+      "h": "code_review::ScrollLeft",
+      "left": "code_review::ScrollLeft",
+      "l": "code_review::ScrollRight",
+      "right": "code_review::ScrollRight",
       "w": null,
       "shift-w": null,
       "b": null,
@@ -49,7 +49,9 @@
   {
     "context": "CodeReview > Editor && mode == full && vim_mode == normal && !menu",
     "bindings": {
-      "; h": "code_review::ToggleFocus",
+      "; e": "code_review::TogglePanel",
+      "; h": "code_review::FocusPanel",
+      "; l": "code_review::FocusDiff",
       // Nothing may enter insert mode on the read-only diff (comments will rebind some of these).
       "i": null,
       "a": null,
@@ -86,7 +88,8 @@
   {
     "context": "ReviewPanel",
     "bindings": {
-      "; l": "code_review::ToggleFocus",
+      "; e": "code_review::TogglePanel",
+      "; l": "code_review::FocusDiff",
     },
   },
 ]
