@@ -1422,9 +1422,11 @@ mod tests {
     }
 
     /// A checkout of the sandbox repository at PR #1's head, and a fake GitHub that knows its
-    /// open pull requests and PR #1. `fail_lists` makes listing answer 401.
+    /// open pull requests and PR #1. `fail_lists` makes listing answer 401; `base_oid`, when set,
+    /// replaces PR #1's base commit.
     async fn pull_request_fixture(
         fail_lists: Arc<std::sync::atomic::AtomicBool>,
+        base_oid: Arc<std::sync::Mutex<Option<String>>>,
         cx: &mut TestAppContext,
     ) -> (Arc<FakeFs>, Entity<Workspace>, &mut VisualTestContext) {
         use crate::github::{
@@ -1464,7 +1466,10 @@ mod tests {
             }
             Some("OpenPullRequests") => Reply::json(OPEN_PULL_REQUESTS),
             Some("SearchPullRequests") => Reply::json(r#"{"data":{"search":{"nodes":[{}]}}}"#),
-            Some("PullRequestDetails") => Reply::json(PR1_DETAILS),
+            Some("PullRequestDetails") => match base_oid.lock().unwrap().as_deref() {
+                Some(base_oid) => Reply::json(PR1_DETAILS.replace(PR1_BASE_OID, base_oid)),
+                None => Reply::json(PR1_DETAILS),
+            },
             _ => Reply::status(500, "{}"),
         });
         cx.update(|cx| {
@@ -1484,7 +1489,9 @@ mod tests {
 
     #[gpui::test]
     async fn test_pull_request_section(cx: &mut TestAppContext) {
-        let (_fs, workspace, cx) = pull_request_fixture(Default::default(), cx).await;
+        let base_oid = Arc::new(std::sync::Mutex::new(None));
+        let (fs, workspace, cx) =
+            pull_request_fixture(Default::default(), base_oid.clone(), cx).await;
 
         dispatch(StartReview, cx);
         let picker = start_review_picker(&workspace, cx);
@@ -1602,6 +1609,27 @@ mod tests {
             cx,
         );
         assert_eq!(review_count(&workspace, cx), 1);
+
+        // The pull request was rebased: opening it again moves its tab to the new base.
+        insert_commit_ref(&fs, C1, C1);
+        *base_oid.lock().unwrap() = Some(C1.to_string());
+        dispatch(
+            OpenPullRequest {
+                reference: Some("#1".into()),
+            },
+            cx,
+        );
+        assert_eq!(review_count(&workspace, cx), 1);
+        review.read_with(cx, |review, cx| {
+            let ReviewTarget::PullRequest(target) = review.target() else {
+                panic!("expected a pull request review");
+            };
+            assert_eq!(target.base.name(), C1);
+            assert_eq!(
+                review.pull_request().unwrap().read(cx).details().base_oid,
+                oid(C1)
+            );
+        });
     }
 
     #[gpui::test]
@@ -1609,7 +1637,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let fail_lists = Arc::new(AtomicBool::new(true));
-        let (_fs, workspace, cx) = pull_request_fixture(fail_lists.clone(), cx).await;
+        let (_fs, workspace, cx) =
+            pull_request_fixture(fail_lists.clone(), Default::default(), cx).await;
         dispatch(StartReview, cx);
         let picker = start_review_picker(&workspace, cx);
         picker.read_with(cx, |picker, _| {
