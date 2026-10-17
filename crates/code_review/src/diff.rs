@@ -860,7 +860,8 @@ impl ReviewDiff {
                     else {
                         return false;
                     };
-                    let autoscroll = file_start_autoscroll(editor, position, cx);
+                    let autoscroll = file_start_autoscroll(editor, position, cx)
+                        .unwrap_or_else(Autoscroll::focused);
                     editor.change_selections(
                         SelectionEffects::scroll(autoscroll),
                         window,
@@ -913,10 +914,17 @@ impl ReviewDiff {
             }
         }
         if !moved {
-            // The scroll position may have been in a file that was just hidden.
+            // The scroll position may have been in a file that was just hidden. A cursor near
+            // the file's start shows the file's header, as when moving to the file.
             self.editor.update(cx, |editor, cx| {
                 editor.focused_editor().update(cx, |editor, cx| {
-                    editor.request_autoscroll(Autoscroll::fit(), cx)
+                    let head = editor.selections.newest_anchor().head();
+                    let autoscroll = path_key
+                        .is_some()
+                        .then(|| file_start_autoscroll(editor, head, cx))
+                        .flatten()
+                        .unwrap_or_else(Autoscroll::fit);
+                    editor.request_autoscroll(autoscroll, cx)
                 })
             });
         }
@@ -1263,17 +1271,15 @@ fn tree_sort_path(repo_path: &RelPath) -> Arc<RelPath> {
 
 /// Scrolls the first row of a file into view with the file's header at the top, so that what
 /// sits between them (file comments and threads, the moved threads) isn't left under the sticky
-/// header. When that doesn't fit, the row goes near the top as usual.
-fn file_start_autoscroll(
+/// header. `None` when that doesn't fit (or the row isn't near its file's header).
+pub(crate) fn file_start_autoscroll(
     editor: &mut Editor,
     position: editor::Anchor,
     cx: &mut Context<Editor>,
-) -> Autoscroll {
+) -> Option<Autoscroll> {
     // The row itself and the scroll margin below it.
     const ROWS_BELOW_BLOCKS: u32 = 4;
-    let Some(visible_lines) = editor.visible_line_count() else {
-        return Autoscroll::focused();
-    };
+    let visible_lines = editor.visible_line_count()?;
     let snapshot = editor.display_snapshot(cx);
     let point = position.to_point(snapshot.buffer_snapshot());
     let row = snapshot.point_to_display_point(point, Bias::Left).row();
@@ -1283,8 +1289,5 @@ fn file_start_autoscroll(
         .filter(|(_, block)| block.is_buffer_header())
         .map(|(header_row, _)| header_row)
         .last();
-    match header_row {
-        Some(header_row) => Autoscroll::top_relative(f64::from(row.0 - header_row.0)),
-        None => Autoscroll::focused(),
-    }
+    header_row.map(|header_row| Autoscroll::top_relative(f64::from(row.0 - header_row.0)))
 }

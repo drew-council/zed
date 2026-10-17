@@ -188,9 +188,9 @@ fn face_cursor(rhs_editor: &Entity<Editor>, lhs_editor: &Entity<Editor>, cx: &mu
         let snapshot = editor.display_snapshot(cx);
         let display_point = snapshot.clip_point(display_point, Bias::Right);
         let point = snapshot.display_point_to_point(display_point, Bias::Right);
-        editor
-            .selections
-            .change_with(&snapshot, |selections| selections.select_ranges([point..point]));
+        editor.selections.change_with(&snapshot, |selections| {
+            selections.select_ranges([point..point])
+        });
         cx.notify();
     });
 }

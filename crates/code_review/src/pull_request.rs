@@ -3168,5 +3168,99 @@ pub(crate) mod tests {
             cx.simulate_keystrokes("[ t");
             assert!(targeted(SINGLE, cx));
         }
+
+        /// A file thread that shows up above the cursor on the file's first row (a reload, as
+        /// after a submit) is shown with the file's header at the top, rather than where the
+        /// view's top happens to be, which may leave it under the sticky header.
+        #[gpui::test]
+        async fn test_reload_keeps_the_file_header_at_the_top(cx: &mut TestAppContext) {
+            let file_thread = serde_json::json!({
+                "id": "PRRT_file",
+                "isResolved": false,
+                "isOutdated": false,
+                "subjectType": "FILE",
+                "path": "src/util/strings.rs",
+                "line": 1,
+                "startLine": null,
+                "originalLine": 1,
+                "originalStartLine": null,
+                "diffSide": "RIGHT",
+                "startDiffSide": null,
+                "comments": {
+                    "totalCount": 1,
+                    "nodes": [{
+                        "id": "PRRC_file",
+                        "databaseId": 2,
+                        "body": "A file comment\nover\nseveral\nlines",
+                        "createdAt": "2026-10-17T04:00:00Z",
+                        "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r2",
+                        "state": "SUBMITTED",
+                        "commit": { "oid": PR1_HEAD_OID },
+                        "author": { "__typename": "User", "login": "someone" },
+                    }],
+                },
+            });
+            let add_thread = Arc::new(AtomicBool::new(false));
+            let respond = {
+                let add_thread = add_thread.clone();
+                move |request: &SentRequest| {
+                    if request.operation() != Some("ReviewThreads")
+                        || !add_thread.load(Ordering::SeqCst)
+                    {
+                        return None;
+                    }
+                    let mut threads: serde_json::Value = serde_json::from_str(PR1_THREADS).unwrap();
+                    threads["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(file_thread.clone());
+                    Some(Reply::json(threads.to_string()))
+                }
+            };
+            let fixture = Fixture {
+                respond: Some(Arc::new(respond)),
+                ..Fixture::default()
+            };
+            let (_fs, _workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let scroll_and_header_rows = |cx: &mut VisualTestContext| {
+                rhs.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let cursor = editor.selections.newest::<Point>(&snapshot).head();
+                    let cursor_row = snapshot.point_to_display_point(cursor, Bias::Left).row();
+                    let header_row = snapshot
+                        .blocks_in_range(editor::display_map::DisplayRow(0)..cursor_row)
+                        .filter(|(_, block)| block.is_buffer_header())
+                        .map(|(row, _)| row)
+                        .last()
+                        .unwrap();
+                    (editor.scroll_position(cx).y, f64::from(header_row.0))
+                })
+            };
+
+            cx.simulate_keystrokes("] f");
+            assert_eq!(
+                path_at_cursor(&review, cx).as_deref(),
+                Some("src/util/strings.rs")
+            );
+            let (scroll_top, header_row) = scroll_and_header_rows(cx);
+            assert_eq!(scroll_top, header_row);
+            // The view's top inside the file, as a centered scroll may leave it.
+            rhs.update_in(cx, |editor, window, cx| {
+                let position = editor.scroll_position(cx);
+                editor.set_scroll_position(gpui::point(position.x, position.y + 1.5), window, cx);
+            });
+            cx.run_until_parked();
+
+            add_thread.store(true, Ordering::SeqCst);
+            let pull_request = review.read_with(cx, |review, _| review.pull_request().cloned());
+            pull_request
+                .unwrap()
+                .update(cx, |pull_request, cx| pull_request.reload(cx));
+            cx.run_until_parked();
+            assert!(remote_keys(&review, cx).contains(&thread("PRRT_file")));
+            let (scroll_top, header_row) = scroll_and_header_rows(cx);
+            assert_eq!(scroll_top, header_row);
+        }
     }
 }

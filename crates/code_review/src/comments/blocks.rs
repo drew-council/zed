@@ -4,7 +4,7 @@ use super::{
     view::{CommentView, EditingState, Leave},
 };
 use crate::{
-    diff::{ReviewDiff, review_path_key},
+    diff::{ReviewDiff, file_start_autoscroll, review_path_key},
     line_cursor::selected_rows,
     session::{ReviewSession, ReviewSessionEvent},
 };
@@ -454,12 +454,15 @@ impl CommentBlocks {
         cx: &mut Context<Self>,
     ) {
         let mut previous = std::mem::take(&mut self.remote);
+        let mut changed = Vec::new();
         for (order, item) in items.into_iter().enumerate() {
             let block = match previous.remove(&item.key) {
                 Some(mut block) => {
-                    block.view.update(cx, |view, cx| {
+                    if block.view.update(cx, |view, cx| {
                         view.set_threads(item.title, item.threads, cx)
-                    });
+                    }) {
+                        changed.push(item.key.clone());
+                    }
                     if block.target != item.target {
                         block.target = item.target;
                         block.anchor = None;
@@ -468,6 +471,7 @@ impl CommentBlocks {
                     block
                 }
                 None => {
+                    changed.push(item.key.clone());
                     let language_registry = self.language_registry.clone();
                     let view = cx.new(|cx| {
                         RemoteThreadView::new(item.title, item.threads, language_registry, cx)
@@ -488,7 +492,47 @@ impl CommentBlocks {
             self.selected = None;
         }
         self.reconcile(window, cx);
+        self.keep_file_start_in_view(&changed, cx);
         cx.notify();
+    }
+
+    /// Threads of a file that show up (or change) above its first row while the cursor is on
+    /// that row (a reload after a submit, say) are shown with the file's header at the top, as
+    /// when moving to the file: wherever the view's top was, they could be under the sticky
+    /// header.
+    fn keep_file_start_in_view(&self, changed: &[RemoteKey], cx: &mut App) {
+        for key in changed {
+            let Some(hosted) = self.hosted.get(&ItemKey::Remote(key.clone())) else {
+                continue;
+            };
+            if !hosted.placement.is_file {
+                continue;
+            }
+            let Some(editor) = hosted.editor.upgrade() else {
+                continue;
+            };
+            let row = hosted.placement.row;
+            let scrolled = editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let cursor_row = editor
+                    .selections
+                    .newest_anchor()
+                    .head()
+                    .to_point(&snapshot)
+                    .row;
+                if cursor_row != row.to_point(&snapshot).row {
+                    return false;
+                }
+                let Some(autoscroll) = file_start_autoscroll(editor, row, cx) else {
+                    return false;
+                };
+                editor.request_autoscroll(autoscroll, cx);
+                true
+            });
+            if scrolled {
+                return;
+            }
+        }
     }
 
     /// The pull request's threads this tab shows, in the order they were given.
@@ -1630,8 +1674,7 @@ impl CommentBlocks {
                 ))
             });
         let remote = self.remote.iter().filter_map(|(key, block)| {
-            let (file_index, row, side, side_row) =
-                position(&block.target, block.anchor.as_ref())?;
+            let (file_index, row, side, side_row) = position(&block.target, block.anchor.as_ref())?;
             Some((
                 file_index,
                 row,
@@ -1669,11 +1712,18 @@ impl CommentBlocks {
             return false;
         };
         let anchor = hosted.placement.row;
+        let is_file = hosted.placement.is_file;
         editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let point = Point::new(anchor.to_point(&snapshot).row, 0);
+            // A file's comments and threads sit between its header and its first row, where the
+            // sticky header would cover them.
+            let autoscroll = is_file
+                .then(|| file_start_autoscroll(editor, anchor, cx))
+                .flatten()
+                .unwrap_or_else(Autoscroll::center);
             editor.change_selections(
-                SelectionEffects::scroll(Autoscroll::center()),
+                SelectionEffects::scroll(autoscroll),
                 window,
                 cx,
                 |selections| selections.select_ranges([point..point]),
@@ -3469,7 +3519,11 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(active_review(&workspace, cx), review);
         assert!(is_focused(&rhs, cx), "fold: {fold}");
-        assert_eq!(vim_mode(&rhs, cx).as_deref(), Some("normal"), "fold: {fold}");
+        assert_eq!(
+            vim_mode(&rhs, cx).as_deref(),
+            Some("normal"),
+            "fold: {fold}"
+        );
         let before = cursor_point(&rhs, cx);
         cx.simulate_keystrokes("j");
         assert_ne!(cursor_point(&rhs, cx), before, "fold: {fold}");
@@ -3488,9 +3542,7 @@ mod tests {
     /// Unsplitting while the left side has the focus (a pane too narrow for a split diff, or
     /// `ToggleSplitDiff`) drops that editor: the right side takes the focus (V7.X1).
     #[gpui::test]
-    async fn test_dropping_the_focused_left_side_focuses_the_right_side(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_dropping_the_focused_left_side_focuses_the_right_side(cx: &mut TestAppContext) {
         init(cx, DiffViewStyle::Split);
         let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
         let rhs = rhs_editor(&review, cx);
