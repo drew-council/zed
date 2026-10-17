@@ -37,6 +37,7 @@ project.workspace = true
 regex.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 settings.workspace = true
 smallvec.workspace = true
 time.workspace = true
@@ -60,7 +61,6 @@ project = { workspace = true, features = ["test-support"] }
 # `project`'s test support turns on `remote`'s, whose extra variant `remote_connection` (through
 # `git_ui`) only matches with its own test support.
 remote_connection = { workspace = true, features = ["test-support"] }
-serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 theme.workspace = true
 theme_settings.workspace = true

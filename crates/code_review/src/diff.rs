@@ -723,6 +723,31 @@ impl ReviewDiff {
             .map(|(repo_path, _)| repo_path.clone())
     }
 
+    /// The file whose diff base (the old side of the diff) is the buffer `base_buffer_id`, and
+    /// that buffer.
+    pub(crate) fn base_buffer(
+        &self,
+        base_buffer_id: BufferId,
+        cx: &App,
+    ) -> Option<(RepoPath, Entity<Buffer>)> {
+        self.buffer_subscriptions
+            .iter()
+            .find_map(|(repo_path, entry)| {
+                let base_buffer = entry.diff.read(cx).base_text_buffer();
+                (base_buffer.read(cx).remote_id() == base_buffer_id)
+                    .then(|| (repo_path.clone(), base_buffer.clone()))
+            })
+    }
+
+    /// The (right-hand side) buffer and the diff of a file, also while the file is hidden.
+    pub(crate) fn file_diff(
+        &self,
+        path_key: &PathKey,
+    ) -> Option<(&Entity<Buffer>, &Entity<BufferDiff>)> {
+        let entry = self.entry(path_key)?;
+        Some((&entry.display_buffer, &entry.diff))
+    }
+
     fn entry(&self, path_key: &PathKey) -> Option<&BufferSubscriptions> {
         self.buffer_subscriptions
             .values()

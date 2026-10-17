@@ -3,8 +3,10 @@ mod view;
 
 pub(crate) use blocks::{CommentBlocks, CommentBlocksEvent};
 
+use anyhow::{Context as _, Result};
 use git::repository::RepoPath;
 use gpui::SharedString;
+use serde::{Deserialize, Serialize};
 use std::ops::{Range, RangeInclusive};
 use ui::Color;
 
@@ -12,15 +14,18 @@ use ui::Color;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct CommentId(pub u64);
 
-/// The side of the diff a line comment is on: the old (removed) lines or the new ones.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// The side of the diff a line comment is on: the old (removed) lines or the new ones. Old lines
+/// come first where both sides are at the same place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Side {
     Old,
     New,
 }
 
 /// tuicr's comment types. Comments are untyped unless given one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CommentType {
     Issue,
     Suggestion,
@@ -83,7 +88,8 @@ pub(crate) enum CommentTarget {
     Lines {
         path: RepoPath,
         side: Side,
-        /// 1-based line numbers on `side` when the comment was made.
+        /// 1-based line numbers on `side`. They follow the comment's anchor while the review is
+        /// open, and are what a review opened later looks for.
         lines: RangeInclusive<u32>,
     },
 }
@@ -100,8 +106,8 @@ impl CommentTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommentState {
     Draft,
-    /// The commented lines changed while the review was closed.
-    #[allow(dead_code, reason = "set once comments are persisted")]
+    /// The commented lines had changed when the review was opened again. The comment stays (on
+    /// the lines with the same numbers) until it is deleted.
     Outdated,
     /// Posted to GitHub as part of a review, so it can't change any more.
     #[allow(dead_code, reason = "set once reviews can be submitted to GitHub")]
@@ -118,14 +124,24 @@ pub(crate) struct Comment {
     /// The saved text (trimmed). Edits in an open comment editor aren't part of it until the
     /// comment is left.
     pub body: String,
-    /// The text of the commented lines when the comment was made, to tell whether they changed
-    /// since.
-    #[allow(dead_code, reason = "compared once comments are persisted")]
+    /// The text of the commented lines, kept up to date like the line numbers, to tell whether
+    /// they changed while the review was closed.
     pub line_text: Option<String>,
     pub state: CommentState,
     /// Where a line comment's lines are now, in the buffer of their side (the file's buffer for
-    /// the new side). Anchors follow edits; they aren't stored.
+    /// the new side, its diff base for the old side). Anchors follow edits; they aren't stored,
+    /// and a comment loaded from the database gets them once its file is loaded.
     pub anchor: Option<Range<language::Anchor>>,
+}
+
+impl Comment {
+    pub(crate) fn is_outdated(&self) -> bool {
+        self.state == CommentState::Outdated
+    }
+
+    pub(crate) fn is_submitted(&self) -> bool {
+        matches!(self.state, CommentState::Submitted { .. })
+    }
 }
 
 pub(crate) struct NewComment {
@@ -176,9 +192,136 @@ impl CommentStore {
         id
     }
 
+    /// Adds comments read from the database, keeping their ids.
+    pub(crate) fn restore(&mut self, comments: impl IntoIterator<Item = Comment>) {
+        for comment in comments {
+            if self.get(comment.id).is_some() {
+                continue;
+            }
+            self.next_id = self.next_id.max(comment.id.0 + 1);
+            self.comments.push(comment);
+        }
+        self.comments.sort_by_key(|comment| comment.id);
+    }
+
     pub(crate) fn remove(&mut self, id: CommentId) -> Option<Comment> {
         let index = self.comments.iter().position(|comment| comment.id == id)?;
         Some(self.comments.remove(index))
+    }
+}
+
+/// A comment as stored in the database (JSON, so that fields can be added without a migration:
+/// new ones need `#[serde(default)]`).
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct StoredComment {
+    target: StoredTarget,
+    #[serde(default)]
+    comment_type: Option<CommentType>,
+    body: String,
+    #[serde(default)]
+    line_text: Option<String>,
+    #[serde(default)]
+    state: StoredState,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StoredTarget {
+    Review,
+    File {
+        path: String,
+    },
+    Lines {
+        path: String,
+        side: Side,
+        start: u32,
+        end: u32,
+    },
+}
+
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredState {
+    #[default]
+    Draft,
+    Outdated,
+    Submitted {
+        review_id: String,
+    },
+}
+
+impl Comment {
+    pub(crate) fn to_json(&self) -> Result<String> {
+        let target = match &self.target {
+            CommentTarget::Review => StoredTarget::Review,
+            CommentTarget::File { path } => StoredTarget::File {
+                path: path.as_unix_str().to_string(),
+            },
+            CommentTarget::Lines { path, side, lines } => StoredTarget::Lines {
+                path: path.as_unix_str().to_string(),
+                side: *side,
+                start: *lines.start(),
+                end: *lines.end(),
+            },
+        };
+        let state = match &self.state {
+            CommentState::Draft => StoredState::Draft,
+            CommentState::Outdated => StoredState::Outdated,
+            CommentState::Submitted { review_id } => StoredState::Submitted {
+                review_id: review_id.to_string(),
+            },
+        };
+        let stored = StoredComment {
+            target,
+            comment_type: self.comment_type,
+            body: self.body.clone(),
+            line_text: self.line_text.clone(),
+            state,
+        };
+        Ok(serde_json::to_string(&stored)?)
+    }
+
+    pub(crate) fn from_json(id: CommentId, json: &str) -> Result<Self> {
+        let stored: StoredComment =
+            serde_json::from_str(json).context("parsing a stored comment")?;
+        let target = match stored.target {
+            StoredTarget::Review => CommentTarget::Review,
+            StoredTarget::File { path } => CommentTarget::File {
+                path: RepoPath::new(&path)?,
+            },
+            StoredTarget::Lines {
+                path,
+                side,
+                start,
+                end,
+            } => {
+                anyhow::ensure!(
+                    1 <= start && start <= end,
+                    "invalid line range {start}-{end}"
+                );
+                CommentTarget::Lines {
+                    path: RepoPath::new(&path)?,
+                    side,
+                    lines: start..=end,
+                }
+            }
+        };
+        let state = match stored.state {
+            StoredState::Draft => CommentState::Draft,
+            StoredState::Outdated => CommentState::Outdated,
+            StoredState::Submitted { review_id } => CommentState::Submitted {
+                review_id: review_id.into(),
+            },
+        };
+        Ok(Self {
+            id,
+            target,
+            comment_type: stored.comment_type,
+            body: stored.body,
+            line_text: stored.line_text,
+            state,
+            anchor: None,
+        })
     }
 }
 
@@ -206,5 +349,62 @@ mod tests {
         );
         assert_eq!(CommentType::cycle(None, false), Some(CommentType::Praise));
         assert_eq!(CommentType::cycle(Some(CommentType::Issue), false), None);
+    }
+
+    #[test]
+    fn test_comment_json_round_trip() {
+        let comments = [
+            Comment {
+                id: CommentId(0),
+                target: CommentTarget::Review,
+                comment_type: Some(CommentType::Praise),
+                body: "Nice".into(),
+                line_text: None,
+                state: CommentState::Draft,
+                anchor: None,
+            },
+            Comment {
+                id: CommentId(3),
+                target: CommentTarget::File {
+                    path: RepoPath::new("src/a b.rs").unwrap(),
+                },
+                comment_type: None,
+                body: "multi\nline".into(),
+                line_text: None,
+                state: CommentState::Submitted {
+                    review_id: "42".into(),
+                },
+                anchor: None,
+            },
+            Comment {
+                id: CommentId(7),
+                target: CommentTarget::Lines {
+                    path: RepoPath::new("lib.rs").unwrap(),
+                    side: Side::Old,
+                    lines: 3..=5,
+                },
+                comment_type: Some(CommentType::Issue),
+                body: "x".into(),
+                line_text: Some("a\nb\nc".into()),
+                state: CommentState::Outdated,
+                anchor: None,
+            },
+        ];
+        for comment in comments {
+            let json = comment.to_json().unwrap();
+            let restored = Comment::from_json(comment.id, &json).unwrap();
+            assert_eq!(restored.target, comment.target);
+            assert_eq!(restored.comment_type, comment.comment_type);
+            assert_eq!(restored.body, comment.body);
+            assert_eq!(restored.line_text, comment.line_text);
+            assert_eq!(restored.state, comment.state);
+        }
+
+        // Missing optional fields default; bad ranges are refused.
+        let minimal = r#"{"target":{"kind":"lines","path":"a.rs","side":"new","start":2,"end":2},"body":"b"}"#;
+        let comment = Comment::from_json(CommentId(1), minimal).unwrap();
+        assert_eq!(comment.state, CommentState::Draft);
+        let reversed = r#"{"target":{"kind":"lines","path":"a.rs","side":"new","start":3,"end":2},"body":"b"}"#;
+        assert!(Comment::from_json(CommentId(1), reversed).is_err());
     }
 }

@@ -1,16 +1,28 @@
 use crate::{
-    comments::{CommentEvent, CommentId, CommentStore, CommentType, NewComment},
-    persistence::{CodeReviewDb, StoredMarks},
+    comments::{
+        Comment, CommentEvent, CommentId, CommentState, CommentStore, CommentTarget, CommentType,
+        NewComment,
+    },
+    persistence::{CodeReviewDb, StoredReview},
 };
+use anyhow::Context as _;
 use buffer_diff::BufferDiffSnapshot;
 use collections::{HashMap, HashSet};
 use git::repository::RepoPath;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task, WeakEntity,
+    App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task, TaskExt as _,
+    WeakEntity,
 };
 use language::{Anchor, BufferSnapshot};
-use std::{future::Future, ops::Range};
+use std::{
+    future::Future,
+    ops::{Range, RangeInclusive},
+};
 use util::ResultExt as _;
+
+/// Reviews not opened for this long are forgotten (marks and comments), once per run of Zed,
+/// when the first review opens.
+const FORGET_REVIEWS_AFTER_DAYS: i64 = 90;
 
 /// Identifies a review across tabs and restarts (DESIGN §2.6): the repository plus what is
 /// reviewed, never a head SHA, so new commits or pushes keep the review's state.
@@ -23,8 +35,12 @@ struct ReviewSessions(HashMap<ReviewKey, WeakEntity<ReviewSession>>);
 
 impl Global for ReviewSessions {}
 
-/// The reviewed marks and comments of one review. Marks are loaded from and saved to
-/// [`CodeReviewDb`].
+/// Set once old reviews have been pruned in this run.
+struct PrunedOldReviews;
+
+impl Global for PrunedOldReviews {}
+
+/// The reviewed marks and comments of one review, loaded from and saved to [`CodeReviewDb`].
 ///
 /// Marks are only deleted when the user unmarks them. A file is reviewed while its diff is the
 /// one it was marked with, and a hunk while its content is: a diff that changes can change back
@@ -41,6 +57,9 @@ pub(crate) struct ReviewSession {
     /// The content hash of each file's diff as last seen.
     content_hashes: HashMap<RepoPath, u64>,
     comments: CommentStore,
+    /// Comments whose lines moved (or whose text changed) since they were last saved. They are
+    /// saved with the comment's next change, and when the review's tabs close or Zed quits.
+    moved_comments: HashSet<CommentId>,
     _load_task: Task<()>,
 }
 
@@ -74,16 +93,23 @@ impl ReviewSession {
 
     fn new(key: ReviewKey, cx: &mut Context<Self>) -> Self {
         let db = CodeReviewDb::global(cx);
+        if !cx.has_global::<PrunedOldReviews>() {
+            cx.set_global(PrunedOldReviews);
+            let prune = db.prune(FORGET_REVIEWS_AFTER_DAYS * 24 * 60 * 60);
+            cx.background_spawn(async move { prune.await.context("forgetting old reviews") })
+                .detach_and_log_err(cx);
+        }
         let load = db.open_review(key.0.to_string());
         let load_task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| match result {
-                Ok(marks) => this.apply_stored_marks(marks, cx),
-                // Marks stay unchangeable, so that nothing overwrites the stored ones.
+                Ok(stored) => this.apply_stored_review(stored, cx),
+                // Marks and comments stay unchangeable, so that nothing overwrites the stored
+                // ones.
                 Err(error) => {
-                    log::error!("loading reviewed marks: {error:#}");
+                    log::error!("loading a review: {error:#}");
                     cx.emit(ReviewSessionEvent::Failed(
-                        format!("Couldn't load the reviewed marks: {error:#}").into(),
+                        format!("Couldn't load the review's marks and comments: {error:#}").into(),
                     ));
                 }
             })
@@ -97,11 +123,13 @@ impl ReviewSession {
             reviewed_hunks: HashMap::default(),
             content_hashes: HashMap::default(),
             comments: CommentStore::default(),
+            moved_comments: HashSet::default(),
             _load_task: load_task,
         }
     }
 
-    fn apply_stored_marks(&mut self, marks: StoredMarks, cx: &mut Context<Self>) {
+    fn apply_stored_review(&mut self, stored: StoredReview, cx: &mut Context<Self>) {
+        let marks = stored;
         for (path, content_hash) in marks.files {
             match RepoPath::new(&path) {
                 Ok(repo_path) => {
@@ -121,6 +149,12 @@ impl ReviewSession {
                 Err(error) => log::warn!("skipping reviewed hunk in {path:?}: {error:#}"),
             }
         }
+        self.comments
+            .restore(marks.comments.into_iter().filter_map(|(id, json)| {
+                Comment::from_json(CommentId(id), &json)
+                    .with_context(|| format!("skipping stored comment {id}"))
+                    .log_err()
+            }));
         self.loaded = true;
         cx.emit(ReviewSessionEvent::Loaded);
         cx.notify();
@@ -130,8 +164,8 @@ impl ReviewSession {
         &self.key
     }
 
-    /// Marks can't change until the stored ones are loaded (which takes milliseconds), or the
-    /// load would overwrite them.
+    /// Marks can't change and comments can't be added until the stored ones are loaded (which
+    /// takes milliseconds), or the load would overwrite them.
     pub(crate) fn is_loaded(&self) -> bool {
         self.loaded
     }
@@ -170,6 +204,7 @@ impl ReviewSession {
                 path.as_unix_str().to_string(),
                 Some(content_hash),
             ),
+            MARKS_NOT_SAVED,
             cx,
         );
         cx.emit(ReviewSessionEvent::FilesChanged(vec![(path.clone(), true)]));
@@ -184,6 +219,7 @@ impl ReviewSession {
         persist(
             self.db
                 .unset_file_reviewed(self.key.0.to_string(), path.as_unix_str().to_string()),
+            MARKS_NOT_SAVED,
             cx,
         );
         cx.emit(ReviewSessionEvent::FilesChanged(vec![(
@@ -210,6 +246,7 @@ impl ReviewSession {
             persist(
                 self.db
                     .unset_hunk_reviewed(key, unix_path, hunk_key.to_string()),
+                MARKS_NOT_SAVED,
                 cx,
             );
             false
@@ -218,6 +255,7 @@ impl ReviewSession {
             persist(
                 self.db
                     .set_hunk_reviewed(key, unix_path, hunk_key.to_string()),
+                MARKS_NOT_SAVED,
                 cx,
             );
             true
@@ -250,6 +288,7 @@ impl ReviewSession {
                     path.as_unix_str().to_string(),
                     Some(digest.content_hash),
                 ),
+                MARKS_NOT_SAVED,
                 cx,
             );
         }
@@ -269,15 +308,20 @@ impl ReviewSession {
         &self.comments
     }
 
+    /// Adds a comment, which is saved once it has text. `None` until the stored comments are
+    /// loaded.
     pub(crate) fn add_comment(
         &mut self,
         new_comment: NewComment,
         cx: &mut Context<Self>,
-    ) -> CommentId {
+    ) -> Option<CommentId> {
+        if !self.loaded {
+            return None;
+        }
         let id = self.comments.insert(new_comment);
         cx.emit(ReviewSessionEvent::Comment(CommentEvent::Added(id)));
         cx.notify();
-        id
+        Some(id)
     }
 
     /// Saves the comment's text, which is trimmed first.
@@ -290,6 +334,7 @@ impl ReviewSession {
             return;
         }
         comment.body = body.to_string();
+        self.save_comment(id, cx);
         cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
         cx.notify();
     }
@@ -307,29 +352,138 @@ impl ReviewSession {
             return;
         }
         comment.comment_type = comment_type;
+        self.save_comment(id, cx);
         cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
         cx.notify();
     }
 
     pub(crate) fn delete_comment(&mut self, id: CommentId, cx: &mut Context<Self>) {
         if self.comments.remove(id).is_some() {
+            self.moved_comments.remove(&id);
+            persist(
+                self.db.delete_comment(self.key.0.to_string(), id.0),
+                "Couldn't delete the comment",
+                cx,
+            );
             cx.emit(ReviewSessionEvent::Comment(CommentEvent::Removed(id)));
             cx.notify();
         }
     }
+
+    /// Records where a line comment's anchor is now: its lines, and their text unless the
+    /// comment is outdated (whose text is what the comment was about). Saved later.
+    pub(crate) fn set_comment_position(
+        &mut self,
+        id: CommentId,
+        lines: RangeInclusive<u32>,
+        line_text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(comment) = self.comments.get_mut(id) else {
+            return;
+        };
+        let CommentTarget::Lines {
+            lines: comment_lines,
+            ..
+        } = &mut comment.target
+        else {
+            return;
+        };
+        let mut changed = false;
+        if *comment_lines != lines {
+            *comment_lines = lines;
+            changed = true;
+        }
+        if !comment.is_outdated() && comment.line_text.as_deref() != Some(line_text.as_str()) {
+            comment.line_text = Some(line_text);
+            changed = true;
+        }
+        if changed {
+            self.moved_comments.insert(id);
+            cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
+            cx.notify();
+        }
+    }
+
+    /// Gives a comment loaded from the database its anchor in its file, flagging it outdated
+    /// when its lines' text changed while the review was closed.
+    pub(crate) fn resolve_comment(
+        &mut self,
+        id: CommentId,
+        anchor: Range<Anchor>,
+        outdated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(comment) = self.comments.get_mut(id) else {
+            return;
+        };
+        comment.anchor = Some(anchor);
+        if outdated && comment.state == CommentState::Draft {
+            comment.state = CommentState::Outdated;
+            self.save_comment(id, cx);
+        }
+        cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
+        cx.notify();
+    }
+
+    /// Forgets a comment's anchor, whose buffer was replaced (the file's diff base was reloaded
+    /// as another buffer, or its snapshot rebuilt); it is resolved again by its lines.
+    pub(crate) fn unresolve_comment(&mut self, id: CommentId) {
+        if let Some(comment) = self.comments.get_mut(id) {
+            comment.anchor = None;
+        }
+    }
+
+    /// Saves the comments whose position changed since they were last saved.
+    pub(crate) fn flush(&mut self, cx: &mut Context<Self>) {
+        for id in std::mem::take(&mut self.moved_comments) {
+            self.save_comment(id, cx);
+        }
+    }
+
+    /// Completes once every write queued so far has.
+    pub(crate) fn saved(&self) -> impl Future<Output = ()> + use<> {
+        let done = self.db.sync();
+        async move {
+            done.await.log_err();
+        }
+    }
+
+    /// Comments without text aren't saved: a new comment starts empty, and is deleted if it is
+    /// left so.
+    fn save_comment(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        let Some(comment) = self.comments.get(id) else {
+            return;
+        };
+        if comment.body.is_empty() {
+            return;
+        }
+        self.moved_comments.remove(&id);
+        match comment.to_json() {
+            Ok(json) => persist(
+                self.db.save_comment(self.key.0.to_string(), id.0, json),
+                "Couldn't save the comment",
+                cx,
+            ),
+            Err(error) => log::error!("serializing comment {id:?}: {error:#}"),
+        }
+    }
 }
+
+const MARKS_NOT_SAVED: &str = "Couldn't save the reviewed marks";
 
 /// The write is already queued; this only reports its failure.
 fn persist(
     write: impl Future<Output = anyhow::Result<()>> + 'static,
+    failure: &'static str,
     cx: &mut Context<ReviewSession>,
 ) {
     cx.spawn(async move |this, cx| {
         if let Err(error) = write.await {
-            log::error!("saving reviewed marks: {error:#}");
+            log::error!("{failure}: {error:#}");
             this.update(cx, |_, cx| {
                 cx.emit(ReviewSessionEvent::Failed(
-                    format!("Couldn't save the reviewed marks: {error:#}").into(),
+                    format!("{failure}: {error:#}").into(),
                 ))
             })
             .log_err();
@@ -598,6 +752,170 @@ mod tests {
         other.read_with(cx, |other, _| {
             assert!(!other.is_hunk_reviewed(&path, &first_hunk))
         });
+    }
+
+    fn comment_bodies(session: &Entity<ReviewSession>, cx: &TestAppContext) -> Vec<(u64, String)> {
+        session.read_with(cx, |session, _| {
+            session
+                .comments()
+                .iter()
+                .map(|comment| (comment.id.0, comment.body.clone()))
+                .collect()
+        })
+    }
+
+    fn add_line_comment(
+        session: &Entity<ReviewSession>,
+        body: &str,
+        cx: &mut TestAppContext,
+    ) -> CommentId {
+        session.update(cx, |session, cx| {
+            let id = session
+                .add_comment(
+                    NewComment {
+                        target: CommentTarget::Lines {
+                            path: RepoPath::new("src/lib.rs").unwrap(),
+                            side: crate::comments::Side::New,
+                            lines: 3..=4,
+                        },
+                        line_text: Some("line 3\nline 4".into()),
+                        anchor: None,
+                    },
+                    cx,
+                )
+                .unwrap();
+            session.set_comment_body(id, body, cx);
+            id
+        })
+    }
+
+    #[gpui::test]
+    async fn test_comments_persist(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let key = ReviewKey("uncommitted:/project".into());
+        let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+        // Nothing can be added before the stored comments are loaded.
+        session.update(cx, |session, cx| {
+            let new_comment = NewComment {
+                target: CommentTarget::Review,
+                line_text: None,
+                anchor: None,
+            };
+            assert!(session.add_comment(new_comment, cx).is_none());
+        });
+        cx.run_until_parked();
+
+        let first = add_line_comment(&session, "  first  ", cx);
+        let second = add_line_comment(&session, "second", cx);
+        let deleted = add_line_comment(&session, "deleted", cx);
+        session.update(cx, |session, cx| {
+            session.set_comment_type(first, Some(CommentType::Issue), cx);
+            session.delete_comment(deleted, cx);
+            // A comment without text isn't stored.
+            session.add_comment(
+                NewComment {
+                    target: CommentTarget::Review,
+                    line_text: None,
+                    anchor: None,
+                },
+                cx,
+            );
+            // Positions are stored on the next change, or when flushed.
+            session.set_comment_position(second, 10..=11, "line 10\nline 11".into(), cx);
+            session.flush(cx);
+        });
+        drop(session);
+        cx.run_until_parked();
+
+        let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            comment_bodies(&session, cx),
+            [
+                (first.0, "first".to_string()),
+                (second.0, "second".to_string())
+            ]
+        );
+        session.read_with(cx, |session, _| {
+            let first = session.comments().get(first).unwrap();
+            assert_eq!(first.comment_type, Some(CommentType::Issue));
+            assert_eq!(first.state, CommentState::Draft);
+            let second = session.comments().get(second).unwrap();
+            assert_eq!(
+                second.target,
+                CommentTarget::Lines {
+                    path: RepoPath::new("src/lib.rs").unwrap(),
+                    side: crate::comments::Side::New,
+                    lines: 10..=11,
+                }
+            );
+            assert_eq!(second.line_text.as_deref(), Some("line 10\nline 11"));
+            assert!(second.anchor.is_none());
+        });
+        // Ids continue after the stored ones.
+        let next = add_line_comment(&session, "next", cx);
+        assert!(next.0 > second.0);
+
+        // An outdated comment stays outdated, and keeps the text it was about.
+        session.update(cx, |session, cx| {
+            let anchor =
+                language::Anchor::min_max_range_for_buffer(language::BufferId::new(1).unwrap());
+            session.resolve_comment(first, anchor, true, cx);
+            session.set_comment_position(first, 1..=1, "changed".into(), cx);
+            session.flush(cx);
+        });
+        drop(session);
+        cx.run_until_parked();
+        let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let first = session.comments().get(first).unwrap();
+            assert_eq!(first.state, CommentState::Outdated);
+            assert_eq!(first.line_text.as_deref(), Some("line 3\nline 4"));
+        });
+
+        // Other reviews have their own comments.
+        let other =
+            cx.update(|cx| ReviewSession::for_key(ReviewKey("uncommitted:/other".into()), cx));
+        cx.run_until_parked();
+        assert!(comment_bodies(&other, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_old_reviews_are_forgotten(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let old_key = ReviewKey("uncommitted:/old".into());
+        let recent_key = ReviewKey("uncommitted:/recent".into());
+        for key in [&old_key, &recent_key] {
+            let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+            cx.run_until_parked();
+            add_line_comment(&session, "kept?", cx);
+            session.update(cx, |session, cx| {
+                session.mark_file(&RepoPath::new("src/lib.rs").unwrap(), 1, cx)
+            });
+            drop(session);
+            cx.run_until_parked();
+        }
+        let db = cx.update(|cx| CodeReviewDb::global(cx));
+        let days = |days: i64| days * 24 * 60 * 60;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        db.set_last_opened_at(old_key.0.to_string(), now - days(91))
+            .await
+            .unwrap();
+        db.set_last_opened_at(recent_key.0.to_string(), now - days(89))
+            .await
+            .unwrap();
+
+        // The next run of Zed forgets the old review when it opens its first review.
+        cx.update(|cx| cx.remove_global::<PrunedOldReviews>());
+        let recent = cx.update(|cx| ReviewSession::for_key(recent_key.clone(), cx));
+        let old = cx.update(|cx| ReviewSession::for_key(old_key.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(comment_bodies(&recent, cx).len(), 1);
+        assert!(comment_bodies(&old, cx).is_empty());
+        let path = RepoPath::new("src/lib.rs").unwrap();
+        recent.read_with(cx, |recent, _| assert!(recent.is_file_reviewed(&path)));
+        old.read_with(cx, |old, _| assert!(!old.is_file_reviewed(&path)));
     }
 
     /// `digest` with the hunk at `index` changed.

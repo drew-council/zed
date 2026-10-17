@@ -14,7 +14,7 @@ use crate::{
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
     reviewed::paint_reviewed_hunks,
-    session::{ReviewSession, ReviewSessionEvent},
+    session::{ReviewKey, ReviewSession, ReviewSessionEvent},
     target::{BranchBase, ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
@@ -350,6 +350,10 @@ pub struct ReviewView {
     line_cursor: Entity<LineCursor>,
     /// Shared by every tab reviewing the same thing; replaced when the review key changes.
     session: Entity<ReviewSession>,
+    /// The sessions of the keys this tab reviewed before (another base, another branch), kept
+    /// while the tab is open so that switching back finds their comments as they were, anchors
+    /// and all.
+    previous_sessions: HashMap<ReviewKey, Entity<ReviewSession>>,
     comments: Entity<CommentBlocks>,
     filters: ReviewFilters,
     /// The generated and vendored files among the review's files.
@@ -537,6 +541,7 @@ impl ReviewView {
             top_block,
             line_cursor,
             session,
+            previous_sessions: HashMap::default(),
             comments,
             filters: ReviewFilters::default(),
             attributes: HashMap::default(),
@@ -560,7 +565,13 @@ impl ReviewView {
         if self.session.read(cx).key() == &key {
             return;
         }
-        self.session = ReviewSession::for_key(key, cx);
+        let session = self
+            .previous_sessions
+            .remove(&key)
+            .unwrap_or_else(|| ReviewSession::for_key(key, cx));
+        let previous = std::mem::replace(&mut self.session, session);
+        let previous_key = previous.read(cx).key().clone();
+        self.previous_sessions.insert(previous_key, previous);
         self._session_subscription =
             cx.subscribe_in(&self.session, window, Self::handle_session_event);
         let session = self.session.clone();
@@ -2232,6 +2243,67 @@ mod tests {
             assert_eq!(review_count(&workspace, cx), 2);
             let main_review = active_review(&workspace, cx);
             assert_eq!(tab_title(&main_review, cx), "Review: feature vs main");
+        }
+
+        #[gpui::test]
+        async fn test_comments_survive_review_key_switches(cx: &mut TestAppContext) {
+            use crate::test_support::{move_to_row_with_text, rhs_editor};
+
+            crate::test_support::init_vim_test(cx, DiffViewStyle::Unified);
+            let (fs, workspace, cx) = branch_fixture(cx).await;
+            dispatch(ReviewBranch::default(), cx);
+            let review = active_review(&workspace, cx);
+            cx.focus(&review);
+            cx.run_until_parked();
+            let rhs = rhs_editor(&review, cx);
+            let bodies = |cx: &mut VisualTestContext| {
+                review.read_with(cx, |review, cx| {
+                    review
+                        .session()
+                        .read(cx)
+                        .comments()
+                        .iter()
+                        .map(|comment| comment.body.clone())
+                        .collect::<Vec<_>>()
+                })
+            };
+            let hosted = |cx: &mut VisualTestContext| {
+                let blocks = review.read_with(cx, |review, _| review.comments().clone());
+                cx.update(|_, cx| blocks.update(cx, |blocks, cx| blocks.hosted_rows(cx).len()))
+            };
+
+            move_to_row_with_text(&rhs, "TWO", cx);
+            cx.simulate_keystrokes("c");
+            cx.simulate_input("saved");
+            cx.simulate_keystrokes("ctrl-enter");
+            // This one is still being written when the key changes.
+            move_to_row_with_text(&rhs, "B", cx);
+            cx.simulate_keystrokes("c");
+            cx.simulate_input("open");
+
+            let change_base = |base: &str, cx: &mut VisualTestContext| {
+                let base = BranchBase::new(base.to_string()).unwrap();
+                review.update_in(cx, |review, window, cx| {
+                    review.change_base(base, window, cx)
+                });
+                cx.run_until_parked();
+            };
+            change_base("main", cx);
+            assert!(bodies(cx).is_empty());
+            assert_eq!(hosted(cx), 0);
+            change_base("origin/main", cx);
+            assert_eq!(bodies(cx), ["saved", "open"]);
+            assert_eq!(hosted(cx), 2);
+
+            // A branch switch and back.
+            fs.set_branch_name(dot_git(), Some("other"));
+            cx.run_until_parked();
+            assert_eq!(tab_title(&review, cx), "Review: other vs origin/main");
+            assert!(bodies(cx).is_empty());
+            fs.set_branch_name(dot_git(), Some("feature"));
+            cx.run_until_parked();
+            assert_eq!(bodies(cx), ["saved", "open"]);
+            assert_eq!(hosted(cx), 2);
         }
 
         #[gpui::test]

@@ -1,4 +1,4 @@
-use super::{Comment, CommentBlocks, CommentId, CommentState, CommentTarget, CommentType};
+use super::{Comment, CommentBlocks, CommentId, CommentTarget, CommentType, Side};
 use crate::{CycleCommentType, CycleCommentTypeBackward, DiscardCommentChanges, SaveComment};
 use editor::{Editor, hover_markdown_style};
 use gpui::{Entity, Subscription, WeakEntity};
@@ -7,7 +7,7 @@ use markdown::{Markdown, MarkdownElement};
 use std::sync::Arc;
 use ui::{Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::{CloseActiveItem, SaveIntent};
+use workspace::{CloseActiveItem, CloseItemInAllPanes, SaveIntent};
 
 /// How a comment editor is left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +37,7 @@ pub(crate) struct CommentView {
     blocks: WeakEntity<CommentBlocks>,
     comment_type: Option<CommentType>,
     location: Option<SharedString>,
+    is_outdated: bool,
     is_submitted: bool,
     markdown: Entity<Markdown>,
     editing: Option<EditingState>,
@@ -58,7 +59,8 @@ impl CommentView {
             blocks,
             comment_type: comment.comment_type,
             location: location_label(&comment.target),
-            is_submitted: matches!(comment.state, CommentState::Submitted { .. }),
+            is_outdated: comment.is_outdated(),
+            is_submitted: comment.is_submitted(),
             markdown,
             editing: None,
             targeted: false,
@@ -68,7 +70,8 @@ impl CommentView {
     pub(crate) fn update_comment(&mut self, comment: &Comment, cx: &mut Context<Self>) {
         self.comment_type = comment.comment_type;
         self.location = location_label(&comment.target);
-        self.is_submitted = matches!(comment.state, CommentState::Submitted { .. });
+        self.is_outdated = comment.is_outdated();
+        self.is_submitted = comment.is_submitted();
         if self.markdown.read(cx).source().as_ref() != comment.body {
             let body = SharedString::from(comment.body.clone());
             self.markdown
@@ -83,6 +86,12 @@ impl CommentView {
 
     pub(crate) fn editor(&self) -> Option<&Entity<Editor>> {
         self.editing.as_ref().map(|editing| &editing.editor)
+    }
+
+    pub(crate) fn set_return_to(&mut self, return_to: WeakEntity<Editor>) {
+        if let Some(editing) = &mut self.editing {
+            editing.return_to = return_to;
+        }
     }
 
     pub(crate) fn start_editing(&mut self, editing: EditingState, cx: &mut Context<Self>) {
@@ -114,9 +123,28 @@ impl CommentView {
         self.targeted
     }
 
-    /// The type badge and what the comment is on, when there is anything to say.
+    #[cfg(test)]
+    pub(crate) fn markdown_source(&self, cx: &App) -> SharedString {
+        self.markdown.read(cx).source().to_string().into()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_outdated(&self) -> bool {
+        self.is_outdated
+    }
+
+    #[cfg(test)]
+    pub(crate) fn location(&self) -> Option<SharedString> {
+        self.location.clone()
+    }
+
+    /// The type and state badges and what the comment is on, when there is anything to say.
     fn render_header(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if self.comment_type.is_none() && self.location.is_none() {
+        if self.comment_type.is_none()
+            && self.location.is_none()
+            && !self.is_outdated
+            && !self.is_submitted
+        {
             return None;
         }
         Some(
@@ -124,6 +152,19 @@ impl CommentView {
                 .gap_2()
                 .when_some(self.comment_type, |header, comment_type| {
                     header.child(type_badge(comment_type, cx))
+                })
+                .when(self.is_outdated, |header| {
+                    header.child(
+                        div()
+                            .id(("review-comment-outdated", self.id.0))
+                            .child(state_badge("OUTDATED", Color::Warning, cx))
+                            .tooltip(Tooltip::text(
+                                "The commented lines changed while the review was closed",
+                            )),
+                    )
+                })
+                .when(self.is_submitted, |header| {
+                    header.child(state_badge("SUBMITTED", Color::Muted, cx))
                 })
                 .when_some(self.location.clone(), |header, location| {
                     header.child(
@@ -192,15 +233,40 @@ fn cycle_type(blocks: &WeakEntity<CommentBlocks>, id: CommentId, forward: bool, 
         .log_err();
 }
 
+/// A comment's block sits below its last line, so a single line needs no label. The line numbers
+/// follow edits while the review is open.
 fn location_label(target: &CommentTarget) -> Option<SharedString> {
     match target {
         CommentTarget::Review => None,
         CommentTarget::File { .. } => Some("File comment".into()),
-        CommentTarget::Lines { lines, .. } if lines.start() != lines.end() => {
-            Some(format!("Lines {}–{}", lines.start(), lines.end()).into())
+        CommentTarget::Lines { lines, side, .. } if lines.start() != lines.end() => {
+            let label = match side {
+                Side::New => "Lines",
+                Side::Old => "Old lines",
+            };
+            Some(format!("{label} {}–{}", lines.start(), lines.end()).into())
         }
+        CommentTarget::Lines {
+            side: Side::Old,
+            lines,
+            ..
+        } => Some(format!("Old line {}", lines.start()).into()),
         CommentTarget::Lines { .. } => None,
     }
+}
+
+fn state_badge(label: &'static str, color: Color, cx: &App) -> impl IntoElement {
+    div()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(color.color(cx).opacity(0.6))
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(color)
+                .buffer_font(cx),
+        )
 }
 
 fn type_badge(comment_type: CommentType, cx: &App) -> impl IntoElement {
@@ -279,6 +345,18 @@ impl Render for CommentView {
                 .on_action({
                     let blocks = blocks.clone();
                     move |action: &CloseActiveItem, window, cx| {
+                        let mode = if action.save_intent == Some(SaveIntent::Skip) {
+                            Leave::Discard
+                        } else {
+                            Leave::Keep
+                        };
+                        leave(&blocks, id, mode, window, cx)
+                    }
+                })
+                // Vim's `:bd` keeps the text and `:bd!` discards it, like `:q` and `:q!`.
+                .on_action({
+                    let blocks = blocks.clone();
+                    move |action: &CloseItemInAllPanes, window, cx| {
                         let mode = if action.save_intent == Some(SaveIntent::Skip) {
                             Leave::Discard
                         } else {
