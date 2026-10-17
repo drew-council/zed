@@ -56,9 +56,32 @@
   withGLES ? false,
   profile ? "release",
   commitSha ? null,
+  releaseChannel ? "nightly",
 }:
 assert withGLES -> stdenv.hostPlatform.isLinux;
+# The Darwin install phase below still bundles and links the nightly app.
+assert releaseChannel != "nightly" -> stdenv.hostPlatform.isLinux;
 let
+  channel =
+    {
+      stable = {
+        suffix = "";
+        appName = "Zed";
+        appId = "dev.zed.Zed";
+      };
+      preview = {
+        suffix = "-preview";
+        appName = "Zed Preview";
+        appId = "dev.zed.Zed-Preview";
+      };
+      nightly = {
+        suffix = "-nightly";
+        appName = "Zed Nightly";
+        appId = "dev.zed.Zed-Nightly";
+      };
+    }
+    .${releaseChannel};
+
   mkIncludeFilter =
     root': path: type:
     let
@@ -94,7 +117,7 @@ let
       pname = "zed-editor";
       version =
         zedCargoLock.package.version
-        + "-nightly"
+        + channel.suffix
         + lib.optionalString (commitSha != null) "+${builtins.substring 0 7 commitSha}";
       src = builtins.path {
         path = ../.;
@@ -354,7 +377,7 @@ craneLib.buildPackage (
     # TODO: put this in a separate derivation that depends on src to avoid running it on every build
     preBuild = ''
       ALLOW_MISSING_LICENSES=yes bash script/generate-licenses
-      echo nightly > crates/zed/RELEASE_CHANNEL
+      echo ${releaseChannel} > crates/zed/RELEASE_CHANNEL
     '';
 
     installPhase =
@@ -390,9 +413,9 @@ craneLib.buildPackage (
           ln -s $out/bin/zed $out/bin/zeditor  # home-manager expects the CLI binary to be here
 
 
-          install -D "crates/zed/resources/app-icon-nightly@2x.png" \
+          install -D "crates/zed/resources/app-icon${channel.suffix}@2x.png" \
             "$out/share/icons/hicolor/1024x1024@2x/apps/zed.png"
-          install -D crates/zed/resources/app-icon-nightly.png \
+          install -D crates/zed/resources/app-icon${channel.suffix}.png \
             $out/share/icons/hicolor/512x512/apps/zed.png
 
           # TODO: icons should probably be named "zed-nightly"
@@ -400,11 +423,11 @@ craneLib.buildPackage (
             export DO_STARTUP_NOTIFY="true"
             export APP_CLI="zed"
             export APP_ICON="zed"
-            export APP_NAME="Zed Nightly"
+            export APP_NAME="${channel.appName}"
             export APP_ARGS="%U"
             mkdir -p "$out/share/applications"
-            ${lib.getExe envsubst} < "crates/zed/resources/zed.desktop.in" > "$out/share/applications/dev.zed.Zed-Nightly.desktop"
-            chmod +x "$out/share/applications/dev.zed.Zed-Nightly.desktop"
+            ${lib.getExe envsubst} < "crates/zed/resources/zed.desktop.in" > "$out/share/applications/${channel.appId}.desktop"
+            chmod +x "$out/share/applications/${channel.appId}.desktop"
           )
 
           runHook postInstall
