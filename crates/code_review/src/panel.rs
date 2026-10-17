@@ -1247,22 +1247,36 @@ impl ReviewPanel {
                     })
                     .child(
                         h_flex()
+                            .w_full()
                             .min_w_0()
                             .gap_1()
-                            // Where the comment is matters more than how it starts.
+                            // Where the comment is matters more than how it starts: the first
+                            // line gets what the location leaves.
                             .child(
-                                div().flex_none().max_w(relative(0.6)).child(
-                                    Label::new(comment.location.clone())
-                                        .size(LabelSize::Small)
-                                        .color(if muted { Color::Muted } else { Color::Default })
-                                        .truncate(),
-                                ),
+                                div()
+                                    .flex_none()
+                                    .max_w_full()
+                                    .debug_selector(|| {
+                                        format!("review-comment-location: {}", comment.first_line)
+                                    })
+                                    .child(
+                                        Label::new(comment.location.clone())
+                                            .size(LabelSize::Small)
+                                            .color(if muted {
+                                                Color::Muted
+                                            } else {
+                                                Color::Default
+                                            })
+                                            .truncate(),
+                                    ),
                             )
                             .child(
-                                Label::new(comment.first_line.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate(),
+                                div().flex_1().min_w_0().child(
+                                    Label::new(comment.first_line.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
                             ),
                     )
                     .when_some(state, |item, (state, color)| {
@@ -2234,5 +2248,32 @@ mod tests {
         cx.simulate_keystrokes("r");
         assert!(is_reviewed(&review, "modified.txt", cx));
         assert!(selected(&panel, cx).starts_with("long.txt"));
+    }
+
+    /// A comment's location shows in full however short its first line is (V3.17).
+    #[gpui::test]
+    async fn test_comment_location_isnt_cut_off(cx: &mut TestAppContext) {
+        use crate::test_support::{move_to_row_with_text, open_review_fixture};
+
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        add_review_panel(&workspace, cx);
+        let editor = rhs_editor(&review, cx);
+        for body in ["x", "a first line too long for the panel, so it is cut off"] {
+            move_to_row_with_text(&editor, "line 3", cx);
+            cx.simulate_keystrokes("c");
+            cx.simulate_input(body);
+            cx.simulate_keystrokes("ctrl-enter");
+        }
+        cx.simulate_keystrokes("; h");
+        cx.run_until_parked();
+        let short = cx.debug_bounds("review-comment-location: x").unwrap();
+        let long = cx
+            .debug_bounds(
+                "review-comment-location: a first line too long for the panel, so it is cut off",
+            )
+            .unwrap();
+        assert!(short.size.width > px(0.));
+        assert_eq!(short.size.width, long.size.width);
     }
 }
