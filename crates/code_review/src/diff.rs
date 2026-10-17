@@ -1,19 +1,22 @@
-use crate::target::ReviewTarget;
+use crate::{commits::CommitDiffList, target::ReviewTarget};
 use anyhow::Result;
 use buffer_diff::{BufferDiff, BufferDiffEvent};
 use collections::{HashMap, HashSet};
 use editor::{
-    EditorEvent, EditorSettings, HiddenUnstagedDiffHunkRenderer, SelectionEffects,
+    Addon, EditorEvent, EditorSettings, HiddenUnstagedDiffHunkRenderer, SelectionEffects,
     SplittableEditor, multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
-use git::repository::RepoPath;
+use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
     AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
     WeakEntity,
 };
-use language::{Anchor, Buffer, Capability, OffsetRangeExt as _, language_settings::SoftWrap};
+use language::{
+    Anchor, Buffer, BufferId, Capability, OffsetRangeExt as _, Point,
+    language_settings::SoftWrap,
+};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
@@ -32,9 +35,71 @@ use workspace::{CloseActiveItem, Item as _, ItemNavHistory, Workspace};
 /// last, leaving a large diff on a spinner. Throughput flattens past this point.
 const MAX_CONCURRENT_BUFFER_LOADS: usize = 16;
 
-fn diff_base(target: &ReviewTarget) -> DiffBase {
-    match target {
-        ReviewTarget::Uncommitted => DiffBase::Head,
+/// Where a review's changed files and their diffs come from.
+#[derive(Clone)]
+pub(crate) enum DiffSource {
+    BufferList(Entity<DiffBufferList>),
+    Commits(Entity<CommitDiffList>),
+}
+
+impl DiffSource {
+    fn new(
+        target: &ReviewTarget,
+        repo: Entity<Repository>,
+        project: Entity<Project>,
+        cx: &mut App,
+    ) -> Self {
+        let diff_base = match target {
+            ReviewTarget::Uncommitted => DiffBase::Head,
+            ReviewTarget::Branch { base } => DiffBase::Merge {
+                base_ref: base.clone(),
+            },
+            ReviewTarget::Commits(range) => {
+                let range = *range;
+                return Self::Commits(
+                    cx.new(|cx| CommitDiffList::new(range, repo, project, cx)),
+                );
+            }
+        };
+        let git_store = project.read(cx).git_store().clone();
+        Self::BufferList(cx.new(|cx| DiffBufferList::new(diff_base, git_store, Some(repo), cx)))
+    }
+
+    fn load_buffers(&self, cx: &mut App) -> Vec<DiffBuffer> {
+        match self {
+            Self::BufferList(list) => list.update(cx, |list, cx| list.load_buffers(cx)),
+            Self::Commits(list) => list.update(cx, |list, cx| list.load_buffers(cx)),
+        }
+    }
+
+    fn repo(&self, cx: &App) -> Option<Entity<Repository>> {
+        match self {
+            Self::BufferList(list) => list.read(cx).repo().cloned(),
+            Self::Commits(list) => Some(list.read(cx).repo().clone()),
+        }
+    }
+
+    fn status_for_buffer_id(&self, buffer_id: BufferId, cx: &App) -> Option<FileStatus> {
+        match self {
+            Self::BufferList(list) => list.read(cx).status_for_buffer_id(buffer_id, cx),
+            Self::Commits(list) => list.read(cx).status_for_buffer_id(buffer_id, cx),
+        }
+    }
+}
+
+/// Shows each file header's status against the review's base (merge base, commit range base)
+/// rather than against HEAD.
+struct ReviewAddon {
+    source: DiffSource,
+}
+
+impl Addon for ReviewAddon {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn override_status_for_buffer_id(&self, buffer_id: BufferId, cx: &App) -> Option<FileStatus> {
+        self.source.status_for_buffer_id(buffer_id, cx)
     }
 }
 
@@ -47,11 +112,15 @@ struct BufferSubscriptions {
 }
 
 /// The diff of a review: a read-only multibuffer with one excerpt group per changed file, over
-/// the real project buffers, kept in sync with the changed-file list of a [`DiffBufferList`] and
-/// with each buffer's [`BufferDiff`]. Adapted from `git_ui`'s `DiffMultibuffer`.
+/// the real project buffers (or historic ones for commit snapshots), kept in sync with the
+/// changed-file list of its [`DiffSource`] and with each buffer's [`BufferDiff`]. Adapted from
+/// `git_ui`'s `DiffMultibuffer`.
 pub struct ReviewDiff {
     multibuffer: Entity<MultiBuffer>,
-    diff_buffer_list: Entity<DiffBufferList>,
+    source: DiffSource,
+    /// A merge-base list has no files until its first tree diff; until that starts, the review
+    /// is loading rather than empty.
+    awaiting_tree_diff: bool,
     editor: Entity<SplittableEditor>,
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
     /// Single-file mode: only this file's excerpts are in the multibuffer.
@@ -71,9 +140,7 @@ impl ReviewDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let git_store = project.read(cx).git_store().clone();
-        let diff_buffer_list =
-            cx.new(|cx| DiffBufferList::new(diff_base(target), git_store, Some(repo), cx));
+        let source = DiffSource::new(target, repo, project.clone(), cx);
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -93,6 +160,9 @@ impl ReviewDiff {
             editor.set_diff_hunk_renderer(Some(Arc::new(HiddenUnstagedDiffHunkRenderer)), cx);
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_read_only(true);
+                editor.register_addon(ReviewAddon {
+                    source: source.clone(),
+                });
                 // Long lines scroll horizontally instead of wrapping, like tuicr. Without an
                 // override the first file's language settings would decide for the whole
                 // review. The left side copies this when it is created.
@@ -101,18 +171,32 @@ impl ReviewDiff {
             editor
         });
 
-        let subscriptions = vec![
-            cx.subscribe_in(&editor, window, Self::handle_editor_event),
-            cx.subscribe_in(
-                &diff_buffer_list,
-                window,
-                |this, _, _: &BranchDiffEvent, window, cx| this.refresh_in(window, cx),
-            ),
-        ];
+        let mut subscriptions = vec![cx.subscribe_in(&editor, window, Self::handle_editor_event)];
+        match &source {
+            DiffSource::BufferList(list) => subscriptions.extend([
+                cx.subscribe_in(list, window, |this, _, _: &BranchDiffEvent, window, cx| {
+                    this.refresh_in(window, cx)
+                }),
+                // The list notifies when a tree diff starts and when it finishes loading.
+                cx.observe(list, |this, list, cx| {
+                    if list.read(cx).is_tree_base_loading() {
+                        this.awaiting_tree_diff = false;
+                    }
+                    cx.notify();
+                }),
+            ]),
+            DiffSource::Commits(list) => subscriptions.extend([
+                cx.subscribe_in(list, window, |this, _, _: &BranchDiffEvent, window, cx| {
+                    this.refresh_in(window, cx)
+                }),
+                cx.observe(list, |_, _, cx| cx.notify()),
+            ]),
+        }
 
         let mut this = Self {
             multibuffer,
-            diff_buffer_list,
+            awaiting_tree_diff: matches!(target, ReviewTarget::Branch { .. }),
+            source,
             editor,
             buffer_subscriptions: HashMap::default(),
             single_file: None,
@@ -134,7 +218,58 @@ impl ReviewDiff {
     }
 
     pub fn repo(&self, cx: &App) -> Option<Entity<Repository>> {
-        self.diff_buffer_list.read(cx).repo().cloned()
+        self.source.repo(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> &DiffSource {
+        &self.source
+    }
+
+    /// Whether the review shows historic, read-only buffers of a commit range that doesn't end
+    /// at HEAD.
+    pub fn is_snapshot(&self, cx: &App) -> bool {
+        match &self.source {
+            DiffSource::BufferList(_) => false,
+            DiffSource::Commits(list) => list.read(cx).is_snapshot(),
+        }
+    }
+
+    fn is_source_loading(&self, cx: &App) -> bool {
+        match &self.source {
+            DiffSource::BufferList(list) => {
+                self.awaiting_tree_diff || list.read(cx).is_tree_base_loading()
+            }
+            DiffSource::Commits(list) => list.read(cx).is_loading(),
+        }
+    }
+
+    fn source_error(&self, cx: &App) -> Option<SharedString> {
+        match &self.source {
+            DiffSource::BufferList(_) => None,
+            DiffSource::Commits(list) => list.read(cx).error(),
+        }
+    }
+
+    /// Changes the base of a branch review. The list empties and reloads against the new base.
+    pub(crate) fn set_branch_base(&mut self, base: SharedString, cx: &mut Context<Self>) {
+        let DiffSource::BufferList(list) = &self.source else {
+            return;
+        };
+        self.empty_label = ReviewTarget::Branch { base: base.clone() }.empty_label();
+        self.awaiting_tree_diff = true;
+        list.update(cx, |list, cx| {
+            list.set_diff_base(DiffBase::Merge { base_ref: base }, cx)
+        });
+        cx.notify();
+    }
+
+    /// The repository path of a file in the review.
+    pub(crate) fn repo_path_for(&self, path_key: &PathKey) -> Option<RepoPath> {
+        self.buffer_subscriptions
+            .iter()
+            .find(|(_, entry)| &entry.path_key == path_key)
+            .map(|(repo_path, _)| repo_path.clone())
     }
 
     fn refresh_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -294,6 +429,19 @@ impl ReviewDiff {
         snapshot.path_for_buffer(anchor.buffer_id).cloned()
     }
 
+    /// The file under the cursor of the focused side, and the cursor's row in that side's buffer.
+    pub(crate) fn path_and_row_at_cursor(&self, cx: &mut App) -> Option<(PathKey, u32)> {
+        let editor = self.editor.read(cx).focused_editor().clone();
+        editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let head = editor.selections.newest::<Point>(&display_snapshot).head();
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let (buffer, point) = snapshot.point_to_buffer_point(head)?;
+            let path_key = snapshot.path_for_buffer(buffer.remote_id())?.clone();
+            Some((path_key, point.row))
+        })
+    }
+
     /// Moves the cursor to the first row of the file (showing only that file in single-file
     /// mode).
     pub(crate) fn move_to_path(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -373,9 +521,7 @@ impl ReviewDiff {
 
     async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncWindowContext) -> Result<()> {
         let entries = this.update(cx, |this, cx| {
-            let buffers_to_load = this
-                .diff_buffer_list
-                .update(cx, |diff_buffer_list, cx| diff_buffer_list.load_buffers(cx));
+            let buffers_to_load = this.source.load_buffers(cx);
             let mut stale_paths = this
                 .multibuffer
                 .read(cx)
@@ -570,7 +716,10 @@ impl Focusable for ReviewDiff {
 impl Render for ReviewDiff {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
-        let is_loading = !self.refresh_task.is_ready();
+        let is_loading = !self.refresh_task.is_ready() || self.is_source_loading(cx);
+        let empty_label = self
+            .source_error(cx)
+            .unwrap_or_else(|| self.empty_label.clone());
 
         div()
             .track_focus(&self.focus_handle)
@@ -596,7 +745,7 @@ impl Render for ReviewDiff {
                         .child(
                             h_flex()
                                 .justify_around()
-                                .child(Label::new(self.empty_label.clone())),
+                                .child(Label::new(empty_label)),
                         )
                         .child(
                             h_flex().justify_around().mt_1().child(

@@ -45,6 +45,8 @@ pub(crate) fn register(workspace: &mut Workspace) {
 pub struct ReviewPanel {
     focus_handle: FocusHandle,
     active_review: Option<WeakEntity<ReviewView>>,
+    /// Re-renders the panel when the review's title changes.
+    _review_subscription: Option<Subscription>,
     _workspace_subscription: Option<Subscription>,
 }
 
@@ -71,11 +73,22 @@ impl ReviewPanel {
         let active_review = workspace
             .active_item_as::<ReviewView>(cx)
             .or_else(|| workspace.items_of_type::<ReviewView>(cx).next());
-        Self {
+        let mut this = Self {
             focus_handle: cx.focus_handle(),
-            active_review: active_review.map(|review| review.downgrade()),
+            active_review: None,
+            _review_subscription: None,
             _workspace_subscription: workspace_subscription,
-        }
+        };
+        this.set_active_review(active_review, cx);
+        this
+    }
+
+    fn set_active_review(&mut self, review: Option<Entity<ReviewView>>, cx: &mut Context<Self>) {
+        self._review_subscription = review
+            .as_ref()
+            .map(|review| cx.observe(review, |_, _, cx| cx.notify()));
+        self.active_review = review.map(|review| review.downgrade());
+        cx.notify();
     }
 
     /// The review the panel shows: the active review tab, or the last active one while another
@@ -95,8 +108,7 @@ impl ReviewPanel {
                 if let Some(review) = workspace.read(cx).active_item_as::<ReviewView>(cx)
                     && self.active_review() != Some(review.clone())
                 {
-                    self.active_review = Some(review.downgrade());
-                    cx.notify();
+                    self.set_active_review(Some(review), cx);
                 }
             }
             workspace::Event::ItemRemoved { item_id } => {
@@ -105,12 +117,11 @@ impl ReviewPanel {
                     .as_ref()
                     .is_some_and(|review| review.entity_id() == *item_id)
                 {
-                    self.active_review = workspace
+                    let next_review = workspace
                         .read(cx)
                         .items_of_type::<ReviewView>(cx)
-                        .find(|review| review.entity_id() != *item_id)
-                        .map(|review| review.downgrade());
-                    cx.notify();
+                        .find(|review| review.entity_id() != *item_id);
+                    self.set_active_review(next_review, cx);
                 }
             }
             _ => {}
@@ -130,7 +141,7 @@ impl Render for ReviewPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
             .active_review()
-            .map(|review| review.read(cx).target().title());
+            .map(|review| review.read(cx).title(cx));
         v_flex()
             .key_context("ReviewPanel")
             .track_focus(&self.focus_handle)

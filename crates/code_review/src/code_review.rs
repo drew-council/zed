@@ -1,18 +1,22 @@
+mod commits;
 mod diff;
 mod line_cursor;
 mod panel;
 mod target;
+mod top_block;
 mod view;
 
 use anyhow::Context as _;
-use gpui::{App, KeyBinding, actions};
+use gpui::{Action, App, KeyBinding, actions};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use settings::{KeybindSource, KeymapFile, KeymapFileLoadResult};
 use util::ResultExt as _;
 use workspace::Workspace;
 
 pub use diff::ReviewDiff;
 pub use panel::ReviewPanel;
-pub use target::ReviewTarget;
+pub use target::{CommitRange, ReviewTarget};
 pub use view::ReviewView;
 
 actions!(
@@ -21,6 +25,10 @@ actions!(
         /// Opens a review of the uncommitted changes (staged and unstaged) in the active
         /// repository.
         ReviewUncommitted,
+        /// Changes the base the current branch review compares against.
+        ChangeBase,
+        /// Shows or hides the commit messages at the top of a commit review.
+        ToggleHeader,
         /// Toggles focus on the review panel.
         ToggleFocus,
         /// Opens the review panel and focuses it.
@@ -47,6 +55,28 @@ actions!(
         OpenFileAtCursor,
     ]
 );
+
+/// Opens a review of the current branch: its changes since the merge base with `base`,
+/// uncommitted changes included.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = code_review)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewBranch {
+    /// The ref to compare against, e.g. "origin/main". Defaults to the repository's default
+    /// branch.
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// Opens a review of one commit ("abc1234", "HEAD~2") or a range of commits ("A..B": the commits
+/// after A up to and including B).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = code_review)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewCommits {
+    #[serde(default)]
+    pub commits: Option<String>,
+}
 
 // Embedded here instead of read through `settings::SettingsAssets`: rust-embed doesn't notice new
 // files in release builds, and every edit to an embedded keymap would rebuild `settings` and
@@ -115,14 +145,16 @@ pub(crate) fn init_test(cx: &mut gpui::TestAppContext) {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use askpass::AskPassDelegate;
+    use editor::{Editor, SelectionEffects, SplittableEditor};
+    use git::repository::{CommitData, CommitOptions};
     use gpui::{
-        Action as _, AppContext as _, BorrowAppContext as _, Entity, TestAppContext,
+        Action, AppContext as _, BorrowAppContext as _, Entity, TestAppContext,
         VisualContext as _, VisualTestContext,
     };
-    use editor::{Editor, SelectionEffects, SplittableEditor};
     use language::Point;
     use multi_buffer::MultiBufferRow;
-    use project::{FakeFs, Project};
+    use project::{FakeFs, Project, git_store::Repository};
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
     use std::{path::Path, sync::Arc};
@@ -239,6 +271,110 @@ pub(crate) mod test_support {
         format!("line {index}\n")
     }
 
+    pub(crate) const C1: &str = "1111111111111111111111111111111111111111";
+    pub(crate) const C2: &str = "2222222222222222222222222222222222222222";
+    pub(crate) const C3: &str = "3333333333333333333333333333333333333333";
+
+    pub(crate) fn dot_git() -> &'static Path {
+        Path::new(path!("/project/.git"))
+    }
+
+    pub(crate) fn oid(sha: &str) -> git::Oid {
+        sha.parse().unwrap()
+    }
+
+    pub(crate) fn commit_data(sha: &str, parent: Option<&str>, message: &str) -> CommitData {
+        CommitData {
+            sha: oid(sha),
+            parents: parent.map(oid).into_iter().collect(),
+            author_name: "Ada".into(),
+            author_email: "ada@example.com".into(),
+            commit_timestamp: 1_700_000_000,
+            subject: message.lines().next().unwrap_or_default().to_string().into(),
+            message: message.to_string().into(),
+        }
+    }
+
+    /// A workspace over `/project`, focused.
+    pub(crate) async fn open_workspace(
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        cx.focus(&workspace);
+        (workspace, cx)
+    }
+
+    pub(crate) fn repository(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<Repository> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).active_repository(cx).unwrap()
+        })
+    }
+
+    /// Makes `sha` with `contents` a historic commit of the fake repository, which only keeps
+    /// the contents of the HEADs it had before each commit.
+    pub(crate) async fn record_commit(
+        fs: &FakeFs,
+        repo: &Entity<Repository>,
+        contents: &[(&str, String)],
+        sha: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        fs.set_head_for_repo(dot_git(), contents, sha);
+        cx.run_until_parked();
+        let committed = repo.update(cx, |repo, cx| {
+            repo.commit(
+                "next".into(),
+                None,
+                CommitOptions {
+                    allow_empty: true,
+                    ..Default::default()
+                },
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        committed.await.unwrap().unwrap();
+    }
+
+    pub(crate) fn dispatch(action: impl Action, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.dispatch_action(action.boxed_clone(), cx));
+        cx.run_until_parked();
+    }
+
+    pub(crate) fn active_review(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<ReviewView> {
+        workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ReviewView>(cx).unwrap()
+        })
+    }
+
+    pub(crate) fn review_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.items_of_type::<ReviewView>(cx).count()
+        })
+    }
+
+    pub(crate) fn tab_title(review: &Entity<ReviewView>, cx: &mut VisualTestContext) -> String {
+        use workspace::item::Item as _;
+        review.read_with(cx, |review, cx| review.tab_content_text(0, cx).to_string())
+    }
+
+    pub(crate) fn excerpt_paths(review: &Entity<ReviewView>, cx: &mut VisualTestContext) -> Vec<String> {
+        review.read_with(cx, |review, cx| review.diff().read(cx).excerpt_file_paths(cx))
+    }
+
     /// A repository whose uncommitted changes are, in review order: `a.rs` (two hunks far apart),
     /// `added.txt`, `deleted.txt`, `long.txt` (a 300-column line) and `modified.txt` (a
     /// modification plus a pure addition, which faces a spacer in split view).
@@ -302,7 +438,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use gpui::{
-        Action as _, AppContext as _, Focusable as _, TestAppContext, VisualContext as _,
+        AppContext as _, Focusable as _, TestAppContext, VisualContext as _,
         VisualTestContext,
     };
     use project::{FakeFs, Project};
