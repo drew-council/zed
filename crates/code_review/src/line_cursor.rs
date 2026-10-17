@@ -1,7 +1,7 @@
 use buffer_diff::DiffHunkStatusKind;
 use editor::{
     Bias, DisplayPoint, Editor, EditorEvent, MultiBufferSnapshot, RowHighlightOptions,
-    SplittableEditor,
+    SplittableEditor, ToPoint as _,
     display_map::{DisplayRow, DisplaySnapshot},
 };
 use gpui::{Entity, EntityId, Hsla, Subscription, point};
@@ -67,6 +67,7 @@ impl LineCursor {
     /// wide enough), and the highlight moves with focus between the sides.
     fn sync_split_state(&mut self, cx: &mut Context<Self>) {
         let splittable = self.editor.read(cx);
+        let rhs_editor = splittable.rhs_editor().clone();
         let lhs_editor = splittable.lhs_editor().cloned();
         let lhs_editor_id = lhs_editor.as_ref().map(|editor| editor.entity_id());
         let focused_lhs = lhs_editor
@@ -78,6 +79,7 @@ impl LineCursor {
             self.lhs_editor_id = lhs_editor_id;
             if let Some(lhs_editor) = &lhs_editor {
                 configure(lhs_editor, cx);
+                face_cursor(&rhs_editor, lhs_editor, cx);
             }
             changed = true;
         }
@@ -164,6 +166,31 @@ fn configure(editor: &Entity<Editor>, cx: &mut App) {
     editor.update(cx, |editor, cx| {
         editor.show_local_selections = false;
         editor.set_forbid_horizontal_autoscroll(true);
+        cx.notify();
+    });
+}
+
+/// Puts a new left side's cursor on the row facing the right side's cursor, as the split
+/// editor does whenever the right side's cursor moves. A new left side otherwise keeps its own
+/// position until then (the end of the diff), and `ctrl-w h` would jump there. Changing the
+/// selections directly has no selection effects, so nothing mirrors back onto the right side.
+fn face_cursor(rhs_editor: &Entity<Editor>, lhs_editor: &Entity<Editor>, cx: &mut App) {
+    let display_point = rhs_editor.update(cx, |editor, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        let head = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_point(snapshot.buffer_snapshot());
+        snapshot.point_to_display_point(head, Bias::Right)
+    });
+    lhs_editor.update(cx, |editor, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        let display_point = snapshot.clip_point(display_point, Bias::Right);
+        let point = snapshot.display_point_to_point(display_point, Bias::Right);
+        editor
+            .selections
+            .change_with(&snapshot, |selections| selections.select_ranges([point..point]));
         cx.notify();
     });
 }
@@ -342,8 +369,8 @@ pub(crate) fn cursor_rows(
 mod tests {
     use super::*;
     use crate::test_support::{
-        add_review_panel, cursor_point, lhs_editor, move_to_row_with_text, open_review_fixture,
-        rhs_editor, row_text, splittable,
+        add_review_panel, cursor_line, cursor_point, lhs_editor, move_to_row_with_text,
+        open_review_fixture, rhs_editor, row_text, splittable,
     };
     use editor::{SelectionEffects, ToggleSplitDiff};
     use gpui::{Focusable as _, TestAppContext, VisualTestContext};
@@ -637,6 +664,34 @@ mod tests {
         let lhs_rows = cursor_rows(&new_lhs, cx);
         assert_eq!(lhs_rows.len(), 1);
         assert_eq!(row_text(&new_lhs, lhs_rows[0].0, cx), "three");
+
+        // Its own cursor starts on the facing row too, so `ctrl-w h` before any motion stays
+        // there (V7.X2).
+        let scroll_y = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.update(cx, |editor, cx| editor.scroll_position(cx).y)
+        };
+        let scroll_top = scroll_y(&rhs, cx);
+        cx.simulate_keystrokes("ctrl-w h");
+        assert!(splittable.read_with(cx, |editor, _| editor.focused_editor() == &new_lhs));
+        assert_eq!(cursor_line(&new_lhs, cx), "three");
+        assert_eq!(scroll_y(&new_lhs, cx), scroll_top);
+        assert_eq!(cursor_point(&rhs, cx).row, rhs_row);
+
+        // Likewise after the pane got too narrow for a split diff and wide again.
+        cx.simulate_keystrokes("ctrl-w l");
+        let wide = cx.update(|window, _| window.bounds().size);
+        cx.simulate_resize(gpui::size(px(300.), wide.height));
+        cx.run_until_parked();
+        cx.simulate_resize(wide);
+        cx.run_until_parked();
+        let resized_lhs = lhs_editor(&review, cx);
+        assert_ne!(resized_lhs, new_lhs);
+        let scroll_top = scroll_y(&rhs, cx);
+        cx.simulate_keystrokes("ctrl-w h");
+        assert!(splittable.read_with(cx, |editor, _| editor.focused_editor() == &resized_lhs));
+        assert_eq!(cursor_line(&resized_lhs, cx), "three");
+        assert_eq!(scroll_y(&resized_lhs, cx), scroll_top);
+        assert_eq!(cursor_point(&rhs, cx).row, rhs_row);
     }
 
     #[gpui::test]
