@@ -2377,4 +2377,101 @@ mod tests {
         assert!(short.size.width > px(0.));
         assert_eq!(short.size.width, long.size.width);
     }
+
+    /// Opening a review shows the panel in the left dock, whichever panel the dock showed and
+    /// whether it was open, and keeps the focus in the diff. Switching between review tabs and
+    /// refreshes leave a dock the user closed closed.
+    #[gpui::test]
+    async fn test_opening_a_review_shows_the_panel(cx: &mut TestAppContext) {
+        use crate::{
+            ReviewBranch,
+            test_support::{
+                active_review, cursor_point, dot_git, insert_commit_ref, open_workspace,
+                review_count,
+            },
+        };
+        use project::FakeFs;
+        use serde_json::json;
+        use util::path;
+        use workspace::{dock::test::TestPanel, pane::ActivatePreviousItem};
+
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "a.txt": "ONE\nTWO\nthree\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(dot_git(), &[("a.txt", "one\ntwo\nthree\n".into())]);
+        fs.set_merge_base_content_for_repo(dot_git(), &[("a.txt", "one\ntwo\nthree\n".into())]);
+        insert_commit_ref(&fs, "main", "1111111111111111111111111111111111111111");
+        let (workspace, cx) = open_workspace(fs.clone(), cx).await;
+        // Another panel of the left dock (the project panel, say) is its active one, and the
+        // dock is closed.
+        let other_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let other_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 0, cx));
+            workspace.add_panel(other_panel.clone(), window, cx);
+            workspace.open_panel::<TestPanel>(window, cx);
+            workspace.close_panel::<TestPanel>(window, cx);
+            other_panel
+        });
+        let panel = add_review_panel(&workspace, cx);
+        let shown_panel = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                let left_dock = workspace.left_dock().read(cx);
+                left_dock.visible_panel().map(|panel| panel.panel_id())
+            })
+        };
+        let assert_diff_focused = |review: &Entity<ReviewView>, cx: &mut VisualTestContext| {
+            let editor = rhs_editor(review, cx);
+            cx.update(|window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
+            let row = cursor_point(&editor, cx).row;
+            cx.simulate_keystrokes("j");
+            assert_ne!(cursor_point(&editor, cx).row, row);
+            cx.simulate_keystrokes("k");
+        };
+        assert_eq!(shown_panel(cx), None);
+
+        dispatch(ReviewUncommitted, cx);
+        let uncommitted = active_review(&workspace, cx);
+        assert_eq!(shown_panel(cx), Some(panel.entity_id()));
+        assert_diff_focused(&uncommitted, cx);
+
+        // The dock shows the other panel.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<TestPanel>(window, cx)
+        });
+        assert_eq!(shown_panel(cx), Some(other_panel.entity_id()));
+        dispatch(
+            ReviewBranch {
+                base: Some("main".into()),
+            },
+            cx,
+        );
+        let branch = active_review(&workspace, cx);
+        assert_ne!(branch, uncommitted);
+        assert_eq!(shown_panel(cx), Some(panel.entity_id()));
+        assert_diff_focused(&branch, cx);
+
+        // The user closes the dock.
+        cx.simulate_keystrokes("; e");
+        assert_eq!(shown_panel(cx), None);
+        dispatch(ActivatePreviousItem::default(), cx);
+        assert_eq!(active_review(&workspace, cx), uncommitted);
+        assert_eq!(shown_panel(cx), None);
+        dispatch(ActivatePreviousItem::default(), cx);
+        assert_eq!(active_review(&workspace, cx), branch);
+        assert_eq!(shown_panel(cx), None);
+        fs.set_head_and_index_for_repo(dot_git(), &[("a.txt", "one\nTWO\nthree\n".into())]);
+        cx.run_until_parked();
+        assert_eq!(shown_panel(cx), None);
+        assert_diff_focused(&branch, cx);
+
+        // Opening a review that is already open shows the panel too.
+        dispatch(ReviewUncommitted, cx);
+        assert_eq!(review_count(&workspace, cx), 2);
+        assert_eq!(active_review(&workspace, cx), uncommitted);
+        assert_eq!(shown_panel(cx), Some(panel.entity_id()));
+        assert_diff_focused(&uncommitted, cx);
+    }
 }

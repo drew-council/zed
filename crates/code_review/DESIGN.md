@@ -23,7 +23,8 @@ C plus the orchestrator's additions: the validators' cheap observations), two re
 the fixed build (R1, local reviews: 74/74; R2, pull requests and the CLI: 48/50, one
 upstream-inherited FAIL and one known issue) and fix 3 (the sweeps' last cheap findings, see "Fix
 1", "Fix 2" and "Fix 3"; per-session counts in `research/final-validation/SUMMARY.md`). What is
-left of the observations is under "Known issues".
+left of the observations is under "Known issues". After the user's own testing: opening a review
+shows the review panel (see "UX: opening a review shows the review panel").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -1675,6 +1676,34 @@ orchestrator's additions)** — upstream edits: one appended help paragraph in `
   summary under "Reviews" without scrolling (gh: one COMMENTED review), then `new-pr-c` → **#15**.
   Smoke (uncommitted, branch, PR A: `j`/`k`/`]f`/`]c`/`]t`, a comment on each side, `y`): no
   regressions; logs only the usual noise. Token leak grep clean.
+
+**UX: opening a review shows the review panel** (the user's report after testing the fork: "when
+opening review, the left panel doesn't default to opening the 'review' panel") — no upstream edits:
+
+- `ReviewView::deploy_in_repo`, the funnel of every entry point (the Start Review picker,
+  `ReviewUncommitted`/`ReviewBranch`/`ReviewCommits`/`OpenPullRequest`, the branch picker of a new
+  branch review, pull requests in place or in a new worktree, `zed --review`, `zed://review` links),
+  calls `Workspace::open_panel::<ReviewPanel>`: the left dock opens if it was closed and switches to
+  the review panel if another panel (project, git…) was showing. The focus stays where the item's
+  activation puts it, in the diff (`;h` still focuses the panel). It also does this when the review
+  was already open (opened again from an entry point).
+- Decisions: switching between open review tabs, `;l`, refreshes and reloads, split clones and
+  Change Base (in place, or activating the tab that already reviews that base: a tab switch) leave
+  the dock as it is, so a dock the user closed stays closed. Review tabs aren't restored on startup
+  (not serializable), and the dock's own restored state applies as before. `open_panel` rather than
+  `reveal_panel`, which would unzoom a zoomed center pane. A review deployed before the workspace's
+  panels load wouldn't show the panel; no entry point gets there (the CLI and new-worktree flows
+  wait for the repository scan, the panel loads on `initialize_panels`' first poll).
+- Tests: 1 new (202 total + 1 ignored), red without the fix: with another left-dock panel active
+  and the dock closed, opening a review shows the review panel with the diff focused (`j` moves);
+  the same when the other panel is showing; after `; e` closes the dock, switching tabs and a
+  repository change leave it closed; opening an open review shows the panel again.
+- **Live check** (harness, `validation/ux-panel/`): PASS. Start Review → Uncommitted with the
+  project panel showing, and → Branch vs main with the dock closed: the review panel shows, `j`
+  moves in the diff; after `; e` the dock stays closed through `ctrl-pgup`/`ctrl-pgdn` tab switches
+  and an external edit's refresh; `zh cli --review uncommitted` (already open) with the git panel
+  showing and `zh cli --review commit:HEAD` with the dock closed show the panel, `j` moves. Logs:
+  only the usual noise.
 
 **Known issues / notes for the next slices:**
 

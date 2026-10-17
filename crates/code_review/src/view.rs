@@ -648,7 +648,8 @@ impl ReviewView {
     }
 
     /// Activates the open review of `target` in `repo`, or opens a new one. Reviews of other
-    /// targets stay open in their own tabs.
+    /// targets stay open in their own tabs. Either way the review panel shows in the left dock,
+    /// while the diff takes the focus.
     pub fn deploy_in_repo(
         workspace: &mut Workspace,
         target: ReviewTarget,
@@ -656,6 +657,9 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
+        // Only here, where a review is opened: switching between review tabs (or anything that
+        // refreshes one) leaves the dock as the user left it.
+        workspace.open_panel::<ReviewPanel>(window, cx);
         if let Some(existing) = find_review(workspace, &target, &repo, cx) {
             // A pull request's base may have moved since its tab opened.
             existing.update(cx, |view, cx| view.update_pull_request_base(&target, cx));
