@@ -27,6 +27,7 @@ mod emmet_ext;
 mod fold;
 mod folding_ranges;
 mod git;
+mod gutter_row;
 mod highlight_matching_bracket;
 pub mod hover_links;
 pub mod hover_popover;
@@ -118,6 +119,7 @@ pub use git::{
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
+pub use gutter_row::{GutterRow, GutterRowDragEnd, GutterRowRenderer};
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
 pub use inline_input::InlineInputState;
@@ -1219,6 +1221,11 @@ pub struct Editor {
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
     pub(crate) colorize_brackets_task: Task<()>,
+    pub(crate) gutter_row_renderer: Option<GutterRowRenderer>,
+    pub(crate) hovered_gutter_row: Option<DisplayRow>,
+    pub(crate) gutter_row_drag: Option<gutter_row::GutterRowDrag>,
+    /// See [`Editor::set_full_width_block`].
+    pub(crate) full_width_block: Option<CustomBlockId>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -2606,6 +2613,10 @@ impl Editor {
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
             colorize_brackets_task: Task::ready(()),
+            gutter_row_renderer: None,
+            hovered_gutter_row: None,
+            gutter_row_drag: None,
+            full_width_block: None,
         };
 
         if let Some(project) = editor.project.clone() {

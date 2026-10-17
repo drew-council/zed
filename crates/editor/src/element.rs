@@ -2694,6 +2694,37 @@ impl EditorElement {
         Some((display_row, buffer_row))
     }
 
+    fn layout_gutter_row_buttons(
+        &self,
+        gutter: &Gutter,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        let editor = self.editor.read(cx);
+        let Some(renderer) = editor.gutter_row_renderer.clone() else {
+            return Vec::new();
+        };
+        let hovered = editor.hovered_gutter_row;
+        let drag = editor.gutter_row_drag.as_ref().map(|drag| drag.rows());
+        gutter
+            .row_infos
+            .iter()
+            .zip(gutter.range.start.0..)
+            .filter(|(info, _)| info.buffer_row.is_some())
+            .filter_map(|(info, row)| {
+                let row = DisplayRow(row);
+                let gutter_row = crate::GutterRow {
+                    row,
+                    info,
+                    hovered: hovered == Some(row),
+                    drag: drag.clone(),
+                };
+                let element = renderer(&gutter_row, window, cx)?;
+                Some(gutter.prepaint_button(element, row, window, cx))
+            })
+            .collect()
+    }
+
     fn layout_run_indicators(
         &self,
         gutter: &Gutter,
@@ -3640,13 +3671,24 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> RenderBlocksOutput {
+        // The split view draws (and measures) it across both sides.
+        let full_width_block = (self.split_side == Some(SplitSide::Right))
+            .then(|| self.editor.read(cx).full_width_block.map(BlockId::Custom))
+            .flatten();
         let (fixed_blocks, non_fixed_blocks) = snapshot
             .blocks_in_range(rows.clone())
+            .filter(|(_, block)| Some(block.id()) != full_width_block)
             .partition::<Vec<_>, _>(|(_, block)| block.style() == BlockStyle::Fixed);
 
         let mut focused_block = self
             .editor
             .update(cx, |editor, _| editor.take_focused_block());
+        if let Some(id) = full_width_block
+            && let Some(block) = focused_block.take_if(|block| block.id == id)
+        {
+            self.editor
+                .update(cx, |editor, _| editor.set_focused_block(block));
+        }
         let mut fixed_block_max_width = Pixels::ZERO;
         let mut blocks = Vec::new();
         let mut spacer_blocks = Vec::new();
@@ -5582,6 +5624,10 @@ impl EditorElement {
 
             if let Some(diff_review_button) = layout.diff_review_button.as_mut() {
                 diff_review_button.paint(window, cx);
+            }
+
+            for button in layout.gutter_row_buttons.iter_mut() {
+                button.paint(window, cx);
             }
         });
     }
@@ -9759,6 +9805,8 @@ impl Element for EditorElement {
                             gutter.prepaint_button(button, display_row, window, cx)
                         });
 
+                    let gutter_row_buttons = self.layout_gutter_row_buttons(&gutter, window, cx);
+
                     self.layout_signature_help(
                         &hitbox,
                         content_origin,
@@ -10011,6 +10059,7 @@ impl Element for EditorElement {
                         bookmarks,
                         breakpoints,
                         diff_review_button,
+                        gutter_row_buttons,
                         crease_toggles,
                         crease_trailers,
                         tab_invisible,
@@ -10228,6 +10277,7 @@ pub struct EditorLayout {
     bookmarks: Vec<AnyElement>,
     breakpoints: Vec<AnyElement>,
     diff_review_button: Option<AnyElement>,
+    gutter_row_buttons: Vec<AnyElement>,
     crease_toggles: Vec<Option<AnyElement>>,
     expand_toggles: Vec<Option<(AnyElement, gpui::Point<Pixels>)>>,
     diff_hunk_controls: Vec<AnyElement>,

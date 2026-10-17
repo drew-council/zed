@@ -50,6 +50,16 @@ impl EditorElement {
             editor.update_diff_review_drag(valid_point.row(), window, cx);
         }
 
+        if editor.gutter_row_renderer.is_some() {
+            let row = point_for_position.exact_unclipped.row();
+            let snapshot = &position_map.snapshot;
+            let hovered = ((gutter_hovered || text_hovered)
+                && row <= snapshot.max_point().row()
+                && !snapshot.is_block_line(row))
+            .then_some(row);
+            editor.update_gutter_row_hover(hovered, valid_point.row(), cx);
+        }
+
         let hovered_diff_control = position_map
             .diff_hunk_control_bounds
             .iter()
@@ -877,6 +887,11 @@ impl EditorElement {
         // Handle diff review drag completion
         if editor.diff_review_drag_state.is_some() {
             editor.end_diff_review_drag(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if editor.end_gutter_row_drag(window, cx) {
             cx.stop_propagation();
             return;
         }

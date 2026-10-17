@@ -444,6 +444,15 @@ impl Block {
         }
     }
 
+    /// A custom block placed `Above(Anchor::Min)`: it comes before everything at the start of
+    /// the multibuffer, the first buffer's header (or folded header) included.
+    fn is_above_start(&self) -> bool {
+        matches!(
+            self,
+            Block::Custom(block) if matches!(block.placement, BlockPlacement::Above(Anchor::Min))
+        )
+    }
+
     fn place_above(&self) -> bool {
         match self {
             Block::Custom(block) => matches!(block.placement, BlockPlacement::Above(_)),
@@ -1573,6 +1582,7 @@ impl BlockMap {
             placement_a
                 .start()
                 .cmp(placement_b.start())
+                .then_with(|| block_b.is_above_start().cmp(&block_a.is_above_start()))
                 .then_with(|| placement_b.end().cmp(placement_a.end()))
                 .then_with(|| placement_a.tie_break().cmp(&placement_b.tie_break()))
                 .then_with(|| {
@@ -1763,7 +1773,11 @@ pub(crate) fn balancing_block(
         their_snapshot,
         my_point,
     );
-    let their_anchor = their_snapshot.anchor_at(their_range.start, my_anchor.bias());
+    // The start of the multibuffer faces the other side's start, before its first header.
+    let their_anchor = match my_anchor {
+        Anchor::Min => Anchor::Min,
+        _ => their_snapshot.anchor_at(their_range.start, my_anchor.bias()),
+    };
     let their_placement = match my_block.placement {
         BlockPlacement::Above(_) => BlockPlacement::Above(their_anchor),
         BlockPlacement::Below(_) => {
@@ -5799,6 +5813,133 @@ mod tests {
             }
         }
         chars.into_iter().collect()
+    }
+
+    #[gpui::test]
+    fn test_block_above_multibuffer_start(cx: &mut gpui::TestAppContext) {
+        cx.update(init_test);
+
+        let text = "111\n222";
+        let buffer = cx.update(|cx| {
+            MultiBuffer::build_multi(
+                [
+                    (text, vec![Point::new(0, 0)..Point::new(1, 3)]),
+                    (text, vec![Point::new(0, 0)..Point::new(1, 3)]),
+                ],
+                cx,
+            )
+        });
+        let buffer_snapshot = cx.update(|cx| buffer.read(cx).snapshot(cx));
+        let buffer_ids = buffer_snapshot
+            .excerpts()
+            .map(|excerpt| excerpt.context.start.buffer_id)
+            .dedup()
+            .collect::<Vec<_>>();
+        assert_eq!(buffer_ids.len(), 2);
+
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot.clone());
+        let (_, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (_, tab_snapshot) = TabMap::new(fold_snapshot, 4.try_into().unwrap());
+        let (_, wrap_snapshot) =
+            cx.update(|cx| WrapMap::new(tab_snapshot, font("Helvetica"), px(14.0), None, cx));
+        let mut block_map = BlockMap::new(wrap_snapshot.clone(), 2, 1);
+
+        let block = |placement, height| BlockProperties {
+            style: BlockStyle::Sticky,
+            placement,
+            height: Some(height),
+            render: Arc::new(|_| div().into_any()),
+            priority: 0,
+        };
+        let mut writer = block_map.write(wrap_snapshot.clone(), Patch::default(), None);
+        let ids = writer.insert([
+            // Inserted after a block at the first row, which goes below the first header.
+            block(
+                BlockPlacement::Above(buffer_snapshot.anchor_before(Point::new(0, 0))),
+                1,
+            ),
+            block(BlockPlacement::Above(Anchor::Min), 3),
+        ]);
+        let (first_row_block, start_block) = (ids[0], ids[1]);
+
+        let describe = |snapshot: &BlockSnapshot| {
+            snapshot
+                .blocks_in_range(BlockRow(0)..BlockRow(u32::MAX))
+                .map(|(row, block)| {
+                    let kind = match block {
+                        Block::Custom(block) if block.id == start_block => "start",
+                        Block::Custom(block) if block.id == first_row_block => "first row",
+                        Block::Custom(_) => "custom",
+                        Block::BufferHeader { .. } => "header",
+                        Block::FoldedBuffer { .. } => "folded",
+                        Block::ExcerptBoundary { .. } => "boundary",
+                        Block::Spacer { .. } => "spacer",
+                    };
+                    (row.0, kind)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let snapshot = block_map.read(wrap_snapshot.clone(), Patch::default(), None);
+        assert_eq!(
+            describe(&snapshot),
+            [(0, "start"), (3, "header"), (5, "first row"), (8, "header")]
+        );
+        assert_eq!(
+            snapshot.to_block_point(WrapPoint::new(WrapRow(0), 0)),
+            BlockPoint::new(BlockRow(6), 0),
+            "the first text row comes after the block, the header and the first row's block"
+        );
+        assert!(snapshot.sticky_header_excerpt(0.).is_none());
+        assert!(snapshot.sticky_header_excerpt(2.).is_none());
+        assert_eq!(
+            snapshot
+                .sticky_header_excerpt(3.)
+                .map(|header| header.excerpt.buffer_id()),
+            Some(buffer_ids[0])
+        );
+        assert_eq!(
+            snapshot
+                .sticky_header_excerpt(6.)
+                .map(|header| header.excerpt.buffer_id()),
+            Some(buffer_ids[0])
+        );
+
+        // A folded first buffer keeps the block above its folded header.
+        let mut writer = block_map.write(wrap_snapshot.clone(), Patch::default(), None);
+        buffer.read_with(cx, |buffer, cx| {
+            writer.fold_buffers([buffer_ids[0]], buffer, cx);
+        });
+        let snapshot = block_map.read(wrap_snapshot.clone(), Patch::default(), None);
+        assert_eq!(
+            describe(&snapshot),
+            [(0, "start"), (3, "folded"), (5, "header")]
+        );
+        assert!(snapshot.sticky_header_excerpt(1.).is_none());
+
+        let mut writer = block_map.write(wrap_snapshot.clone(), Patch::default(), None);
+        buffer.read_with(cx, |buffer, cx| {
+            writer.unfold_buffers([buffer_ids[0]], buffer, cx);
+        });
+        writer.resize(HashMap::from_iter([(start_block, 5)]));
+        let snapshot = block_map.read(wrap_snapshot.clone(), Patch::default(), None);
+        assert_eq!(
+            describe(&snapshot),
+            [
+                (0, "start"),
+                (5, "header"),
+                (7, "first row"),
+                (10, "header")
+            ]
+        );
+
+        let mut writer = block_map.write(wrap_snapshot.clone(), Patch::default(), None);
+        writer.remove(HashSet::from_iter([start_block]));
+        let snapshot = block_map.read(wrap_snapshot, Patch::default(), None);
+        assert_eq!(
+            describe(&snapshot),
+            [(0, "header"), (2, "first row"), (5, "header")]
+        );
     }
 
     impl Block {

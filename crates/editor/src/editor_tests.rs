@@ -50664,3 +50664,144 @@ async fn test_soft_wrap_indent_updated_on_file_move_between_directories(
         .unwrap();
     assert_eq!(snapshot.soft_wrap_indent(DisplayRow(0)), Some(0));
 }
+
+#[gpui::test]
+async fn test_gutter_row_renderer_hover_and_drag(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("ˇone\ntwo\nthree\nfour\nfive");
+
+    let seen = Rc::new(RefCell::new(Vec::<(u32, bool)>::new()));
+    let ended = Rc::new(RefCell::new(None));
+    cx.update_editor(|editor, _, cx| {
+        let weak_editor = cx.weak_entity();
+        let seen = seen.clone();
+        let ended = ended.clone();
+        editor.set_gutter_row_renderer(
+            Some(Rc::new(move |gutter_row, _, _| {
+                seen.borrow_mut()
+                    .push((gutter_row.row.0, gutter_row.hovered));
+                (gutter_row.row == DisplayRow(1)).then(|| {
+                    let weak_editor = weak_editor.clone();
+                    let ended = ended.clone();
+                    let row = gutter_row.row;
+                    div()
+                        .id("gutter-row-button")
+                        .debug_selector(|| "gutter-row-button".into())
+                        .size(px(8.))
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            window.prevent_default();
+                            let ended = ended.clone();
+                            weak_editor
+                                .update(cx, |editor, cx| {
+                                    editor.start_gutter_row_drag(
+                                        row,
+                                        Box::new(move |rows, _, _| {
+                                            *ended.borrow_mut() = Some(rows)
+                                        }),
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        })
+                        .into_any_element()
+                })
+            })),
+            cx,
+        );
+    });
+    let draw = |cx: &mut EditorTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    };
+    draw(&mut cx);
+    let (text_bounds, gutter_bounds, line_height) = cx.update_editor(|editor, _, _| {
+        let position_map = editor.last_position_map.as_ref().unwrap();
+        (
+            position_map.text_hitbox.bounds,
+            position_map.gutter_hitbox.bounds,
+            position_map.line_height,
+        )
+    });
+    let row_y = |row: f32| text_bounds.origin.y + line_height * (row + 0.5);
+
+    // The renderer is called for every row, and sees the row under the pointer (in the text or
+    // the gutter) as hovered.
+    cx.simulate_mouse_move(
+        point(text_bounds.origin.x + px(5.), row_y(2.)),
+        None,
+        Modifiers::none(),
+    );
+    seen.borrow_mut().clear();
+    draw(&mut cx);
+    assert_eq!(
+        cx.update_editor(|editor, _, _| editor.hovered_gutter_row()),
+        Some(DisplayRow(2))
+    );
+    assert_eq!(
+        *seen.borrow(),
+        [(0, false), (1, false), (2, true), (3, false), (4, false)]
+    );
+    cx.simulate_mouse_move(
+        point(gutter_bounds.origin.x + px(2.), row_y(3.)),
+        None,
+        Modifiers::none(),
+    );
+    assert_eq!(
+        cx.update_editor(|editor, _, _| editor.hovered_gutter_row()),
+        Some(DisplayRow(3))
+    );
+    cx.simulate_mouse_move(
+        point(
+            text_bounds.origin.x + px(5.),
+            text_bounds.bottom() + px(50.),
+        ),
+        None,
+        Modifiers::none(),
+    );
+    assert_eq!(
+        cx.update_editor(|editor, _, _| editor.hovered_gutter_row()),
+        None
+    );
+
+    // A drag from the renderer's element ends with the rows it went over, and selects nothing.
+    draw(&mut cx);
+    let button = cx
+        .debug_bounds("gutter-row-button")
+        .expect("the renderer's element is painted");
+    assert!(gutter_bounds.contains(&button.center()));
+    cx.simulate_mouse_down(button.center(), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        point(text_bounds.origin.x + px(5.), row_y(3.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    seen.borrow_mut().clear();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.gutter_row_drag.as_ref().map(|drag| drag.rows()),
+            Some(DisplayRow(1)..=DisplayRow(3))
+        );
+    });
+    cx.simulate_mouse_up(
+        point(text_bounds.origin.x + px(5.), row_y(3.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.run_until_parked();
+    assert_eq!(*ended.borrow(), Some(DisplayRow(1)..=DisplayRow(3)));
+    cx.assert_editor_state("ˇone\ntwo\nthree\nfour\nfive");
+
+    cx.update_editor(|editor, _, cx| editor.set_gutter_row_renderer(None, cx));
+    cx.simulate_mouse_move(
+        point(text_bounds.origin.x + px(5.), row_y(2.)),
+        None,
+        Modifiers::none(),
+    );
+    assert_eq!(
+        cx.update_editor(|editor, _, _| editor.hovered_gutter_row()),
+        None
+    );
+}

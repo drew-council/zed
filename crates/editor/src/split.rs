@@ -6440,6 +6440,223 @@ mod tests {
         );
     }
 
+    fn lhs_balancing_block(
+        editor: &Entity<SplittableEditor>,
+        rhs_block: crate::CustomBlockId,
+        cx: &mut VisualTestContext,
+    ) -> (Entity<Editor>, crate::CustomBlockId) {
+        let rhs_editor = editor.read_with(cx, |editor, _| editor.rhs_editor.clone());
+        let lhs_editor =
+            editor.read_with(cx, |editor, _| editor.lhs.as_ref().unwrap().editor.clone());
+        let lhs_block = lhs_editor.read_with(cx, |lhs_editor, cx| {
+            let display_map = lhs_editor.display_map.read(cx);
+            let companion = display_map.companion().unwrap().read(cx);
+            let mapping = companion
+                .custom_block_to_balancing_block(rhs_editor.read(cx).display_map.entity_id());
+            *mapping.borrow().get(&rhs_block).unwrap()
+        });
+        (lhs_editor, lhs_block)
+    }
+
+    #[gpui::test]
+    async fn test_block_above_start_leads_both_sides(cx: &mut gpui::TestAppContext) {
+        use rope::Point;
+        use unindent::Unindent as _;
+
+        let (editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+        let (buffer, diff) = buffer_with_diff("bbb\nccc\n", "aaa\nbbb\nccc\n", &mut cx);
+        editor.update(cx, |editor, cx| {
+            editor.update_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer.clone(),
+                vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                0,
+                diff.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let rhs_editor = editor.read_with(cx, |editor, _| editor.rhs_editor.clone());
+        let block_id = rhs_editor.update(cx, |rhs_editor, cx| {
+            rhs_editor.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Above(multi_buffer::Anchor::Min),
+                    height: Some(1),
+                    style: BlockStyle::Sticky,
+                    render: Arc::new(|_| div().into_any()),
+                    priority: 0,
+                }],
+                None,
+                cx,
+            )[0]
+        });
+        cx.update(|_, cx| {
+            set_block_content_for_tests(&rhs_editor, block_id, cx, |_| "start".to_string());
+        });
+
+        // The left side's spacer for it comes before its header too, also on a new left side.
+        for resplit in [false, true] {
+            if resplit {
+                editor.update_in(cx, |editor, window, cx| editor.unsplit(window, cx));
+                cx.run_until_parked();
+                editor.update_in(cx, |editor, window, cx| editor.split(window, cx));
+                cx.run_until_parked();
+            }
+            let (lhs_editor, lhs_block_id) = lhs_balancing_block(&editor, block_id, &mut cx);
+            cx.update(|_, cx| {
+                set_block_content_for_tests(&lhs_editor, lhs_block_id, cx, |_| "start".to_string());
+            });
+            assert_split_content(
+                &editor,
+                "
+                § start
+                § <no file>
+                § -----
+                aaa
+                bbb
+                ccc"
+                .unindent(),
+                "
+                § start
+                § <no file>
+                § -----
+                § spacer
+                bbb
+                ccc"
+                .unindent(),
+                &mut cx,
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_full_width_block_in_split_view(cx: &mut gpui::TestAppContext) {
+        use crate::display_map::DisplayRow;
+        use gpui::{Focusable as _, InteractiveElement as _, Styled as _};
+        use parking_lot::Mutex;
+        use rope::Point;
+
+        let (editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+        let base_text = (0..80)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let (buffer, diff) = buffer_with_diff(&base_text, &format!("added\n{base_text}"), &mut cx);
+        editor.update(cx, |editor, cx| {
+            editor.update_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer.clone(),
+                vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                0,
+                diff.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let widths = Arc::new(Mutex::new(Vec::new()));
+        let focus_handle = cx.update(|_, cx| cx.focus_handle());
+        let rhs_editor = editor.read_with(cx, |editor, _| editor.rhs_editor.clone());
+        let block_id = rhs_editor.update(cx, |rhs_editor, cx| {
+            let widths = widths.clone();
+            let focus_handle = focus_handle.clone();
+            let block_id = rhs_editor.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Above(multi_buffer::Anchor::Min),
+                    height: Some(1),
+                    style: BlockStyle::Sticky,
+                    render: Arc::new(move |cx| {
+                        widths.lock().push(cx.max_width);
+                        div()
+                            .track_focus(&focus_handle)
+                            .w_full()
+                            .h(cx.line_height * 3.)
+                            .into_any()
+                    }),
+                    priority: 0,
+                }],
+                None,
+                cx,
+            )[0];
+            rhs_editor.set_full_width_block(Some(block_id), cx);
+            block_id
+        });
+
+        // Real frames (focus is only tracked there), with the editor in the workspace.
+        let workspace = cx.update(|window, cx| {
+            window
+                .root::<MultiWorkspace>()
+                .flatten()
+                .unwrap()
+                .read(cx)
+                .workspace()
+                .clone()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+        });
+        cx.simulate_resize(gpui::size(px(2000.), px(500.)));
+        let draw = |cx: &mut VisualTestContext| {
+            widths.lock().clear();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        };
+        let block_heights = |cx: &mut VisualTestContext| {
+            let (lhs_editor, lhs_block_id) = lhs_balancing_block(&editor, block_id, cx);
+            [(&rhs_editor, block_id), (&lhs_editor, lhs_block_id)].map(|(side, id)| {
+                side.update_in(cx, |side, window, cx| {
+                    let snapshot = side.snapshot(window, cx);
+                    let (row, block) = snapshot
+                        .blocks_in_range(DisplayRow(0)..DisplayRow(1))
+                        .next()
+                        .unwrap();
+                    assert_eq!(row, DisplayRow(0));
+                    assert_eq!(block.id(), crate::display_map::BlockId::Custom(id));
+                    block.height()
+                })
+            })
+        };
+
+        // Drawn once, by the split view, across both sides, and measured there: the left
+        // side's spacer follows.
+        cx.run_until_parked();
+        draw(&mut cx);
+        draw(&mut cx);
+        let rendered = widths.lock().clone();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(rendered[0] > px(1800.), "{rendered:?}");
+        assert_eq!(block_heights(&mut cx), [3, 3]);
+
+        // Out of view, it's only drawn while it holds the focus (so that it keeps it).
+        cx.update(|window, cx| window.focus(&focus_handle, cx));
+        draw(&mut cx);
+        let scroll_away = |cx: &mut VisualTestContext| {
+            rhs_editor.update_in(cx, |editor, window, cx| {
+                editor.set_scroll_position(gpui::point(0., 40.), window, cx);
+            });
+        };
+        scroll_away(&mut cx);
+        draw(&mut cx);
+        draw(&mut cx);
+        assert_eq!(widths.lock().len(), 1);
+        cx.update(|window, cx| window.focus(&rhs_editor.focus_handle(cx), cx));
+        draw(&mut cx);
+        draw(&mut cx);
+        assert!(widths.lock().is_empty());
+
+        // Unsplit, the editor draws it as usual.
+        editor.update_in(cx, |editor, window, cx| editor.unsplit(window, cx));
+        rhs_editor.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(gpui::point(0., 0.), window, cx);
+        });
+        draw(&mut cx);
+        draw(&mut cx);
+        assert_eq!(widths.lock().len(), 1);
+        assert!(widths.lock()[0] > px(1800.));
+    }
+
     #[gpui::test]
     async fn test_act_as_type(cx: &mut gpui::TestAppContext) {
         let (splittable_editor, cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;

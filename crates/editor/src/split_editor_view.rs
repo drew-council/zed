@@ -23,6 +23,10 @@ use crate::{
     scroll::ScrollOffset,
     split::SplittableEditor,
 };
+use crate::{
+    FocusedBlock,
+    display_map::{BlockContext, BlockId, CustomBlockId, EditorMargins},
+};
 
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 
@@ -257,6 +261,7 @@ struct BufferHeaderLayout {
 
 struct SplitBufferHeadersPrepaintState {
     content_bounds: Bounds<Pixels>,
+    full_width_block: Option<AnyElement>,
     sticky_header: Option<AnyElement>,
     non_sticky_headers: Vec<BufferHeaderLayout>,
 }
@@ -310,6 +315,7 @@ impl Element for SplitBufferHeadersElement {
         if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
             return SplitBufferHeadersPrepaintState {
                 content_bounds: bounds,
+                full_width_block: None,
                 sticky_header: None,
                 non_sticky_headers: Vec::new(),
             };
@@ -353,6 +359,10 @@ impl Element for SplitBufferHeadersElement {
                         bounds: prepaint.content_bounds,
                     }),
                     |window| {
+                        if let Some(full_width_block) = &mut prepaint.full_width_block {
+                            full_width_block.paint(window, cx);
+                        }
+
                         for header_layout in &mut prepaint.non_sticky_headers {
                             header_layout.element.paint(window, cx);
                         }
@@ -411,6 +421,17 @@ impl SplitBufferHeadersElement {
         );
         let end_row = DisplayRow(end_row);
 
+        let full_width_block = self.build_full_width_block(
+            &snapshot,
+            scroll_position,
+            content_bounds,
+            available_width,
+            line_height,
+            start_row..end_row,
+            window,
+            cx,
+        );
+
         let (selected_buffer_ids, latest_selection_anchors) =
             self.compute_selection_info(&snapshot, cx);
 
@@ -458,6 +479,7 @@ impl SplitBufferHeadersElement {
 
         SplitBufferHeadersPrepaintState {
             content_bounds,
+            full_width_block,
             sticky_header,
             non_sticky_headers,
         }
@@ -680,6 +702,121 @@ impl SplitBufferHeadersElement {
         headers
     }
 
+    /// The right side's full-width block (see [`Editor::set_full_width_block`]): drawn here,
+    /// over both sides, while it is in view or holds the focus (below the view then, as the
+    /// editor does with a focused block, so that the focus stays), and measured at this width.
+    fn build_full_width_block(
+        &self,
+        snapshot: &EditorSnapshot,
+        scroll_position: gpui::Point<ScrollOffset>,
+        bounds: Bounds<Pixels>,
+        available_width: Pixels,
+        line_height: Pixels,
+        rows: std::ops::Range<DisplayRow>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let custom_block_id = self.rhs_editor.read(cx).full_width_block?;
+        let block_id = BlockId::Custom(custom_block_id);
+        // The right side, prepainted already, left its focused block for the next frame,
+        // unless it is this one.
+        let focused_block = self.rhs_editor.update(cx, |editor, _| {
+            let focused_block = editor.take_focused_block();
+            match focused_block {
+                Some(focused_block) if focused_block.id == block_id => Some(focused_block),
+                Some(focused_block) => {
+                    editor.set_focused_block(focused_block);
+                    None
+                }
+                None => None,
+            }
+        });
+        let visible_row = snapshot
+            .blocks_in_range(rows)
+            .find(|(_, block)| block.id() == block_id)
+            .map(|(row, _)| row);
+        let has_focus = focused_block
+            .and_then(|focused_block| focused_block.focus_handle.upgrade())
+            .is_some_and(|focus_handle| focus_handle.contains_focused(window, cx));
+        if visible_row.is_none() && !has_focus {
+            return None;
+        }
+        let Some(Block::Custom(custom)) = snapshot.block_for_id(block_id) else {
+            return None;
+        };
+
+        let rem_size = window.rem_size();
+        let font_id = window.text_system().resolve_font(&self.style.text.font());
+        let font_size = self.style.text.font_size.to_pixels(rem_size);
+        let em_width = window
+            .text_system()
+            .em_width(font_id, font_size)
+            .unwrap_or_default();
+        let margins = EditorMargins::default();
+        let mut element = div()
+            .size_full()
+            .child(custom.render(&mut BlockContext {
+                window,
+                app: cx,
+                anchor_x: Pixels::ZERO,
+                max_width: available_width,
+                margins: &margins,
+                em_width,
+                line_height,
+                block_id,
+                height: custom.height.unwrap_or(1),
+                selected: false,
+                editor_style: &self.style,
+                indent_guide_padding: Pixels::ZERO,
+            }))
+            .into_any_element();
+
+        // Measured like the editor measures blocks: whole rows, at least one.
+        let content_size = element.layout_as_root(
+            size(
+                AvailableSpace::Definite(available_width),
+                AvailableSpace::MinContent,
+            ),
+            window,
+            cx,
+        );
+        let height_in_rows = ((content_size.height / line_height).ceil() as u32).max(1);
+        if custom.height != Some(height_in_rows) {
+            self.rhs_editor.update(cx, |editor, cx| {
+                editor.resize_blocks(
+                    HashMap::from_iter([(custom_block_id, height_in_rows)]),
+                    None,
+                    cx,
+                )
+            });
+        }
+
+        let origin = match visible_row {
+            Some(row) => point(
+                bounds.origin.x,
+                bounds.origin.y
+                    + Pixels::from((row.as_f64() - scroll_position.y) * f64::from(line_height)),
+            ),
+            None => point(bounds.origin.x, bounds.bottom()),
+        };
+        let available_size = size(
+            AvailableSpace::Definite(available_width),
+            AvailableSpace::Definite(height_in_rows as f32 * line_height),
+        );
+        let focus_handle = window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            element.prepaint_as_root(origin, available_size, window, cx)
+        });
+        if let Some(focus_handle) = focus_handle {
+            self.rhs_editor.update(cx, |editor, _| {
+                editor.set_focused_block(FocusedBlock {
+                    id: block_id,
+                    focus_handle: focus_handle.downgrade(),
+                })
+            });
+        }
+        Some(element)
+    }
+
     fn prepaint_header(
         header: &mut AnyElement,
         origin: gpui::Point<Pixels>,
@@ -691,5 +828,17 @@ impl SplitBufferHeadersElement {
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             header.prepaint_as_root(origin, available_size, window, cx);
         });
+    }
+}
+
+impl Editor {
+    /// When this editor is the right side of a split diff, draws its custom block `block`
+    /// across both sides instead of on the right side only (over the left side's spacer for
+    /// it), measured at that width: a block above the start of the multibuffer
+    /// (`BlockPlacement::Above(Anchor::Min)`) as the document's header, say. Unsplit, and in
+    /// other editors, the block is drawn as usual.
+    pub fn set_full_width_block(&mut self, block: Option<CustomBlockId>, cx: &mut Context<Self>) {
+        self.full_width_block = block;
+        cx.notify();
     }
 }
