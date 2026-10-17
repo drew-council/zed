@@ -78,6 +78,24 @@ actions!(
         NextHunk,
         /// Moves to the previous hunk, skipping files folded as reviewed.
         PreviousHunk,
+        /// Shows only the files whose path matches a regex (case-insensitive).
+        EditIncludeFilter,
+        /// Hides the files whose path matches a regex (case-insensitive).
+        EditExcludeFilter,
+        /// Removes the include filter.
+        ClearIncludeFilter,
+        /// Removes the exclude filter.
+        ClearExcludeFilter,
+        /// Removes the include and exclude filters and shows reviewed files again.
+        ClearFilters,
+        /// Hides or shows the files marked as reviewed.
+        ToggleHideReviewed,
+        /// Searches the review panel's files by path.
+        SearchPaths,
+        /// Selects the next file matching the review panel's path search.
+        SelectNextMatch,
+        /// Selects the previous file matching the review panel's path search.
+        SelectPreviousMatch,
     ]
 );
 

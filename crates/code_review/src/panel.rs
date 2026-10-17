@@ -1,11 +1,13 @@
 use crate::{
-    CollapseSelectedEntry, ExpandSelectedEntry, FocusPanel, ReviewUncommitted, ReviewView,
-    ToggleFileReviewed, ToggleFocus, TogglePanel, ToggleSelectedDirectory,
-    view::{PanelFile, focus_diff},
+    ClearExcludeFilter, ClearFilters, ClearIncludeFilter, CollapseSelectedEntry,
+    EditExcludeFilter, EditIncludeFilter, ExpandSelectedEntry, FocusPanel, ReviewUncommitted,
+    ReviewView, SearchPaths, SelectNextMatch, SelectPreviousMatch, ToggleFileReviewed,
+    ToggleFocus, ToggleHideReviewed, TogglePanel, ToggleSelectedDirectory,
+    view::{PanelFile, ReviewFilters, current_review, filter_regex, focus_diff},
 };
 use anyhow::Result;
 use collections::HashSet;
-use editor::{EditorEvent, PathKey};
+use editor::{Editor, EditorEvent, PathKey, actions::MoveToEnd};
 use file_icons::FileIcons;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
@@ -26,6 +28,33 @@ const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 const TREE_INDENT: f32 = 16.0;
 
 pub(crate) fn register(workspace: &mut Workspace) {
+    workspace.register_action(|workspace, _: &EditIncludeFilter, window, cx| {
+        open_prompt(workspace, PromptKind::Include, window, cx);
+    });
+    workspace.register_action(|workspace, _: &EditExcludeFilter, window, cx| {
+        open_prompt(workspace, PromptKind::Exclude, window, cx);
+    });
+    workspace.register_action(|workspace, _: &SearchPaths, window, cx| {
+        open_prompt(workspace, PromptKind::Search, window, cx);
+    });
+    workspace.register_action(|workspace, _: &ClearIncludeFilter, window, cx| {
+        update_filters(workspace, window, cx, |filters| filters.include = None);
+    });
+    workspace.register_action(|workspace, _: &ClearExcludeFilter, window, cx| {
+        update_filters(workspace, window, cx, |filters| filters.exclude = None);
+    });
+    workspace.register_action(|workspace, _: &ClearFilters, window, cx| {
+        update_filters(workspace, window, cx, |filters| {
+            filters.include = None;
+            filters.exclude = None;
+            filters.hide_reviewed = false;
+        });
+    });
+    workspace.register_action(|workspace, _: &ToggleHideReviewed, window, cx| {
+        update_filters(workspace, window, cx, |filters| {
+            filters.hide_reviewed = !filters.hide_reviewed
+        });
+    });
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<ReviewPanel>(window, cx);
     });
@@ -51,6 +80,49 @@ pub(crate) fn register(workspace: &mut Workspace) {
             workspace.open_panel::<ReviewPanel>(window, cx);
         }
     });
+}
+
+/// Opens the review panel with a filter or search prompt.
+fn open_prompt(
+    workspace: &mut Workspace,
+    kind: PromptKind,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if let Some(panel) = workspace.focus_panel::<ReviewPanel>(window, cx) {
+        panel.update(cx, |panel, cx| panel.start_prompt(kind, window, cx));
+    }
+}
+
+/// Changes the filters of the active review (or the one the panel shows).
+fn update_filters(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    update: impl FnOnce(&mut ReviewFilters),
+) {
+    let Some(review) = current_review(workspace, cx) else {
+        return;
+    };
+    review.update(cx, |review, cx| {
+        let mut filters = review.filters().clone();
+        update(&mut filters);
+        review.set_filters(filters, window, cx);
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptKind {
+    Include,
+    Exclude,
+    Search,
+}
+
+/// The one-line input above the tree for a filter pattern or a path search.
+struct Prompt {
+    kind: PromptKind,
+    editor: Entity<Editor>,
+    error: Option<SharedString>,
 }
 
 /// A row of the file tree.
@@ -109,6 +181,9 @@ pub struct ReviewPanel {
     collapsed: HashSet<(EntityId, RepoPath)>,
     selected: Option<usize>,
     scroll_handle: UniformListScrollHandle,
+    prompt: Option<Prompt>,
+    /// The last path search, repeated by `n` and `N`.
+    search: Option<String>,
     _review_subscriptions: Vec<Subscription>,
     _workspace_subscription: Option<Subscription>,
 }
@@ -143,6 +218,8 @@ impl ReviewPanel {
             collapsed: HashSet::default(),
             selected: None,
             scroll_handle: UniformListScrollHandle::new(),
+            prompt: None,
+            search: None,
             _review_subscriptions: Vec::new(),
             _workspace_subscription: workspace_subscription,
         };
@@ -396,6 +473,10 @@ impl ReviewPanel {
 
     /// Enter: a file opens in the diff, which takes focus; a directory expands or collapses.
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt.is_some() {
+            self.confirm_prompt(window, cx);
+            return;
+        }
         match self.selected_entry().cloned() {
             Some(TreeEntry::File { file, .. }) => self.open_file(file.path_key, true, window, cx),
             Some(TreeEntry::Directory { path, .. }) => self.toggle_directory(path, cx),
@@ -404,7 +485,11 @@ impl ReviewPanel {
     }
 
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(crate::FocusDiff.boxed_clone(), cx);
+        if self.prompt.is_some() {
+            self.close_prompt(window, cx);
+        } else {
+            window.dispatch_action(crate::FocusDiff.boxed_clone(), cx);
+        }
     }
 
     /// Moves the diff to the file; `focus` also moves focus to the diff.
@@ -483,6 +568,149 @@ impl ReviewPanel {
             .rposition(|entry| matches!(entry, TreeEntry::Directory { .. }) && entry.depth() < depth);
         if let Some(parent) = parent {
             self.select(parent, cx);
+        }
+    }
+
+    fn start_prompt(&mut self, kind: PromptKind, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.active_review() else {
+            return;
+        };
+        let filters = review.read(cx).filters();
+        let text = match kind {
+            PromptKind::Include => filters.include.as_ref().map(|regex| regex.as_str().to_string()),
+            PromptKind::Exclude => filters.exclude.as_ref().map(|regex| regex.as_str().to_string()),
+            PromptKind::Search => self.search.clone(),
+        }
+        .unwrap_or_default();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(
+                match kind {
+                    PromptKind::Include | PromptKind::Exclude => "Regex (empty clears)",
+                    PromptKind::Search => "Part of a path",
+                },
+                window,
+                cx,
+            );
+            editor.set_text(text, window, cx);
+            editor.move_to_end(&MoveToEnd, window, cx);
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        self.prompt = Some(Prompt {
+            kind,
+            editor,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// Enter in the prompt: applies the pattern (an invalid one keeps the prompt open with the
+    /// error) or runs the search.
+    fn confirm_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = &mut self.prompt else {
+            return;
+        };
+        let text = prompt.editor.read(cx).text(cx);
+        match prompt.kind {
+            PromptKind::Include | PromptKind::Exclude => {
+                let regex = match filter_regex(&text) {
+                    Ok(regex) => regex,
+                    Err(error) => {
+                        prompt.error = Some(error.to_string().into());
+                        cx.notify();
+                        return;
+                    }
+                };
+                let kind = prompt.kind;
+                if let Some(review) = self.active_review() {
+                    review.update(cx, |review, cx| {
+                        let mut filters = review.filters().clone();
+                        match kind {
+                            PromptKind::Include => filters.include = regex,
+                            _ => filters.exclude = regex,
+                        }
+                        review.set_filters(filters, window, cx);
+                    });
+                }
+                self.close_prompt(window, cx);
+            }
+            PromptKind::Search => {
+                self.search = (!text.is_empty()).then_some(text);
+                self.close_prompt(window, cx);
+                self.select_match(true, cx);
+            }
+        }
+    }
+
+    /// Selects the next (or previous) file whose path contains the search, wrapping around and
+    /// expanding the directories around it.
+    fn select_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_ref().map(|search| search.to_lowercase()) else {
+            return;
+        };
+        let files = self.files(cx);
+        let matches = files
+            .iter()
+            .filter(|file| file.repo_path.as_unix_str().to_lowercase().contains(&search))
+            .collect::<Vec<_>>();
+        let current = match self.selected_entry() {
+            Some(TreeEntry::File { file, .. }) => Some(file.path_key.clone()),
+            _ => None,
+        };
+        let target = if forward {
+            matches
+                .iter()
+                .find(|file| current.as_ref().is_none_or(|current| &file.path_key > current))
+                .or_else(|| matches.first())
+        } else {
+            matches
+                .iter()
+                .rev()
+                .find(|file| current.as_ref().is_none_or(|current| &file.path_key < current))
+                .or_else(|| matches.last())
+        };
+        let Some(target) = target.map(|file| (*file).clone()) else {
+            return;
+        };
+        if let Some(review_id) = self.active_review.as_ref().map(|review| review.entity_id()) {
+            self.collapsed.retain(|(id, directory)| {
+                *id != review_id || !target.repo_path.starts_with(directory)
+            });
+        }
+        self.rebuild(cx);
+        if let Some(index) = self.entries.iter().position(
+            |entry| matches!(entry, TreeEntry::File { file, .. } if file.path_key == target.path_key),
+        ) {
+            self.select(index, cx);
+        }
+    }
+
+    fn select_next_match(&mut self, _: &SelectNextMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_match(true, cx);
+    }
+
+    fn select_previous_match(
+        &mut self,
+        _: &SelectPreviousMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_match(false, cx);
+    }
+
+    fn cancel_editor(&mut self, _: &editor::actions::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt.is_some() {
+            self.close_prompt(window, cx);
+        } else {
+            cx.propagate();
         }
     }
 
@@ -617,8 +845,8 @@ impl ReviewPanel {
     fn render_header(&self, review: &Entity<ReviewView>, cx: &Context<Self>) -> impl IntoElement {
         let review = review.read(cx);
         let title = review.title(cx);
-        let files = review.panel_files(cx);
-        let reviewed = files.iter().filter(|file| file.reviewed).count();
+        let summary = review.summary(cx);
+        let status = status_line(review.filters(), &summary, review.diff().read(cx).single_file().is_some());
         v_flex()
             .px_2()
             .py_1()
@@ -627,10 +855,18 @@ impl ReviewPanel {
             .border_color(cx.theme().colors().border_variant)
             .child(Label::new(title).truncate())
             .child(
-                Label::new(format!("{reviewed}/{} reviewed", files.len()))
+                Label::new(format!("{}/{} reviewed", summary.reviewed, summary.total))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+            .when_some(status, |header, status| {
+                header.child(
+                    Label::new(status)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+            })
     }
 
     fn render_empty_state(&self, review: Option<&Entity<ReviewView>>, cx: &Context<Self>) -> AnyElement {
@@ -645,6 +881,30 @@ impl ReviewPanel {
                     ),
                 )
                 .into_any_element(),
+            Some(review) if !review.read(cx).diff().read(cx).files(cx).is_empty() => {
+                let review = review.read(cx);
+                let summary = review.summary(cx);
+                let filters = review.filters();
+                v_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Label::new(review.diff().read(cx).empty_label(cx)).color(Color::Muted))
+                    .when(filters.include.is_some() || filters.exclude.is_some(), |el| {
+                        el.child(Button::new("review-panel-clear-filters", "Clear Filters").on_click(
+                            |_, window, cx| window.dispatch_action(ClearFilters.boxed_clone(), cx),
+                        ))
+                    })
+                    .when(summary.reviewed_hidden > 0, |el| {
+                        el.child(
+                            Button::new("review-panel-show-reviewed", "Show Reviewed Files").on_click(
+                                |_, window, cx| {
+                                    window.dispatch_action(ToggleHideReviewed.boxed_clone(), cx)
+                                },
+                            ),
+                        )
+                    })
+                    .into_any_element()
+            }
             Some(review) => {
                 let diff = review.read(cx).diff().read(cx);
                 if diff.is_loading(cx) {
@@ -697,6 +957,27 @@ impl ReviewPanel {
     }
 }
 
+/// Describes the active filters and what they hide, when anything applies.
+fn status_line(filters: &ReviewFilters, summary: &crate::view::ReviewSummary, single_file: bool) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(include) = &filters.include {
+        parts.push(format!("include {}", include.as_str()));
+    }
+    if let Some(exclude) = &filters.exclude {
+        parts.push(format!("exclude {}", exclude.as_str()));
+    }
+    if summary.filtered_out > 0 {
+        parts.push(format!("{} filtered out", summary.filtered_out));
+    }
+    if summary.reviewed_hidden > 0 {
+        parts.push(format!("{} reviewed hidden", summary.reviewed_hidden));
+    }
+    if single_file {
+        parts.push("single file".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// The status letter of a file row and its color.
 fn status_letter(status: FileStatus) -> (&'static str, Color) {
     if status.is_conflicted() {
@@ -710,6 +991,29 @@ fn status_letter(status: FileStatus) -> (&'static str, Color) {
     }
 }
 
+fn render_prompt(prompt: &Prompt, cx: &App) -> impl IntoElement {
+    let label = match prompt.kind {
+        PromptKind::Include => "Include",
+        PromptKind::Exclude => "Exclude",
+        PromptKind::Search => "Search",
+    };
+    v_flex()
+        .px_2()
+        .py_1()
+        .gap_0p5()
+        .border_b_1()
+        .border_color(cx.theme().colors().border_variant)
+        .child(
+            h_flex()
+                .gap_2()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(div().flex_1().child(prompt.editor.clone())),
+        )
+        .when_some(prompt.error.clone(), |el, error| {
+            el.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+        })
+}
+
 impl EventEmitter<PanelEvent> for ReviewPanel {}
 
 impl Focusable for ReviewPanel {
@@ -719,11 +1023,15 @@ impl Focusable for ReviewPanel {
 }
 
 impl Render for ReviewPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let review = self.active_review();
+        let editing = self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.editor.focus_handle(cx).is_focused(window));
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add("ReviewPanel");
-        key_context.add("not_editing");
+        key_context.add(if editing { "editing" } else { "not_editing" });
 
         v_flex()
             .key_context(key_context)
@@ -738,10 +1046,16 @@ impl Render for ReviewPanel {
             .on_action(cx.listener(Self::collapse_selected_entry))
             .on_action(cx.listener(Self::toggle_selected_directory))
             .on_action(cx.listener(Self::toggle_file_reviewed))
+            .on_action(cx.listener(Self::select_next_match))
+            .on_action(cx.listener(Self::select_previous_match))
+            .on_action(cx.listener(Self::cancel_editor))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .when_some(review.as_ref(), |panel, review| {
                 panel.child(self.render_header(review, cx))
+            })
+            .when_some(self.prompt.as_ref(), |panel, prompt| {
+                panel.child(render_prompt(prompt, cx))
             })
             .map(|panel| {
                 if self.entries.is_empty() {
@@ -829,13 +1143,49 @@ impl Panel for ReviewPanel {
 mod tests {
     use super::*;
     use crate::test_support::{
-        add_review_panel, init_vim_test, open_tree_fixture, path_at_cursor, rhs_editor,
+        add_review_panel, dispatch, excerpt_paths, init_vim_test, is_folded, is_reviewed,
+        open_tree_fixture, path_at_cursor, rhs_editor,
     };
     use gpui::{TestAppContext, VisualTestContext};
     use settings::DiffViewStyle;
 
     fn rows(panel: &Entity<ReviewPanel>, cx: &mut VisualTestContext) -> Vec<String> {
         panel.read_with(cx, |panel, _| panel.rows_for_test())
+    }
+
+    /// The rows without the selection marker or indentation.
+    fn names(panel: &Entity<ReviewPanel>, cx: &mut VisualTestContext) -> Vec<String> {
+        rows(panel, cx)
+            .into_iter()
+            .map(|row| row.trim_start_matches('>').trim_start().to_string())
+            .collect()
+    }
+
+    fn selected(panel: &Entity<ReviewPanel>, cx: &mut VisualTestContext) -> String {
+        rows(panel, cx)
+            .into_iter()
+            .find_map(|row| Some(row.strip_prefix('>')?.trim_start().to_string()))
+            .unwrap_or_default()
+    }
+
+    fn prompt(panel: &Entity<ReviewPanel>, cx: &mut VisualTestContext) -> Option<(String, Option<SharedString>)> {
+        panel.read_with(cx, |panel, cx| {
+            let prompt = panel.prompt.as_ref()?;
+            Some((prompt.editor.read(cx).text(cx), prompt.error.clone()))
+        })
+    }
+
+    fn header(panel: &Entity<ReviewPanel>, cx: &mut VisualTestContext) -> (String, Option<String>) {
+        panel.read_with(cx, |panel, cx| {
+            let review = panel.active_review().unwrap();
+            let review = review.read(cx);
+            let summary = review.summary(cx);
+            let single_file = review.diff().read(cx).single_file().is_some();
+            (
+                format!("{}/{} reviewed", summary.reviewed, summary.total),
+                status_line(review.filters(), &summary, single_file),
+            )
+        })
     }
 
     #[gpui::test]
@@ -920,5 +1270,175 @@ mod tests {
         assert_eq!(rows(&panel, cx)[0], ">docs/");
         cx.simulate_keystrokes("2 j");
         assert_eq!(rows(&panel, cx)[2], ">src/");
+    }
+
+    #[gpui::test]
+    async fn test_filters_and_search(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_tree_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        let all_files = excerpt_paths(&review, cx);
+        let panel_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| panel.read(cx).focus_handle(cx).contains_focused(window, cx))
+        };
+
+        // Include (case-insensitive) hides the rest in the diff and the panel, and moves the
+        // cursor off a hidden file.
+        cx.simulate_keystrokes("; h i");
+        assert_eq!(prompt(&panel, cx), Some((String::new(), None)));
+        cx.simulate_input("^SRC/");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(prompt(&panel, cx), None);
+        assert!(panel_focused(cx));
+        assert_eq!(
+            excerpt_paths(&review, cx),
+            ["src/a/b/c.rs", "src/lib.rs", "src/mod_b.rs"]
+        );
+        assert_eq!(
+            names(&panel, cx),
+            ["src/", "a/b/", "c.rs A", "lib.rs M", "mod_b.rs M"]
+        );
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("src/a/b/c.rs"));
+        let (count, status) = header(&panel, cx);
+        assert_eq!(count, "0/3 reviewed");
+        assert_eq!(status.as_deref(), Some("include ^SRC/ · 4 filtered out"));
+
+        // File navigation stays among the shown files.
+        cx.simulate_keystrokes("; l ] f ] f ] f");
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("src/mod_b.rs"));
+
+        // Exclude composes with include.
+        cx.simulate_keystrokes("; h e");
+        cx.simulate_input("mod_");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(excerpt_paths(&review, cx), ["src/a/b/c.rs", "src/lib.rs"]);
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("src/a/b/c.rs"));
+
+        // Prompts start with the current pattern; an invalid one keeps the prompt open.
+        cx.simulate_keystrokes("i");
+        assert_eq!(prompt(&panel, cx), Some(("^SRC/".into(), None)));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(prompt(&panel, cx), None);
+        assert!(panel_focused(cx));
+        cx.simulate_keystrokes("e");
+        cx.simulate_input("(");
+        cx.simulate_keystrokes("enter");
+        let (text, error) = prompt(&panel, cx).unwrap();
+        assert_eq!(text, "mod_(");
+        assert!(error.is_some());
+        cx.simulate_keystrokes("escape");
+        assert_eq!(excerpt_paths(&review, cx), ["src/a/b/c.rs", "src/lib.rs"]);
+
+        // `I` and `E` clear the patterns.
+        cx.simulate_keystrokes("shift-i shift-e");
+        assert_eq!(excerpt_paths(&review, cx), all_files);
+        assert_eq!(header(&panel, cx).1, None);
+
+        // Path search expands collapsed directories, and `n`/`N` wrap.
+        cx.simulate_keystrokes("g g j j space");
+        assert_eq!(selected(&panel, cx), "src/ ▸");
+        cx.simulate_keystrokes("/");
+        cx.simulate_input(".RS");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(selected(&panel, cx), "c.rs A");
+        cx.simulate_keystrokes("n");
+        assert_eq!(selected(&panel, cx), "lib.rs M");
+        cx.simulate_keystrokes("n n");
+        assert_eq!(selected(&panel, cx), "c.rs A");
+        cx.simulate_keystrokes("shift-n");
+        assert_eq!(selected(&panel, cx), "mod_b.rs M");
+        cx.simulate_keystrokes("/");
+        assert_eq!(prompt(&panel, cx), Some((".RS".into(), None)));
+        cx.simulate_keystrokes("escape");
+    }
+
+    #[gpui::test]
+    async fn test_hide_reviewed(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_tree_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        let all_files = excerpt_paths(&review, cx);
+        dispatch(crate::ToggleHideReviewed, cx);
+
+        // Marking hides the file and moves on.
+        cx.simulate_keystrokes("r");
+        assert!(is_reviewed(&review, "docs/old.md", cx));
+        assert!(!excerpt_paths(&review, cx).contains(&"docs/old.md".to_string()));
+        assert!(!names(&panel, cx).contains(&"old.md D ✓".to_string()));
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("src/a/b/c.rs"));
+        let total = all_files.len();
+        assert_eq!(header(&panel, cx).0, format!("1/{total} reviewed"));
+        assert_eq!(header(&panel, cx).1.as_deref(), Some("1 reviewed hidden"));
+
+        // On the last file the cursor wraps around to the first shown file.
+        let last = all_files.last().unwrap().clone();
+        for _ in 0..all_files.len() {
+            cx.simulate_keystrokes("] f");
+        }
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some(last.as_str()));
+        cx.simulate_keystrokes("r");
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("src/a/b/c.rs"));
+
+        // Everything reviewed: the diff and the panel say so.
+        for _ in 0..all_files.len() {
+            cx.simulate_keystrokes("r");
+        }
+        assert_eq!(excerpt_paths(&review, cx), Vec::<String>::new());
+        assert_eq!(
+            review.read_with(cx, |review, cx| review.diff().read(cx).empty_label(cx)),
+            "All files reviewed"
+        );
+        assert!(names(&panel, cx).is_empty());
+
+        // Showing reviewed files again brings them back folded.
+        dispatch(crate::ToggleHideReviewed, cx);
+        assert_eq!(excerpt_paths(&review, cx), all_files);
+        assert!(is_folded(&review, "src/lib.rs", cx));
+    }
+
+    #[gpui::test]
+    async fn test_panel_follows_active_review(cx: &mut TestAppContext) {
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_tree_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), Some(review.clone()));
+
+        // A split shares the reviewed marks but has its own filters.
+        dispatch(workspace::SplitRight::default(), cx);
+        let other = crate::test_support::active_review(&workspace, cx);
+        assert_ne!(other, review);
+        assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), Some(other.clone()));
+        cx.focus(&other);
+        cx.simulate_keystrokes("r");
+        assert!(is_reviewed(&review, "docs/old.md", cx));
+        assert!(is_folded(&review, "docs/old.md", cx));
+        cx.simulate_keystrokes("; h i");
+        cx.simulate_input("lib");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(excerpt_paths(&other, cx), ["src/lib.rs"]);
+        assert_eq!(names(&panel, cx), ["src/", "lib.rs M"]);
+        assert_eq!(excerpt_paths(&review, cx).len(), 7);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&review, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), Some(review.clone()));
+        assert_eq!(names(&panel, cx)[1], "old.md D ✓");
+
+        // Closing every review empties the panel.
+        for _ in 0..2 {
+            dispatch(workspace::CloseActiveItem::default(), cx);
+            if let Some(review) = workspace.read_with(cx, |workspace, cx| {
+                workspace.items_of_type::<ReviewView>(cx).next()
+            }) {
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.activate_item(&review, true, true, window, cx)
+                });
+                cx.run_until_parked();
+            }
+        }
+        assert_eq!(panel.read_with(cx, |panel, _| panel.active_review()), None);
+        assert!(rows(&panel, cx).is_empty());
     }
 }

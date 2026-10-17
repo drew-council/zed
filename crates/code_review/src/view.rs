@@ -14,6 +14,7 @@ use crate::{
 };
 use collections::HashSet;
 use git::{repository::RepoPath, status::FileStatus};
+use regex::{Regex, RegexBuilder};
 use editor::{
     Editor, EditorEvent, PathKey, SelectionEffects, SplittableEditor,
     actions::{OpenExcerpts, ToggleSoftWrap},
@@ -35,7 +36,7 @@ use std::{
     any::{Any, TypeId},
     sync::Arc,
 };
-use ui::prelude::*;
+use ui::{KeyBinding, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     ItemNavHistory, Toast, Workspace,
@@ -204,17 +205,21 @@ pub(crate) fn pick_base_for_new_review(
     });
 }
 
-/// Focuses the active review tab, else the review the panel shows, else any open review.
-pub(crate) fn focus_diff(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let review = workspace
+/// The active review tab, else the review the panel shows, else any open review.
+pub(crate) fn current_review(workspace: &Workspace, cx: &App) -> Option<Entity<ReviewView>> {
+    workspace
         .active_item_as::<ReviewView>(cx)
         .or_else(|| {
             workspace
                 .panel::<ReviewPanel>(cx)
                 .and_then(|panel| panel.read(cx).active_review())
         })
-        .or_else(|| workspace.items_of_type::<ReviewView>(cx).next());
-    if let Some(review) = review {
+        .or_else(|| workspace.items_of_type::<ReviewView>(cx).next())
+}
+
+/// Focuses the active review tab, else the review the panel shows, else any open review.
+pub(crate) fn focus_diff(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some(review) = current_review(workspace, cx) {
         workspace.activate_item(&review, true, true, window, cx);
     }
 }
@@ -255,6 +260,44 @@ pub(crate) struct PanelFile {
     pub reviewed: bool,
 }
 
+/// Which files a review tab shows. Per tab and not persisted (like tuicr's filters).
+#[derive(Clone, Default)]
+pub(crate) struct ReviewFilters {
+    /// Only paths matching this (case-insensitive) regex are shown.
+    pub include: Option<Regex>,
+    /// Paths matching this (case-insensitive) regex are hidden.
+    pub exclude: Option<Regex>,
+    pub hide_reviewed: bool,
+}
+
+impl ReviewFilters {
+    fn passes_patterns(&self, repo_path: &RepoPath) -> bool {
+        let path = repo_path.as_unix_str();
+        self.include.as_ref().is_none_or(|include| include.is_match(path))
+            && self.exclude.as_ref().is_none_or(|exclude| !exclude.is_match(path))
+    }
+}
+
+/// Builds a filter pattern; an empty pattern clears the filter.
+pub(crate) fn filter_regex(pattern: &str) -> anyhow::Result<Option<Regex>> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(RegexBuilder::new(pattern).case_insensitive(true).build()?))
+}
+
+/// What the review panel says about the review's files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReviewSummary {
+    /// Files that pass the filters, reviewed or not.
+    pub total: usize,
+    pub reviewed: usize,
+    /// Files hidden by the include and exclude patterns.
+    pub filtered_out: usize,
+    /// Reviewed files hidden by "hide reviewed".
+    pub reviewed_hidden: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Next,
@@ -270,6 +313,7 @@ pub struct ReviewView {
     line_cursor: Entity<LineCursor>,
     /// Shared by every tab reviewing the same thing; replaced when the review key changes.
     session: Entity<ReviewSession>,
+    filters: ReviewFilters,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     /// The left side is recreated on every split; its reviewed hunks are repainted then.
@@ -379,15 +423,15 @@ impl ReviewView {
             // The review panel shows the diff's loading state.
             cx.observe(&diff, |_, _, cx| cx.notify()),
             // A branch review is titled and keyed after the checked-out branch.
-            cx.subscribe(&repo, |this, repo, event: &RepositoryEvent, cx| {
+            cx.subscribe_in(&repo, window, |this, repo, event: &RepositoryEvent, window, cx| {
                 if let (RepositoryEvent::HeadChanged, ReviewTarget::Branch { base }) =
                     (event, &this.target)
                 {
-                    let branch = branch_name(&repo, cx);
+                    let branch = branch_name(repo, cx);
                     let base = base.clone();
                     this.top_block
                         .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
-                    this.update_session(cx);
+                    this.update_session(window, cx);
                     cx.emit(EditorEvent::TitleChanged);
                     cx.notify();
                 }
@@ -412,7 +456,7 @@ impl ReviewView {
         let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
         let line_cursor = cx.new(|cx| LineCursor::new(splittable, cx));
         let session = ReviewSession::for_key(target.review_key(&repo.read(cx)), cx);
-        let session_subscription = cx.subscribe(&session, Self::handle_session_event);
+        let session_subscription = cx.subscribe_in(&session, window, Self::handle_session_event);
         Self {
             target,
             repo,
@@ -420,6 +464,7 @@ impl ReviewView {
             top_block,
             line_cursor,
             session,
+            filters: ReviewFilters::default(),
             project,
             workspace: workspace.downgrade(),
             lhs_editor_id,
@@ -434,22 +479,24 @@ impl ReviewView {
     }
 
     /// Switches to the session of the review's current key (the base or branch changed).
-    fn update_session(&mut self, cx: &mut Context<Self>) {
+    fn update_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.target.review_key(&self.repo.read(cx));
         if self.session.read(cx).key() == &key {
             return;
         }
         self.session = ReviewSession::for_key(key, cx);
-        self._session_subscription = cx.subscribe(&self.session, Self::handle_session_event);
+        self._session_subscription =
+            cx.subscribe_in(&self.session, window, Self::handle_session_event);
         if self.session.read(cx).is_loaded() {
-            self.apply_session(cx);
+            self.apply_session(window, cx);
         }
         self.repaint_reviewed_hunks(cx);
         cx.notify();
     }
 
     /// Brings the folds and marks of every file in line with a newly loaded session.
-    fn apply_session(&mut self, cx: &mut Context<Self>) {
+    fn apply_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.recompute_hidden(window, cx);
         let files = self.diff.read(cx).files(cx);
         for file in &files {
             if let Some(digest) = self.diff.read(cx).digest(&file.path_key).cloned() {
@@ -462,18 +509,22 @@ impl ReviewView {
 
     fn handle_session_event(
         &mut self,
-        _: Entity<ReviewSession>,
+        _: &Entity<ReviewSession>,
         event: &ReviewSessionEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
             ReviewSessionEvent::Loaded => {
-                self.apply_session(cx);
+                self.apply_session(window, cx);
                 self.repaint_reviewed_hunks(cx);
             }
             ReviewSessionEvent::FilesChanged(changes) => {
                 for (repo_path, _) in changes {
                     self.sync_fold(&review_path_key(repo_path), cx);
+                }
+                if self.filters.hide_reviewed {
+                    self.recompute_hidden(window, cx);
                 }
             }
             ReviewSessionEvent::HunksChanged => self.repaint_reviewed_hunks(cx),
@@ -485,11 +536,15 @@ impl ReviewView {
         &mut self,
         _: &Entity<ReviewDiff>,
         event: &ReviewDiffEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            ReviewDiffEvent::FilesChanged => {}
+            // A file may need hiding before its excerpts appear, and the label for an entirely
+            // hidden review depends on which files have hunks.
+            ReviewDiffEvent::FileListChanged | ReviewDiffEvent::FilesChanged => {
+                self.recompute_hidden(window, cx)
+            }
             ReviewDiffEvent::FileDiffChanged {
                 path_key,
                 newly_shown,
@@ -520,6 +575,79 @@ impl ReviewView {
             }
         }
         cx.notify();
+    }
+
+    pub(crate) fn filters(&self) -> &ReviewFilters {
+        &self.filters
+    }
+
+    pub(crate) fn set_filters(
+        &mut self,
+        filters: ReviewFilters,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.filters = filters;
+        self.recompute_hidden(window, cx);
+        cx.notify();
+    }
+
+    fn is_hidden_by_filters(&self, repo_path: &RepoPath, cx: &App) -> bool {
+        !self.filters.passes_patterns(repo_path)
+            || (self.filters.hide_reviewed && self.session.read(cx).is_file_reviewed(repo_path))
+    }
+
+    /// Hides the files the filters exclude, in the diff and in the panel.
+    fn recompute_hidden(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let diff = self.diff.read(cx);
+        let listed = diff.listed_paths();
+        let hidden = listed
+            .iter()
+            .filter(|repo_path| self.is_hidden_by_filters(repo_path, cx))
+            .map(review_path_key)
+            .collect::<HashSet<_>>();
+        let files = diff.files(cx);
+        let all_hidden_label = (!files.is_empty()
+            && files.iter().all(|file| hidden.contains(&file.path_key)))
+        .then(|| {
+            // Everything is hidden, so a file that passes the other filters is a hidden
+            // reviewed file.
+            let reviewed_hidden = files
+                .iter()
+                .any(|file| self.filters.passes_patterns(&file.repo_path));
+            if self.filters.hide_reviewed && reviewed_hidden {
+                SharedString::from("All files reviewed")
+            } else {
+                format!(
+                    "All {} changed file{} are hidden",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                )
+                .into()
+            }
+        });
+        self.diff.update(cx, |diff, cx| {
+            diff.set_hidden(hidden, all_hidden_label, window, cx)
+        });
+    }
+
+    pub(crate) fn summary(&self, cx: &App) -> ReviewSummary {
+        let session = self.session.read(cx);
+        let mut summary = ReviewSummary::default();
+        for file in self.diff.read(cx).files(cx) {
+            if !self.filters.passes_patterns(&file.repo_path) {
+                summary.filtered_out += 1;
+                continue;
+            }
+            summary.total += 1;
+            if session.is_file_reviewed(&file.repo_path) {
+                summary.reviewed += 1;
+                if self.filters.hide_reviewed {
+                    summary.reviewed_hidden += 1;
+                }
+            }
+        }
+        summary
     }
 
     /// Folds a shown file to its header when it is reviewed and unfolds it otherwise. Single-file
@@ -583,8 +711,12 @@ impl ReviewView {
         let content_hash = diff.digest(&path_key).map(|digest| digest.content_hash);
         let next = diff.file_order().into_iter().find(|key| key > &path_key);
         let reviewed = !self.session.read(cx).is_file_reviewed(&repo_path);
-        // Move first, so folding the file doesn't drag the cursor onto its header.
-        if reviewed && let Some(next) = next {
+        // Move first, so folding the file doesn't drag the cursor onto its header. When reviewed
+        // files are hidden, hiding it moves the cursor on (wrapping around).
+        if reviewed
+            && !self.filters.hide_reviewed
+            && let Some(next) = next
+        {
             self.diff
                 .update(cx, |diff, cx| diff.move_to_path(next, window, cx));
         }
@@ -777,13 +909,13 @@ impl ReviewView {
         }
     }
 
-    /// The files the review panel lists, in review order.
+    /// The files the review panel lists (those the filters don't hide), in review order.
     pub(crate) fn panel_files(&self, cx: &App) -> Vec<PanelFile> {
         let session = self.session.read(cx);
-        self.diff
-            .read(cx)
-            .files(cx)
+        let diff = self.diff.read(cx);
+        diff.files(cx)
             .into_iter()
+            .filter(|file| !diff.is_hidden(&file.path_key))
             .map(|file| PanelFile {
                 reviewed: session.is_file_reviewed(&file.repo_path),
                 path_key: file.path_key,
@@ -855,12 +987,17 @@ impl ReviewView {
             Some(existing) if existing != view => {
                 workspace.activate_item(&existing, true, true, window, cx);
             }
-            _ => view.update(cx, |view, cx| view.change_base(base, cx)),
+            _ => view.update(cx, |view, cx| view.change_base(base, window, cx)),
         }
     }
 
     /// Reviews the branch against `base` instead, in this tab.
-    pub(crate) fn change_base(&mut self, base: SharedString, cx: &mut Context<Self>) {
+    pub(crate) fn change_base(
+        &mut self,
+        base: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let target = ReviewTarget::Branch { base: base.clone() };
         if self.target == target {
             return;
@@ -868,7 +1005,7 @@ impl ReviewView {
         self.target = target;
         self.diff
             .update(cx, |diff, cx| diff.set_branch_base(base.clone(), cx));
-        self.update_session(cx);
+        self.update_session(window, cx);
         let branch = branch_name(&self.repo, cx);
         self.top_block
             .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
@@ -1086,6 +1223,54 @@ impl ReviewView {
         cx.stop_propagation();
     }
 
+    /// Says that only one file is shown, which one, and how to see the others again.
+    fn render_single_file_bar(&self, path_key: &PathKey, cx: &mut Context<Self>) -> impl IntoElement {
+        let diff = self.diff.read(cx);
+        let order = diff.file_order();
+        let position = order
+            .iter()
+            .position(|key| key == path_key)
+            .map_or(0, |index| index + 1);
+        let path = diff
+            .repo_path_for(path_key)
+            .map(|repo_path| repo_path.as_unix_str().to_string())
+            .unwrap_or_default();
+        let focus_handle = self.focus_handle(cx);
+        h_flex()
+            .w_full()
+            .flex_none()
+            .px_3()
+            .py_0p5()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .bg(cx.theme().colors().editor_subheader_background)
+            .child(
+                Label::new(format!("Single file · {position} of {}", order.len()))
+                    .size(LabelSize::Small),
+            )
+            .child(
+                Label::new(path)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("review-show-all-files", "Show All Files")
+                    .label_size(LabelSize::Small)
+                    .key_binding(KeyBinding::for_action_in(
+                        &ToggleSingleFileMode,
+                        &focus_handle,
+                        cx,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.diff
+                            .update(cx, |diff, cx| diff.set_single_file(None, window, cx));
+                    })),
+            )
+    }
+
     fn has_visual_selection(&self, cx: &mut App) -> bool {
         let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
         editor.update(cx, |editor, cx| {
@@ -1114,6 +1299,7 @@ impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_branch_review = matches!(self.target, ReviewTarget::Branch { .. });
         let has_top_block = self.top_block.read(cx).has_content();
+        let single_file = self.diff.read(cx).single_file().cloned();
         v_flex()
             .key_context("CodeReview")
             .capture_action(cx.listener(Self::toggle_soft_wrap))
@@ -1137,6 +1323,9 @@ impl Render for ReviewView {
             })
             .size_full()
             .child(self.top_block.clone())
+            .when_some(single_file, |view, path_key| {
+                view.child(self.render_single_file_bar(&path_key, cx))
+            })
             .child(div().flex_1().min_h_0().child(self.diff.clone()))
     }
 }

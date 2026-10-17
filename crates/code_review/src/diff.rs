@@ -146,7 +146,9 @@ pub(crate) struct ReviewFile {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReviewDiffEvent {
-    /// Files came or went, or gained or lost their hunks.
+    /// The source listed the review's files (before their buffers load).
+    FileListChanged,
+    /// Files came or went, gained or lost their hunks, or were hidden or shown.
     FilesChanged,
     /// A file's digest changed, or its excerpts were just inserted (`newly_shown`).
     FileDiffChanged {
@@ -173,8 +175,14 @@ pub struct ReviewDiff {
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
     /// Single-file mode: only this file's excerpts are in the multibuffer.
     single_file: Option<PathKey>,
+    /// Files hidden by the review's filters: they have no excerpts.
+    hidden: HashSet<PathKey>,
+    /// Every file the source listed in its last refresh, with or without hunks.
+    listed_paths: Vec<RepoPath>,
     focus_handle: FocusHandle,
     empty_label: SharedString,
+    /// Replaces `empty_label` while every file is hidden.
+    all_hidden_label: Option<SharedString>,
     refresh_task: Task<Result<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -251,8 +259,11 @@ impl ReviewDiff {
             editor,
             buffer_subscriptions: HashMap::default(),
             single_file: None,
+            hidden: HashSet::default(),
+            listed_paths: Vec::new(),
             focus_handle: cx.focus_handle(),
             empty_label: target.empty_label(),
+            all_hidden_label: None,
             refresh_task: Task::ready(Ok(())),
             _subscriptions: subscriptions,
         };
@@ -479,21 +490,87 @@ impl ReviewDiff {
     }
 
     fn is_visible(&self, path_key: &PathKey) -> bool {
-        self.single_file
-            .as_ref()
-            .is_none_or(|single_file| single_file == path_key)
+        !self.hidden.contains(path_key)
+            && self
+                .single_file
+                .as_ref()
+                .is_none_or(|single_file| single_file == path_key)
     }
 
-    /// The changed files in review order, including those hidden by single-file mode.
+    /// The changed files in review order, including those hidden by single-file mode but not
+    /// those hidden by filters.
     pub(crate) fn file_order(&self) -> Vec<PathKey> {
         let mut order = self
             .buffer_subscriptions
             .values()
-            .filter(|entry| entry.has_hunks)
+            .filter(|entry| entry.has_hunks && !self.hidden.contains(&entry.path_key))
             .map(|entry| entry.path_key.clone())
             .collect::<Vec<_>>();
         order.sort();
         order
+    }
+
+    pub(crate) fn is_hidden(&self, path_key: &PathKey) -> bool {
+        self.hidden.contains(path_key)
+    }
+
+    pub(crate) fn listed_paths(&self) -> &[RepoPath] {
+        &self.listed_paths
+    }
+
+    /// Hides the given files (removing their excerpts) and shows the others. The cursor moves
+    /// off a file that gets hidden, to the next shown file (wrapping around).
+    pub(crate) fn set_hidden(
+        &mut self,
+        hidden: HashSet<PathKey>,
+        all_hidden_label: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.all_hidden_label = all_hidden_label;
+        if hidden == self.hidden {
+            cx.notify();
+            return;
+        }
+        let previous = std::mem::replace(&mut self.hidden, hidden);
+        let files = self
+            .buffer_subscriptions
+            .iter()
+            .map(|(repo_path, entry)| (repo_path.clone(), entry.path_key.clone()))
+            .collect::<Vec<_>>();
+        // Show files first: an empty multibuffer would move focus to the placeholder.
+        for (repo_path, path_key) in &files {
+            if previous.contains(path_key) && !self.hidden.contains(path_key) {
+                self.sync_excerpts(repo_path, window, cx);
+            }
+        }
+        if let Some(cursor) = self.path_at_cursor(cx)
+            && self.hidden.contains(&cursor)
+        {
+            let order = self.file_order();
+            let target = order
+                .iter()
+                .find(|path_key| *path_key > &cursor)
+                .or_else(|| order.first())
+                .cloned();
+            if self.single_file.is_some() {
+                self.set_single_file(target, window, cx);
+            } else if let Some(target) = target {
+                self.select_path_start(&target, window, cx);
+            }
+        }
+        for (repo_path, path_key) in &files {
+            if !previous.contains(path_key) && self.hidden.contains(path_key) {
+                self.sync_excerpts(repo_path, window, cx);
+            }
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.focused_editor().update(cx, |editor, cx| {
+                editor.request_autoscroll(Autoscroll::fit(), cx)
+            })
+        });
+        cx.emit(ReviewDiffEvent::FilesChanged);
+        cx.notify();
     }
 
     pub(crate) fn single_file(&self) -> Option<&PathKey> {
@@ -564,6 +641,7 @@ impl ReviewDiff {
     /// What the review shows when it has no changes (or why it has none).
     pub(crate) fn empty_label(&self, cx: &App) -> SharedString {
         self.source_error(cx)
+            .or_else(|| self.all_hidden_label.clone())
             .unwrap_or_else(|| self.empty_label.clone())
     }
 
@@ -695,6 +773,12 @@ impl ReviewDiff {
                 stale_paths.remove(&path_key);
                 entries.insert(path_key, diff_buffer);
             }
+            // Lets the view decide which files to hide before their excerpts appear.
+            this.listed_paths = entries
+                .values()
+                .map(|diff_buffer| diff_buffer.repo_path.clone())
+                .collect();
+            cx.emit(ReviewDiffEvent::FileListChanged);
 
             let file_count = this.buffer_subscriptions.len();
             let repo_path_by_display_id = this
@@ -914,6 +998,15 @@ impl Render for ReviewDiff {
                                 .justify_around()
                                 .child(Label::new(empty_label)),
                         )
+                        .when(self.all_hidden_label.is_some(), |el| {
+                            el.child(
+                                h_flex().justify_around().child(
+                                    Label::new("Change the filters in the review panel to see them")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                        })
                         .child(
                             h_flex().justify_around().mt_1().child(
                                 Button::new("review-close-button", "Close")
