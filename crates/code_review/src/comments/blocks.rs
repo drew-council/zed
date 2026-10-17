@@ -1,3 +1,5 @@
+mod gutter;
+
 use super::{
     Comment, CommentEvent, CommentId, CommentTarget, CommentType, NewComment, Side,
     remote::{RemoteThreadContent, RemoteThreadView},
@@ -256,9 +258,13 @@ impl CommentBlocks {
                 },
             ),
             cx.observe_in(&splittable, window, |this, splittable, window, cx| {
-                let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
+                let lhs_editor = splittable.read(cx).lhs_editor().cloned();
+                let lhs_editor_id = lhs_editor.as_ref().map(|lhs| lhs.entity_id());
                 if lhs_editor_id != this.lhs_editor_id {
                     this.lhs_editor_id = lhs_editor_id;
+                    if let Some(lhs_editor) = &lhs_editor {
+                        gutter::install(lhs_editor, cx.weak_entity(), cx);
+                    }
                     this.reconcile(window, cx);
                 }
             }),
@@ -277,6 +283,13 @@ impl CommentBlocks {
             }),
         ];
         let session_subscription = cx.subscribe_in(&session, window, Self::handle_session_event);
+        let sides = [
+            Some(splittable.read(cx).rhs_editor().clone()),
+            splittable.read(cx).lhs_editor().cloned(),
+        ];
+        for editor in sides.iter().flatten() {
+            gutter::install(editor, cx.weak_entity(), cx);
+        }
         let mut this = Self {
             session,
             diff,
@@ -1025,10 +1038,27 @@ impl CommentBlocks {
     /// on the file.
     pub(crate) fn add_line_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editor = self.focused_diff_editor(cx);
-        let Some(selected) = self.selected_lines(cx) else {
+        self.add_line_comment_on(editor, None, window, cx);
+    }
+
+    /// Comments on `rows` (multibuffer rows) of one side of the diff, or on its selection, and
+    /// leaves the cursor on the last of them (or where the selection's head was). The side is
+    /// passed in: a side focused directly only becomes the split editor's focused one on the
+    /// next frame.
+    fn add_line_comment_on(
+        &mut self,
+        editor: Entity<Editor>,
+        rows: Option<RangeInclusive<u32>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected) = self.selected_lines(&editor, rows.clone(), cx) else {
             return;
         };
-        collapse_selection(&editor, window, cx);
+        match rows {
+            Some(rows) => move_cursor_to_row(&editor, *rows.end(), window, cx),
+            None => collapse_selection(&editor, window, cx),
+        }
         match selected {
             SelectedLines::FoldedFile(buffer_id) => {
                 let diff = self.diff.read(cx);
@@ -1071,15 +1101,19 @@ impl CommentBlocks {
         }
     }
 
-    /// What `c` comments on in the focused side of the diff.
-    fn selected_lines(&self, cx: &mut App) -> Option<SelectedLines> {
+    /// What `c` comments on in a side of the diff: `rows` (multibuffer rows), or the selection.
+    fn selected_lines(
+        &self,
+        editor: &Entity<Editor>,
+        rows: Option<RangeInclusive<u32>>,
+        cx: &mut App,
+    ) -> Option<SelectedLines> {
         let splittable = self.diff.read(cx).editor().read(cx);
-        let editor = splittable.focused_editor().clone();
         let rhs = splittable.rhs_editor().clone();
-        let is_lhs = splittable.lhs_editor() == Some(&editor);
+        let is_lhs = splittable.lhs_editor() == Some(editor);
         let diff = self.diff.clone();
         editor.update(cx, |editor, cx| {
-            selected_lines(editor, is_lhs, &rhs, &diff, cx)
+            selected_lines(editor, rows, is_lhs, &rhs, &diff, cx)
         })
     }
 
@@ -1109,7 +1143,7 @@ impl CommentBlocks {
         cx: &mut Context<Self>,
     ) -> Option<(String, usize)> {
         let editor = self.focused_diff_editor(cx);
-        let selected = self.selected_lines(cx);
+        let selected = self.selected_lines(&editor, None, cx);
         collapse_selection_to_start(&editor, window, cx);
         let SelectedLines::Lines {
             side,
@@ -2503,10 +2537,12 @@ fn facing_row(from: &Entity<Editor>, row: u32, to: &Entity<Editor>, cx: &mut App
     })
 }
 
-/// The lines `c` comments on (or visual `y` copies), on the side of the diff `editor` shows. A
-/// selection over the removed and added lines of a unified diff takes the added ones.
+/// The lines `c` comments on (or visual `y` copies), on the side of the diff `editor` shows:
+/// `rows` (multibuffer rows), or the selection's. A selection over the removed and added lines
+/// of a unified diff takes the added ones.
 fn selected_lines(
     editor: &mut Editor,
+    rows: Option<RangeInclusive<u32>>,
     is_lhs: bool,
     rhs: &Entity<Editor>,
     diff: &Entity<ReviewDiff>,
@@ -2516,7 +2552,10 @@ fn selected_lines(
     let diff = diff.read(cx);
     let snapshot = display_snapshot.buffer_snapshot();
     // The anchor, not the resolved selection: on a folded header that spans the whole file.
-    let head = editor.selections.newest_anchor().head();
+    let head = match &rows {
+        Some(rows) => snapshot.anchor_before(Point::new(*rows.end(), 0)),
+        None => editor.selections.newest_anchor().head(),
+    };
     let (head_anchor, _) = snapshot.anchor_to_buffer_anchor(head)?;
     // Folds live on the right side, by the file's buffer; the left side shows the diff bases.
     let is_folded = if is_lhs {
@@ -2529,7 +2568,7 @@ fn selected_lines(
     if is_folded {
         return Some(SelectedLines::FoldedFile(head_anchor.buffer_id));
     }
-    let rows = selected_rows(editor, &display_snapshot);
+    let rows = rows.unwrap_or_else(|| selected_rows(editor, &display_snapshot));
     let row_infos = snapshot
         .row_infos(MultiBufferRow(*rows.start()))
         .take(rows.clone().count())
@@ -2583,6 +2622,17 @@ fn collapse_selection(editor: &Entity<Editor>, window: &mut Window, cx: &mut App
     });
 }
 
+/// Puts the cursor (an empty selection, so vim is in normal mode) at the start of a multibuffer
+/// row, without scrolling.
+fn move_cursor_to_row(editor: &Entity<Editor>, row: u32, window: &mut Window, cx: &mut App) {
+    editor.update(cx, |editor, cx| {
+        let point = Point::new(row, 0);
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([point..point])
+        });
+    });
+}
+
 /// Collapses the selection onto its first row's start, where vim leaves the cursor after a
 /// yank.
 fn collapse_selection_to_start(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
@@ -2607,7 +2657,7 @@ mod tests {
         test_support::{
             active_review, add_review_panel, cursor_line, cursor_point, dispatch, excerpt_paths,
             init_vim_test, is_folded, lhs_editor, move_to_row_with_text, open_review_fixture,
-            path_at_cursor, review_count, rhs_editor, splittable,
+            path_at_cursor, review_count, rhs_editor, row_text, splittable,
         },
     };
     use fs::Fs as _;
@@ -4592,5 +4642,322 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         assert_eq!(cursor_point(&editor, cx).row, 1);
         cx.simulate_keystrokes("ctrl-enter");
         assert_eq!(bodies(&review, cx), ["one\ntwo"]);
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    /// The gutter's "+" on a display row of one side, as last drawn.
+    fn plus_button(
+        is_lhs: bool,
+        row: u32,
+        refused: bool,
+        cx: &mut VisualTestContext,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        let selector = format!(
+            "review-gutter-comment{}-{}-{row}",
+            if refused { "-refused" } else { "" },
+            if is_lhs { "lhs" } else { "rhs" },
+        );
+        cx.debug_bounds(selector.leak())
+    }
+
+    fn line_height(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> gpui::Pixels {
+        editor.update_in(cx, |editor, window, cx| {
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        })
+    }
+
+    /// A point in the text of `editor`'s display row `row`, found from a "+" drawn on display row
+    /// `reference_row` (the sides of a split diff have the same display rows).
+    fn text_position(
+        editor: &Entity<Editor>,
+        row: u32,
+        reference: gpui::Bounds<gpui::Pixels>,
+        reference_row: u32,
+        cx: &mut VisualTestContext,
+    ) -> gpui::Point<gpui::Pixels> {
+        let line_height = line_height(editor, cx);
+        let bounds = editor.read_with(cx, |editor, _| *editor.last_bounds().unwrap());
+        gpui::point(
+            bounds.center().x,
+            reference.center().y + line_height * (row as f32 - reference_row as f32),
+        )
+    }
+
+    /// The "+" of the row the cursor of `editor` is on, and that display row.
+    fn cursor_plus_button(
+        editor: &Entity<Editor>,
+        is_lhs: bool,
+        cx: &mut VisualTestContext,
+    ) -> (gpui::Bounds<gpui::Pixels>, u32) {
+        let row = display_row(editor, cursor_point(editor, cx).row, cx);
+        draw(cx);
+        let bounds = plus_button(is_lhs, row, false, cx).expect("the cursor row has a \"+\"");
+        (bounds, row)
+    }
+
+    /// GitHub's "+": on the hovered row and the cursor row; a click comments on its row (the old
+    /// line on a removed row of a unified diff), and clicking a row's text moves the cursor
+    /// there.
+    #[gpui::test]
+    async fn test_gutter_button_comments_on_its_row(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let none = gpui::Modifiers::none();
+
+        let line_3 = move_to_row_with_text(&rhs, "line 3", cx);
+        let (cursor_plus, line_3_row) = cursor_plus_button(&rhs, false, cx);
+        let line_4_row = display_row(&rhs, line_3 + 1, cx);
+        assert!(plus_button(false, line_4_row, false, cx).is_none());
+        let line_4_text = text_position(&rhs, line_4_row, cursor_plus, line_3_row, cx);
+        cx.simulate_mouse_move(line_4_text, None, none);
+        draw(cx);
+        let plus = plus_button(false, line_4_row, false, cx).expect("the hovered row has a \"+\"");
+        assert!(plus_button(false, line_3_row, false, cx).is_some());
+
+        cx.simulate_click(plus.center(), none);
+        cx.run_until_parked();
+        let editor = open_editor(&review, cx).expect("a comment editor opens");
+        assert!(is_focused(&editor, cx));
+        assert_eq!(vim_mode(&editor, cx).as_deref(), Some("insert"));
+        cx.simulate_input("four");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(cursor_line(&rhs, cx), "line 4");
+        assert_eq!(
+            comments(&review, cx),
+            [(lines("a.rs", 4..=4), "four".to_string(), None)]
+        );
+
+        // On a removed row, the old line.
+        let removed = move_to_row_with_text(&rhs, "line 2", cx);
+        let (plus, _) = cursor_plus_button(&rhs, false, cx);
+        cx.simulate_click(plus.center(), none);
+        cx.run_until_parked();
+        cx.simulate_input("old");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!(cursor_point(&rhs, cx).row, removed);
+        assert_eq!(
+            comments(&review, cx)[1],
+            (old_lines("a.rs", 2..=2), "old".to_string(), None)
+        );
+
+        // A click on a row's text puts the line cursor there.
+        let (plus, row) = cursor_plus_button(&rhs, false, cx);
+        let line_1_row = display_row(&rhs, removed - 1, cx);
+        let position = text_position(&rhs, line_1_row, plus, row, cx);
+        cx.simulate_click(position, none);
+        cx.run_until_parked();
+        assert_eq!(cursor_line(&rhs, cx), "line 1");
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(
+            crate::line_cursor::cursor_rows(&rhs, cx)
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect::<Vec<_>>(),
+            [removed - 1]
+        );
+    }
+
+    /// Pressing a "+" and dragging over rows selects them (the line cursor paints them), and the
+    /// release comments on them; a "+" in a selection comments on all of it, also on a
+    /// selection made by shift-clicking; one outside it comments on its own row.
+    #[gpui::test]
+    async fn test_gutter_button_comments_on_rows(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let none = gpui::Modifiers::none();
+        let painted_rows = |cx: &mut VisualTestContext| {
+            crate::line_cursor::cursor_rows(&rhs, cx)
+                .into_iter()
+                .map(|(row, _)| row_text(&rhs, row, cx))
+                .collect::<Vec<_>>()
+        };
+
+        move_to_row_with_text(&rhs, "LINE 2", cx);
+        let (plus, _) = cursor_plus_button(&rhs, false, cx);
+        let line_height = line_height(&rhs, cx);
+        cx.simulate_mouse_down(plus.center(), gpui::MouseButton::Left, none);
+        let below = gpui::point(plus.center().x, plus.center().y + line_height * 2.);
+        cx.simulate_mouse_move(below, gpui::MouseButton::Left, none);
+        draw(cx);
+        cx.run_until_parked();
+        assert_eq!(painted_rows(cx), ["LINE 2", "line 3", "line 4"]);
+        assert!(open_editor(&review, cx).is_none());
+        cx.simulate_mouse_up(below, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        let editor = open_editor(&review, cx).expect("a comment editor opens");
+        assert_eq!(vim_mode(&editor, cx).as_deref(), Some("insert"));
+        cx.simulate_input("range");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(cursor_line(&rhs, cx), "line 4");
+        assert_eq!(
+            comments(&review, cx),
+            [(lines("a.rs", 2..=4), "range".to_string(), None)]
+        );
+
+        // A drag upwards, over the removed row: the added and unchanged lines count, as for `c`.
+        move_to_row_with_text(&rhs, "LINE 2", cx);
+        let (plus, _) = cursor_plus_button(&rhs, false, cx);
+        let above = gpui::point(plus.center().x, plus.center().y - line_height * 2.);
+        cx.simulate_mouse_down(plus.center(), gpui::MouseButton::Left, none);
+        cx.simulate_mouse_move(above, gpui::MouseButton::Left, none);
+        draw(cx);
+        cx.run_until_parked();
+        assert_eq!(painted_rows(cx), ["line 1", "line 2", "LINE 2"]);
+        cx.simulate_mouse_up(above, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        cx.simulate_input("up");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!(
+            comments(&review, cx)[1],
+            (lines("a.rs", 1..=2), "up".to_string(), None)
+        );
+        assert_eq!(cursor_line(&rhs, cx), "LINE 2");
+
+        // Shift-clicking a row's text selects up to it; the "+" at the selection's end comments
+        // on all of it, and so does the one of a hovered row inside it.
+        let line_3 = move_to_row_with_text(&rhs, "line 3", cx);
+        for hover_inside in [false, true] {
+            move_to_row_with_text(&rhs, "line 3", cx);
+            let (plus, row) = cursor_plus_button(&rhs, false, cx);
+            let line_5_row = display_row(&rhs, line_3 + 2, cx);
+            let position = text_position(&rhs, line_5_row, plus, row, cx);
+            cx.simulate_click(position, gpui::Modifiers::shift());
+            draw(cx);
+            assert_eq!(painted_rows(cx), ["line 3", "line 4", "line 5"]);
+            let plus = if hover_inside {
+                let line_4_row = display_row(&rhs, line_3 + 1, cx);
+                let position = text_position(&rhs, line_4_row, plus, row, cx);
+                cx.simulate_mouse_move(position, None, none);
+                draw(cx);
+                plus_button(false, line_4_row, false, cx).unwrap()
+            } else {
+                plus_button(false, line_5_row, false, cx).expect("the selection's end has a \"+\"")
+            };
+            cx.simulate_click(plus.center(), none);
+            cx.run_until_parked();
+            cx.simulate_input("selected");
+            cx.simulate_keystrokes("ctrl-enter");
+            assert_back_in_diff(&rhs, cx);
+            assert_eq!(cursor_line(&rhs, cx), "line 5");
+            assert_eq!(
+                comments(&review, cx).last().unwrap(),
+                &(lines("a.rs", 3..=5), "selected".to_string(), None)
+            );
+            // Line 5 ends the excerpt, whose expand button the "+" covers.
+            assert_ne!(row_text(&rhs, line_3 + 3, cx), "line 6");
+        }
+
+        // A "+" outside the selection comments on its row, and the selection is gone.
+        move_to_row_with_text(&rhs, "line 4", cx);
+        cx.simulate_keystrokes("shift-v j");
+        let (plus, row) = cursor_plus_button(&rhs, false, cx);
+        let line_1_row = display_row(&rhs, line_3 - 3, cx);
+        let position = text_position(&rhs, line_1_row, plus, row, cx);
+        cx.simulate_mouse_move(position, None, none);
+        draw(cx);
+        let plus = plus_button(false, line_1_row, false, cx).unwrap();
+        cx.simulate_click(plus.center(), none);
+        cx.run_until_parked();
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(
+            comments(&review, cx).last().unwrap(),
+            &(lines("a.rs", 1..=1), "one".to_string(), None)
+        );
+    }
+
+    /// Both sides of a split diff have a "+": the left one comments on old lines.
+    #[gpui::test]
+    async fn test_gutter_button_in_split_view(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Split);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+        let none = gpui::Modifiers::none();
+
+        let line_3 = move_to_row_with_text(&rhs, "line 3", cx);
+        let (plus, row) = cursor_plus_button(&rhs, false, cx);
+        // The left side shows the cursor row, but its "+" only while hovered.
+        assert!(plus_button(true, row, false, cx).is_none());
+        let old_line_2 = move_to_row_with_text(&lhs, "line 2", cx);
+        cx.focus(&rhs);
+        move_to_row_with_text(&rhs, "line 3", cx);
+        let old_line_2_row = display_row(&lhs, old_line_2, cx);
+        let position = text_position(&lhs, old_line_2_row, plus, row, cx);
+        cx.simulate_mouse_move(position, None, none);
+        draw(cx);
+        assert!(plus_button(false, old_line_2_row, false, cx).is_none());
+        let lhs_plus = plus_button(true, old_line_2_row, false, cx).expect("the left side has one");
+        cx.simulate_click(lhs_plus.center(), none);
+        cx.run_until_parked();
+        let editor = open_editor(&review, cx).expect("a comment editor opens");
+        assert_eq!(vim_mode(&editor, cx).as_deref(), Some("insert"));
+        cx.simulate_input("old two");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&lhs, cx);
+        assert_eq!(cursor_line(&lhs, cx), "line 2");
+        assert_eq!(
+            comments(&review, cx),
+            [(old_lines("a.rs", 2..=2), "old two".to_string(), None)]
+        );
+        assert!(
+            hosted_on_sides(&review, cx)[0].1,
+            "the block is on the left side"
+        );
+
+        // The right side's, for the new line.
+        let (plus, row) = cursor_plus_button(&lhs, true, cx);
+        let line_3_row = display_row(&rhs, line_3, cx);
+        let position = text_position(&rhs, line_3_row, plus, row, cx);
+        cx.simulate_mouse_move(position, None, none);
+        draw(cx);
+        let rhs_plus = plus_button(false, line_3_row, false, cx).unwrap();
+        cx.simulate_click(rhs_plus.center(), none);
+        cx.run_until_parked();
+        cx.simulate_input("new three");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(
+            comments(&review, cx)[1],
+            (lines("a.rs", 3..=3), "new three".to_string(), None)
+        );
+    }
+
+    /// The gutter's breakpoint and bookmark button doesn't show in the review.
+    #[gpui::test]
+    async fn test_no_breakpoint_button_in_the_gutter(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Split);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "line 3", cx);
+        let (plus, row) = cursor_plus_button(&rhs, false, cx);
+
+        // Over the line number of the next row, for longer than the button's delay.
+        let position = gpui::point(
+            plus.center().x + gpui::px(8.),
+            plus.center().y + line_height(&rhs, cx),
+        );
+        cx.simulate_mouse_move(position, None, gpui::Modifiers::none());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        draw(cx);
+        assert!(plus_button(false, row + 1, false, cx).is_some());
+        assert!(cx.debug_bounds("ICON-DebugBreakpoint").is_none());
+        assert!(cx.debug_bounds("ICON-Bookmark").is_none());
     }
 }

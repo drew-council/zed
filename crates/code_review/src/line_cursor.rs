@@ -162,10 +162,15 @@ impl LineCursor {
     }
 }
 
+/// Sets up a side of the review's diff (the left side on every split).
 fn configure(editor: &Entity<Editor>, cx: &mut App) {
     editor.update(cx, |editor, cx| {
         editor.show_local_selections = false;
         editor.set_forbid_horizontal_autoscroll(true);
+        // The review's comment button takes the place of the gutter's hover button for
+        // breakpoints and bookmarks.
+        editor.set_show_breakpoints(false, cx);
+        editor.set_show_bookmarks(false, cx);
         cx.notify();
     });
 }

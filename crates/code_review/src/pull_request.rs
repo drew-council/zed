@@ -2759,6 +2759,74 @@ pub(crate) mod tests {
             assert!(!markdown.contains("Splitting on"));
         }
 
+        /// The gutter's "+" follows GitHub's comment gate: on a row it refuses, it's disabled,
+        /// says why, and makes no comment; on a row it takes, it opens a comment editor.
+        #[gpui::test]
+        async fn test_gutter_button_follows_the_comment_gate(cx: &mut TestAppContext) {
+            let (_fs, workspace, review, _requests, cx) =
+                open_pull_request_review(DiffViewStyle::Unified, Default::default(), cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let blocks = review.read_with(cx, |review, _| review.comments().clone());
+            let plus_button = |selector: String, cx: &mut VisualTestContext| {
+                draw(cx);
+                cx.debug_bounds(selector.leak())
+            };
+            notification_count(&workspace, cx);
+
+            let row = move_to_row_with_text(&rhs, "ENGINE 100", cx);
+            let refused_row = display_row(&rhs, row, cx);
+            assert!(plus_button(format!("review-gutter-comment-rhs-{refused_row}"), cx).is_none());
+            let refused = plus_button(
+                format!("review-gutter-comment-refused-rhs-{refused_row}"),
+                cx,
+            )
+            .expect("the cursor row has a disabled \"+\"");
+            assert_eq!(
+                cx.update(|_, cx| {
+                    blocks.update(cx, |blocks, cx| {
+                        blocks.gutter_refusal(&rhs, refused_row, cx)
+                    })
+                })
+                .as_deref(),
+                Some("GitHub only accepts comments within its diff hunks")
+            );
+            cx.simulate_click(refused.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert!(!has_open_comment_editor(&review, cx));
+            assert_eq!(notification_count(&workspace, cx), 0);
+            assert_eq!(
+                review.read_with(cx, |review, cx| review
+                    .session()
+                    .read(cx)
+                    .comments()
+                    .iter()
+                    .count()),
+                0
+            );
+
+            for row_text in ["ENGINE 59", "engine 193"] {
+                let row = move_to_row_with_text(&rhs, row_text, cx);
+                let row = display_row(&rhs, row, cx);
+                let plus = plus_button(format!("review-gutter-comment-rhs-{row}"), cx)
+                    .unwrap_or_else(|| panic!("{row_text} takes comments"));
+                cx.simulate_click(plus.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                assert!(has_open_comment_editor(&review, cx), "{row_text}");
+                cx.simulate_input("ok");
+                cx.simulate_keystrokes("ctrl-enter");
+            }
+            assert_eq!(
+                review.read_with(cx, |review, cx| review
+                    .session()
+                    .read(cx)
+                    .comments()
+                    .iter()
+                    .count()),
+                2
+            );
+            assert_eq!(notification_count(&workspace, cx), 0);
+        }
+
         #[gpui::test]
         async fn test_threads_in_split_view(cx: &mut TestAppContext) {
             let (_fs, _workspace, review, _requests, cx) =
