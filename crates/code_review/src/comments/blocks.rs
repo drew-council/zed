@@ -18,7 +18,9 @@ use gpui::{Entity, EventEmitter, Focusable as _, PromptLevel, Subscription, Weak
 use language::{
     Buffer, BufferId, LanguageRegistry, Point, ToPoint as _, language_settings::SoftWrap,
 };
-use multi_buffer::{MultiBuffer, MultiBufferRow, PathKey, RowInfo, ToPoint as _};
+use multi_buffer::{
+    MultiBuffer, MultiBufferRow, MultiBufferSnapshot, PathKey, RowInfo, ToPoint as _,
+};
 use std::{ops::RangeInclusive, sync::Arc};
 use ui::prelude::*;
 use util::{ResultExt as _, truncate_and_trailoff};
@@ -40,9 +42,9 @@ pub(crate) struct CommentBlocks {
     views: HashMap<CommentId, Entity<CommentView>>,
     /// The blocks showing comments on the right side of the diff.
     hosted: HashMap<CommentId, HostedBlock>,
-    /// The comment `]t`/`[t` moved to, with the row the cursor landed on: several comments can
-    /// sit below one row.
-    selected: Option<(CommentId, u32)>,
+    /// The comment `]t`/`[t` moved to, which tells comments below the same row apart while the
+    /// cursor stays on it.
+    selected: Option<CommentId>,
     targeted: Option<CommentId>,
     focus_guard: Option<Subscription>,
     _session_subscription: Subscription,
@@ -55,23 +57,17 @@ struct HostedBlock {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Placement {
-    /// Below the last commented line.
-    BelowLines(Anchor),
-    /// Below the file's header, above its first line.
-    AboveFile(Anchor),
+struct Placement {
+    /// The row the comment belongs to: its last line, or the file's first line.
+    row: Anchor,
+    is_file: bool,
+    block: BlockAnchor,
 }
 
-impl Placement {
-    fn anchor(self) -> Anchor {
-        match self {
-            Self::BelowLines(anchor) | Self::AboveFile(anchor) => anchor,
-        }
-    }
-
-    fn is_file(self) -> bool {
-        matches!(self, Self::AboveFile(_))
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockAnchor {
+    Above(Anchor),
+    Below(Anchor),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -370,7 +366,10 @@ impl CommentBlocks {
             }
             SelectedLines::Lines {
                 side: Side::Old, ..
-            } => self.show_toast("Comments on removed lines aren't supported yet", cx),
+            } => self.show_toast(
+                "Comments on the old side of the diff aren't supported yet",
+                cx,
+            ),
             SelectedLines::Lines {
                 side: Side::New,
                 buffer_id,
@@ -591,8 +590,8 @@ impl CommentBlocks {
         };
         self.rhs_editor(cx).update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let autoscroll = match placement {
-                Placement::BelowLines(anchor) => {
+            let autoscroll = match placement.block {
+                BlockAnchor::Below(anchor) => {
                     let row_below = anchor.to_point(&snapshot).row + 1;
                     if row_below > snapshot.max_point().row {
                         Autoscroll::center().for_anchor(anchor)
@@ -601,7 +600,11 @@ impl CommentBlocks {
                             .for_anchor(snapshot.anchor_before(Point::new(row_below, 0)))
                     }
                 }
-                Placement::AboveFile(anchor) => Autoscroll::fit().for_anchor(anchor),
+                // The file header is sticky, and would cover a block fitted to the top.
+                BlockAnchor::Above(anchor) if placement.is_file => {
+                    Autoscroll::center().for_anchor(anchor)
+                }
+                BlockAnchor::Above(anchor) => Autoscroll::fit().for_anchor(anchor),
             };
             editor.request_autoscroll(autoscroll, cx);
         });
@@ -766,11 +769,10 @@ impl CommentBlocks {
             return;
         }
         let order = self.diff.read(cx).file_order();
-        let cursor_row = self.rhs_cursor_row(cx);
         let current = self
-            .selected
-            .filter(|(_, row)| Some(*row) == cursor_row)
-            .and_then(|(id, _)| items.iter().find(|item| item.2 == id).copied());
+            .comments_at_cursor(cx)
+            .and_then(|(_, at_cursor)| self.selected.filter(|id| at_cursor.contains(id)))
+            .and_then(|id| items.iter().find(|item| item.2 == id).copied());
         let target = match current {
             Some(current) => match direction {
                 Direction::Next => items.iter().find(|item| **item > current),
@@ -857,11 +859,11 @@ impl CommentBlocks {
         };
         self.show_file(&path_key, window, cx);
         self.reconcile(window, cx);
-        let Some(anchor) = self.hosted.get(&id).map(|hosted| hosted.placement.anchor()) else {
+        let Some(anchor) = self.hosted.get(&id).map(|hosted| hosted.placement.row) else {
             return;
         };
         let rhs = self.rhs_editor(cx);
-        let row = rhs.update(cx, |editor, cx| {
+        rhs.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let point = Point::new(anchor.to_point(&snapshot).row, 0);
             editor.change_selections(
@@ -870,10 +872,9 @@ impl CommentBlocks {
                 cx,
                 |selections| selections.select_ranges([point..point]),
             );
-            point.row
         });
         self.focus_diff_editor(&rhs, window, cx);
-        self.selected = Some((id, row));
+        self.selected = Some(id);
         self.update_targeted(cx);
     }
 
@@ -899,20 +900,27 @@ impl CommentBlocks {
     /// The comment `i`, `Enter` and `dd` act on: the one `]t`/`[t` moved to, else the first line
     /// comment below the cursor row, else the file comment above it.
     fn comment_at_cursor(&self, cx: &mut App) -> Option<CommentId> {
+        let (first, at_cursor) = self.comments_at_cursor(cx)?;
+        Some(
+            self.selected
+                .filter(|id| at_cursor.contains(id))
+                .unwrap_or(first),
+        )
+    }
+
+    /// The comments shown at the cursor row: the first one `i` would act on, and all of them.
+    fn comments_at_cursor(&self, cx: &mut App) -> Option<(CommentId, Vec<CommentId>)> {
         let row = self.rhs_cursor_row(cx)?;
-        if let Some((id, selected_row)) = self.selected
-            && selected_row == row
-            && self.hosted.contains_key(&id)
-        {
-            return Some(id);
-        }
         let snapshot = self.rhs_editor(cx).read(cx).buffer().read(cx).snapshot(cx);
-        self.hosted
+        let mut at_cursor = self
+            .hosted
             .iter()
-            .filter(|(_, hosted)| hosted.placement.anchor().to_point(&snapshot).row == row)
-            .map(|(id, hosted)| (hosted.placement.is_file(), *id))
-            .min()
-            .map(|(_, id)| id)
+            .filter(|(_, hosted)| hosted.placement.row.to_point(&snapshot).row == row)
+            .map(|(id, hosted)| (hosted.placement.is_file, *id))
+            .collect::<Vec<_>>();
+        at_cursor.sort();
+        let (_, first) = *at_cursor.first()?;
+        Some((first, at_cursor.into_iter().map(|(_, id)| id).collect()))
     }
 
     /// The cursor's row on the right side of the diff. The left side's rows face the right
@@ -1048,9 +1056,12 @@ fn placement(comment: &Comment, editor: &Editor, cx: &App) -> Option<Placement> 
             if editor.is_buffer_folded(anchor.end.buffer_id, cx) {
                 return None;
             }
-            Some(Placement::BelowLines(
-                snapshot.anchor_in_excerpt(anchor.end)?,
-            ))
+            let row = snapshot.anchor_in_excerpt(anchor.end)?;
+            Some(Placement {
+                row,
+                is_file: false,
+                block: block_below_row(row, &snapshot),
+            })
         }
         CommentTarget::Lines {
             side: Side::Old, ..
@@ -1061,9 +1072,33 @@ fn placement(comment: &Comment, editor: &Editor, cx: &App) -> Option<Placement> 
             if editor.is_buffer_folded(text_anchor.buffer_id, cx) {
                 return None;
             }
-            Some(Placement::AboveFile(anchor))
+            Some(Placement {
+                row: anchor,
+                is_file: true,
+                block: BlockAnchor::Above(anchor),
+            })
         }
     }
+}
+
+/// Where a block goes to sit right below the row `row`: below it, or above the next row of the
+/// same excerpt, which looks the same. A split diff puts a spacer facing the block on the other
+/// side, and mirrors a block below an unchanged row as a spacer above the facing row, which
+/// would misalign the rows; a block above the next unchanged row (or the next hunk) is mirrored
+/// above the row facing that one. Changed rows keep their block below them: the other side
+/// mirrors it below the start of the hunk.
+fn block_below_row(row: Anchor, snapshot: &MultiBufferSnapshot) -> BlockAnchor {
+    let point = row.to_point(snapshot);
+    let mut row_infos = snapshot.row_infos(MultiBufferRow(point.row));
+    if let (Some(current), Some(next)) = (row_infos.next(), row_infos.next())
+        && current.diff_status.is_none()
+        && next.buffer_id == current.buffer_id
+        && next.buffer_row.is_some()
+        && next.buffer_row == current.buffer_row.map(|row| row + 1)
+    {
+        return BlockAnchor::Above(snapshot.anchor_before(Point::new(point.row + 1, 0)));
+    }
+    BlockAnchor::Below(row)
 }
 
 fn block_properties(
@@ -1072,9 +1107,9 @@ fn block_properties(
     view: Entity<CommentView>,
 ) -> BlockProperties<Anchor> {
     BlockProperties {
-        placement: match placement {
-            Placement::BelowLines(anchor) => BlockPlacement::Below(anchor),
-            Placement::AboveFile(anchor) => BlockPlacement::Above(anchor),
+        placement: match placement.block {
+            BlockAnchor::Above(anchor) => BlockPlacement::Above(anchor),
+            BlockAnchor::Below(anchor) => BlockPlacement::Below(anchor),
         },
         // Blocks take the height of their content once rendered.
         height: Some(3),
@@ -1749,6 +1784,12 @@ mod tests {
                 .excerpt_file_paths(cx)),
             ["modified.txt"]
         );
+
+        // The comment moved to isn't at the cursor once other files show above it.
+        cx.simulate_keystrokes("; f g g");
+        assert_eq!(targeted(cx), None);
+        cx.simulate_keystrokes("j");
+        assert_eq!(targeted(cx), None);
     }
 
     #[gpui::test]
@@ -1836,13 +1877,36 @@ mod tests {
         assert_back_in_diff(&rhs, cx);
         assert_eq!(bodies(&review, cx), ["split"]);
 
+        // Blocks below unchanged rows keep the rows facing each other.
+        for row_text in ["line 3", "line 4"] {
+            move_to_row_with_text(&rhs, row_text, cx);
+            cx.simulate_keystrokes("c");
+            cx.simulate_input(row_text);
+            cx.simulate_keystrokes("ctrl-enter");
+        }
+        for row_text in ["LINE 2", "line 3", "line 4", "line 5"] {
+            let rhs_row = move_to_row_with_text(&rhs, row_text, cx);
+            let lhs_text = if row_text == "LINE 2" {
+                "line 2"
+            } else {
+                row_text
+            };
+            let lhs_row = move_to_row_with_text(&lhs_editor(&review, cx), lhs_text, cx);
+            assert_eq!(
+                display_row(&rhs, rhs_row, cx),
+                display_row(&lhs_editor(&review, cx), lhs_row, cx),
+                "{row_text}"
+            );
+        }
+        move_to_row_with_text(&rhs, "LINE 2", cx);
+
         // Old lines can't be commented on yet.
         cx.simulate_keystrokes("ctrl-w h");
         let lhs = lhs_editor(&review, cx);
         assert!(splittable(&review, cx).read_with(cx, |editor, _| editor.focused_editor() == &lhs));
         cx.simulate_keystrokes("c");
         assert!(open_editor(&review, cx).is_none());
-        assert_eq!(bodies(&review, cx), ["split"]);
+        assert_eq!(bodies(&review, cx), ["split", "line 3", "line 4"]);
         // `i` on the left side edits the comment facing the cursor row.
         move_to_row_with_text(&lhs, "line 2", cx);
         cx.simulate_keystrokes("i");
