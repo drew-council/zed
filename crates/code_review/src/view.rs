@@ -894,6 +894,11 @@ impl ReviewView {
             .remove(&key)
             .unwrap_or_else(|| ReviewSession::for_key(key, cx));
         let previous = std::mem::replace(&mut self.session, session);
+        // `zed --review --wait` waits for the review this tab shows, whatever its key is now.
+        previous.update(cx, |previous, cx| {
+            self.session
+                .update(cx, |session, _| previous.move_outcome_waiters_to(session))
+        });
         let previous_key = previous.read(cx).key().clone();
         self.previous_sessions.insert(previous_key, previous);
         self._session_subscription =
@@ -3090,6 +3095,36 @@ mod tests {
                 ReviewTarget::branch("main").unwrap()
             );
             assert_eq!(review_count(&workspace, cx), 2);
+        }
+
+        /// `zed --review branch --wait` waits for the review its tab shows, also after the tab
+        /// moved to another review key.
+        #[gpui::test]
+        async fn test_waiters_follow_key_switch(cx: &mut TestAppContext) {
+            crate::init_test(cx);
+            let (_fs, workspace, cx) = branch_fixture(cx).await;
+            dispatch(ReviewBranch::default(), cx);
+            let review = active_review(&workspace, cx);
+            let session = review.read_with(cx, |review, _| review.session().clone());
+            let outcome = session.update(cx, |session, _| session.wait_for_outcome());
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                let base = BranchBase::new("main").unwrap();
+                ReviewView::select_base(review.clone(), base, workspace, window, cx)
+            });
+            cx.run_until_parked();
+            let new_session = review.read_with(cx, |review, _| review.session().clone());
+            assert_ne!(new_session, session);
+            assert!(!session.update(cx, |session, _| session.has_outcome_waiters()));
+            assert!(new_session.update(cx, |session, _| session.has_outcome_waiters()));
+
+            workspace.update(cx, |workspace, cx| {
+                crate::submit::finish_local_review(workspace, &review, cx)
+            });
+            assert_eq!(
+                futures::FutureExt::now_or_never(outcome),
+                Some(Ok(crate::ReviewOutcome::Finished { markdown: None }))
+            );
         }
 
         #[gpui::test]

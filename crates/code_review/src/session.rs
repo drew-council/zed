@@ -511,6 +511,16 @@ impl ReviewSession {
         }
     }
 
+    /// Hands the waiters over to the session a tab switched to (its review key changed), so they
+    /// wait for the review the tab shows now.
+    pub(crate) fn move_outcome_waiters_to(&mut self, other: &mut ReviewSession) {
+        other.outcome_waiters.extend(
+            self.outcome_waiters
+                .drain(..)
+                .filter(|waiter| !waiter.is_canceled()),
+        );
+    }
+
     pub(crate) fn flush(&mut self, cx: &mut Context<Self>) {
         for id in std::mem::take(&mut self.moved_comments) {
             self.save_comment(id, cx);
