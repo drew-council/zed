@@ -19,14 +19,17 @@ agreed design (from a design-grilling session with the user on 2026-10-16), the 
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
 persistence, panel list" with the M5 part 1 review fixes) and M6 (export, see "Milestone 6"); M7 in
 progress: slice (a), the GitHub client (see "Milestone 7, slice (a)"), is done, followed by a second
-hardening pass over the M5 part 2 + M6 review (see "Hardening 2"); slices (b) PR picker + checkout,
-(c) description + threads and (d) submit are next.** The
+hardening pass over the M5 part 2 + M6 review (see "Hardening 2"), then slice (b), pull request
+reviews from the picker with checkout in place or in a new worktree (see "Milestone 7, slice (b)");
+slices (c) description + threads and (d) submit are next.** The
 long-lived fork branch `code-review`
 exists locally (not pushed): upstream tag `v1.25.0-pre` + the fork commits. The fork's `main` is
 untouched and equals upstream `main`. Review tabs exist for uncommitted changes, the branch vs a base
 (changeable in place), and one commit or a contiguous range (live when it ends at HEAD, a read-only
-historic snapshot otherwise), opened from the `code_review::StartReview` picker or the direct actions
-`ReviewUncommitted` / `ReviewBranch { base }` / `ReviewCommits { commits }`. Each tab has a
+historic snapshot otherwise), and a GitHub pull request (checked out in place, Zed's way, or in a new
+`pr-N` worktree), opened from the `code_review::StartReview` picker or the direct actions
+`ReviewUncommitted` / `ReviewBranch { base }` / `ReviewCommits { commits }` / `OpenPullRequest {
+reference }`. Each tab has a
 tuicr-style line cursor and file navigation, a fixed top block (branch base, or the commit messages),
 per-file and per-hunk reviewed marks persisted in Zed's DB (reviewed files fold to their header,
 reviewed hunks are dimmed, marks stop counting while the diff content differs), and per-tab filters (include /
@@ -38,9 +41,10 @@ whole review (`;c`) open vim editors in insert mode, render as markdown, have ty
 deleted and navigated with `i`/`Enter`, `dd` and `]t`/`[t`/`m`/`M`; they are stored in Zed's DB per
 review, follow the code while the review is open and are flagged outdated when their lines changed
 while it was closed. `y` copies the review as Markdown in tuicr's format, `Y` the comment at the
-cursor, visual `y` the selected lines. A GitHub client (no UI yet) resolves a checkout's GitHub
-repository (a fork's parent), lists and reads its pull requests, threads, reviews and commentable
-lines. Next: M7 slices (b)–(d), then M8 (CLI).
+cursor, visual `y` the selected lines. A GitHub client resolves a checkout's GitHub repository (a
+fork's parent), lists and reads its pull requests, threads, reviews and commentable lines; so far
+the picker lists pull requests and a pull request review shows one line about the pull request.
+Next: M7 slices (c)–(d), then M8 (CLI).
 
 What exists:
 
@@ -49,7 +53,7 @@ What exists:
 | branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
 | `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
-| `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI) |
+| `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange), PullRequest(PullRequestTarget)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`, reused by M8's CLI), `PullRequestReference` + `parse_pull_request_reference` (M8 reuses it), `validate_branch_name` (forge branch names) |
 | `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `check_branch_base`, `resolve_commits`) |
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path`, single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
 | `crates/code_review/src/session.rs` | `ReviewKey`, `ReviewSession` (reviewed files/hunks and the `CommentStore` of one review, shared by its tabs through the `ReviewSessions` global; marks and comments loaded from/saved to the DB, positions flushed on close/quit, old reviews pruned), FNV-1a `file_digest` (content hash + hunk keys), `reconcile` |
@@ -58,18 +62,20 @@ What exists:
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor) and its `ReviewComment` key context with the leave/keep actions |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
 | `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`), the `Forge` trait, `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
-| `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, remote parsing, token lookup and cache, `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache; tests with a fake `HttpClient` and an ignored live test |
+| `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup and cache, `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache; `test_support` (fake GitHub `HttpClient`, fixtures) and tests, an ignored live test |
+| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point M8 calls), the in-place flow, `plan_worktree` and the new-worktree flow |
+| `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, the pure `plan_checkout` and `head_remote`, `run_checkout` (Zed's fetch and branch switch, plus our own git runner `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
 | `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
 | `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header checkbox, `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
-| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, or the commit messages (collapsible); then the review-level comments; commit tab titles |
-| `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select); `CommitSelection` |
+| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: fixed header above the diff — branch base line with a Change Base button, the commit messages (collapsible), or the pull request line (slice (c) makes it the description block); then the review-level comments; commit tab titles |
+| `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll |
 | `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the single-file bar, the panel's read API (`panel_files`, `summary`); GPUI tests |
 | `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu, empty states; workspace-level filter/copy actions; GPUI tests |
-| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
+| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/cargo-timing-*.html` | `cargo --timings` reports for the clean build and the one-week bump |
 | `script/live-harness/README.md` | `zh`: headless real-GUI Zed harness (Xvfb, input, screenshots) for agent verification; costs CPU, use only when a slice asks |
@@ -683,6 +689,134 @@ state dir):**
   both show each other's comments, a shell edit moves them alike, an unsaved edit in one window moves
   them only there, Zed stays idle (no ping-pong).
 
+**Milestone 7, slice (b) (pull request reviews, picker, checkout)** — `plans/M7-github-v2.md` §3
+unless noted. No upstream file changed (new deps `askpass` (was a dev-dependency), `git_ui_core`,
+`zed_actions`; dev-dependency `tempfile`):
+
+- **Target** (`target.rs`): `ReviewTarget::PullRequest(PullRequestTarget { repo, number, base })`;
+  `repo` is the forge's canonical repository, `base` = `BranchBase::new(base_oid)` (GitHub's full oid
+  through the hardening choke point). `is_same_review` compares repo (case-insensitive) + number, so
+  a tab is reused when the base moved; reopening moves that tab to the new base
+  (`ReviewView::update_pull_request_base`). Key `pr:{host}/{owner}/{name}#{n}` (lowercased),
+  independent of the checkout, so a `pr-N` worktree's tab shares the session (marks, comments) with
+  the main checkout's. Diff = `DiffBase::Merge { base_ref: base oid }` (merge-base(base, HEAD) →
+  working tree); `ReviewDiff` checks the base like a branch review's (spinner, "Unknown revision …").
+  Empty label "No changes in this pull request". `HeadChanged` re-checks the base and retitles.
+- **References** (`parse_pull_request_reference`): `123`, `#123`, `pr:123`, `owner/repo#123`,
+  `http(s)://host/owner/repo/pull/123[/…]` (query/fragment ignored, `.git` stripped); digits only
+  (`u64::from_str` would take `+5`), > 0, no overflow; owner/name `[A-Za-z0-9._-]`, not `.`/`..`.
+- **`validate_branch_name`** (every `head_ref`/`base_ref` before a refspec or `change_branch`): no
+  leading `-`, whitespace or control characters (`is_plain_revision`), and git's check-ref-format
+  rules (`~^:?*[\`, `..`, `//`, `@{`, `@`, leading/trailing `/`, trailing `.`, components starting
+  with `.` or ending in `.lock`). Unicode, `+`, `@` inside are allowed, as git allows them.
+- **Checkout plan** (`checkout::plan_checkout`, pure): HEAD == PR head → nothing (no fetch). A
+  remote pointing at the head repository (`head_remote`, C15) → `FetchRemote{R}` (Zed's fetch) →
+  `ChangeBranch{"R/head_ref"}` (Zed's `change_branch`: a local tracking branch, checked out) → plus
+  `FetchRefspec{canonical, ["refs/heads/{base}"]}` when R isn't the canonical repository (the user's
+  fork: its remote doesn't have the base commit) → `FastForward`. Otherwise `refs/pull/N/head` from
+  the remote pointing at the canonical repository, else its URL (SSH when origin is SSH):
+  `FetchRefspec{src, ["refs/pull/N/head:refs/heads/pr/N", "refs/heads/{base}"]}` → `ChangeBranch{pr/N}`
+  → `FastForward`; already on `pr/N` (git refuses to fetch into the checked-out branch):
+  `FetchRefspec{src, ["refs/pull/N/head", "refs/heads/{base}"]}` → `FastForward`. Non-forced, as
+  `gh`. Decisions beyond the plan: `head_remote` is skipped for a pull request that isn't open (its
+  branch is often deleted; GitHub keeps `refs/pull`) and for a fork's pull request whose head branch
+  is named like its base (a fork's `main` into `main`: switching to `origin/main` would make the
+  local `main` track the fork). **`FastForward` always targets the head oid** (not `R/head_ref` or
+  `FETCH_HEAD`: with two refspecs `FETCH_HEAD` holds both heads and `merge` would try an octopus), so
+  HEAD ends at exactly the head the review was loaded with; it is skipped when HEAD already is it
+  (a branch ahead of the PR stays where it is: "Already up to date").
+- **Executor** (`run_checkout`): Zed's `Repository::fetch` / `change_branch` for those steps; the
+  others through our runner `run_git` on the repository's job queue (status bar "git fetch" / "git
+  merge --ff-only"): `git -c core.fsmonitor=false --no-pager`, and for an untrusted repository the
+  same `-c` overrides as `GitBinary::build_command` (hooks, ssh command, credential helper, ext
+  protocol off), the repository's environment, `GIT_TERMINAL_PROMPT=0`, Zed's askpass
+  (`AskPassSession`, `GIT_ASKPASS`/`SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE=force`, unless the environment
+  sets `GIT_ASKPASS`; the delegate is a copy of the worktree service's private one with
+  `AskPassModal`), `--end-of-options` before the source/refs. Hints: a rejected non-fast-forward
+  fetch into `pr/N` → "The pull request was force-pushed. Delete the local branch pr/N and try
+  again."; a refused fast-forward → "‹branch› has commits the pull request doesn't have…". **Dirty
+  tree**: nothing stashes; git carries changes over or refuses, the stderr shows in the error toast
+  (Zed's `change_branch` creates the tracking branch before its checkout fails, as in its branch
+  picker).
+- **Open flow** (`pull_request::open_pull_request(workspace, repo, reference, options)`):
+  `resolve_forge(reference.repo)` → `pull_request(n)` → `PullRequestTarget::new` → remotes, branch,
+  HEAD → plan → (`options.confirm_checkout` and a non-empty plan: a "Check out pull request #N?"
+  prompt, for M8's links) → `run_checkout` → `PullRequestState::set` → `deploy_in_repo`. The
+  checkout only moves after the user picked the pull request (picker / action). Errors:
+  `forge::show_error_toast` (GitHub hint or the git error chain); a success dismisses an earlier
+  error toast (`forge::dismiss_error_toast`).
+- **Review in Worktree** (`options.in_new_worktree`, picker `ctrl-enter`): worktree name `pr-N`; an
+  existing linked worktree at Zed's path for that name is opened with
+  `MultiWorkspace::find_or_create_local_workspace` and the in-place flow runs there. Otherwise
+  `plan_worktree`: a head remote → `NewWorktreeBranchTarget::RemoteBranch{R, head_ref}` (Zed's
+  service fetches R; plus the base fetch for a fork); else **`refs/pull/N/head` + base fetched into
+  `FETCH_HEAD` only, then `ExistingBranch{name: head oid}`** (deviation: no `pr/N` branch for
+  worktrees — `git worktree add --detach` takes any revision, and a branch can't be fetched into
+  while another worktree has it checked out). `git_ui_core::worktree_service::create_worktree_workspace`
+  (opens in the background, detached at the head), then `MultiWorkspace::activate`, then the
+  in-place flow in the new workspace's repository (plan empty) opens the tab there. The original
+  checkout is untouched. Zed's service shows its own error toast; ours is skipped for those
+  (`ShownByWorktreeService`). Note: with the multi-workspace sidebar disabled (AI disabled, as in the
+  harness) `activate` replaces the window's workspace; with it enabled both stay in the window and
+  the title bar's worktree picker switches between them (verified live).
+- **Picker** (`picker.rs`): Pull Requests section after Local, loaded when the picker opens
+  (`resolve_forge(None)` → `list_pull_requests`); header "Pull Requests · ‹canonical›" or "Review
+  Requests · ‹canonical›"; rows `#N` + title (fuzzy positions) + Draft chip + author + updated time,
+  second line `head → base` (+ " · fork" for cross-repository; text, not a chip, so rows keep one
+  height). Status rows "Loading pull requests…", the error hint (`forge::error_message`), "No open
+  pull requests" / "No pull requests request your review"; no GitHub remote
+  (`GitHubError::Unsupported`) → no section; after an error the forge is dropped, so the next load
+  resolves it (and the token) again. Candidate ids from `1 << 20` keep the sections apart. A query
+  that parses as a reference selects its listed pull request (a URL doesn't fuzzy-match its row, so
+  that row is added) or adds "Open pull request ‹ref›" first in the section and selects it. Footer:
+  "Review Requests" / "Open Pull Requests" (`code_review::TogglePullRequestFilter`, `ctrl-r` in
+  `StartReview > Picker > Editor`, which beats `projects::OpenRecent`), and on a pull request row
+  "Review in Worktree" (`ctrl-enter`) and "Review". `StartReviewFocus::PullRequests` selects the first
+  pull request once loaded. Placeholder "Review changes, the branch, commits, or a pull request
+  (#123, URL)…".
+- **`code_review::OpenPullRequest { reference: Option<String> }`** (deviation from the plan's `number:
+  Option<u64>`, as the slice brief asked): `None` opens the picker at the pull requests; a reference
+  that doesn't parse is a toast; otherwise the in-place flow.
+- **Tab and top block**: tab text "PR #N: ‹title›" without the "Review:" prefix (it already says
+  what the tab is), at most 64 characters; tooltip "Review: PR #N: ‹title› (o/r)"; panel title the
+  same. Top block (placeholder until slice (c)): "o/r#N ‹title› ‹author› wants to merge ‹head› into
+  ‹base›", plus a warning "Checked out ‹local7›, pull request head ‹pr7›" when the repository's
+  HEAD (`head_commit` of its snapshot) isn't the pull request's head (another branch checked out,
+  or the pull request moved on; the diff then shows what HEAD has since the base). Export preamble
+  (M6): "Reviewing pull request o/r#N: title", "URL: …", "Head: sha7"; scope "pull request o/r#N".
+- Tests: 7 new (120 total + 1 ignored): reference parsing, branch-name validation, `plan_checkout`
+  (already at head, origin canonical, fork + upstream, own fork PR, third-party fork via remote /
+  SSH URL / HTTPS URL, on `pr/N`, closed PR, fork `main`→`main`, deleted head repo, hostile names),
+  `plan_worktree`, real git in temp dirs (a bare remote with `refs/pull/7/head` → fetch into `pr/7`;
+  a new push → FETCH_HEAD + fast-forward; a force-push → rejected with the hint, `pr/7` unchanged; a
+  diverged branch → refused with the hint), GPUI picker with the fake GitHub (rows and header, toggle
+  and back, `#1`/`o/r#77`/URL selection, opening PR #1 at its head → `PullRequest` target, key, title,
+  reuse via `OpenPullRequest{"1"}`, `OpenPullRequest{None}` → first PR selected, bad reference,
+  reopening a rebased PR moves the tab's base; a 401 → the auth hint, recovered by toggling). The
+  fake repository's fetch is `unimplemented!()`, so GPUI tests only open pull requests whose plan is
+  empty. Clippy clean.
+- **Live check (b)** (harness, `validation/M7b/`; HTTPS clone of the sandbox with the env-token
+  credential helper, `ZH_EXTRA_ENV="GITHUB_TOKEN=$(gh auth token) …"`; nothing posted; leak grep
+  clean): the picker lists #4, #1, #3, #2 (not the closed #5; bot PRs by github-actions), `ctrl-r` →
+  "No pull requests request your review" and back; `1` + Enter on a clone with only `origin/main` →
+  fetch, `feature/template-filters` tracking origin at `3f22f1b`, tab "PR #1: …", panel docs/guide.md,
+  src/util/strings.rs, src/engine.rs, src/filters.rs (A), src/format.rs (D) + src/render.rs (A) (no
+  rename detection, as every review), src/legacy.rs (D), src/lib.rs; gen/schema.rs and vendor/lib.js
+  hidden; `branch -f feature/template-filters 5c5cdf4` + reopening by URL → fast-forwarded to
+  `3f22f1b`, same tab; PR #2 with a conflicting uncommitted edit → git's "Your local changes … would be
+  overwritten" in a toast, HEAD and the edit unchanged, no stash; after reverting, PR #2 in place →
+  `fix/truncate-ellipsis` at `632ee13` with GitHub's two files; the PR #1 tab then warns "Checked out
+  632ee13, pull request head 3f22f1b"; "Review in Worktree" on PR #1 → `pr-1` worktree detached at
+  `3f22f1b` opened as a second workspace with the review, the main checkout still on
+  `fix/truncate-ellipsis`, repeating it reuses the worktree. Fork listing: a probe repo whose origin
+  is `drew-council/zed` lists "Pull Requests · zed-industries/zed" (not confirmed). Fork pull
+  requests (`refs/pull`, read-only): a clone of the public `octocat/Hello-World` → #11572 in place →
+  `pr/11572` at its head with GitHub's diff; `pr/11572` reset back one commit (warning shown) and
+  reopened → FETCH_HEAD + fast-forward; #11569 "Review in Worktree" → a detached `pr-11569` worktree
+  at its head, no branch created. Found and fixed: the tab title cut at 48 characters, the fork chip
+  making rows uneven, a stale error toast after a successful retry, "entity released" when the
+  worktree's workspace replaced the source one.
+
 **Known issues / notes for the next slices:**
 
 - **M7 hooks** (`plans/M7-github-v2.md` §6):
@@ -704,8 +838,8 @@ state dir):**
     reconcile and buffer edit; the last tab that saw them move when windows' buffers differ), so they
     are the live numbers; `Side::Old` = LEFT with the base's numbering (left-side context rows are Old
     too).
-  - Export: add the PR arm in `ReviewView::export_preamble` ("Reviewing pull request o/r#N: title",
-    "URL: …", "Head: sha7", scope "pull request o/r#N").
+  - Export: the PR arm of `ReviewView::export_preamble` exists since slice (b) ("Reviewing pull
+    request o/r#N: title", "URL: …", "Head: sha7", scope "pull request o/r#N").
 - **Comment editors, known gaps**: every `:w` form leaves the comment keeping its text (see "Hardening
   2"); none writes a file. `:qa`, `:qa!`, `:wqa`, `:xa` close the review tab(s); open comment text is
   saved even by `:qa!`. Two tabs editing one saved comment: last writer wins. Two windows whose buffers
@@ -732,8 +866,9 @@ state dir):**
   `e` on a folded header opens the file at its last row. Header controls go only through `ReviewAddon`
   in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
-- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 113 tests
-  + 1 ignored live GitHub test (after hardening 2; 110 after M7 slice a, 89 after M6, stable under
+- Not run: `zed`'s own tests (incl. `test_action_namespaces`). `cargo test -p code_review`: 120 tests
+  + 1 ignored live GitHub test (after M7 slice b; 113 after hardening 2, 110 after M7 slice a, 89
+  after M6, stable under
   `ITERATIONS=5`; the hardening-2 comment tests under `ITERATIONS=10`).
 - M3 was verified live (harness): picker rows, every target, Change Base (button, palette, reuse),
   snapshot read-only + checkout untouched, live range following edits, top block, titles, reuse,
@@ -744,24 +879,26 @@ state dir):**
   keeps its last tree diff when a reload fails, so a base deleted (or HEAD switched to an unrelated
   branch) after a review opened shows the stale file list; the error label only replaces an empty
   list (the base is re-checked on `HeadChanged`).
-- **M7 slice (b) entry points** (from slice a): `forge::resolve_forge(&repo, reference, &project,
-  cx)` (call it on the picker's open and on `OpenPullRequest`; `GitHubError::Unsupported` → hide the
-  PR section), `Forge::list_pull_requests(Open | ReviewRequested)`, `Forge::pull_request(n)`;
-  `forge::error_message(&error)` for status rows, `forge::show_error_toast` for toasts.
-  `PullRequestDetails.base_oid`/`head_oid` are already full-length `Oid`s (still pass `base_oid`
-  through `BranchBase::new`); `head_ref`/`base_ref` are untrusted (validate them). For C15 compare a
-  remote's repository (`ForgeRepo`, from the same remote parsing: expose `github_repo_for_remote` or
-  re-parse) with `details.head_repository` via `ForgeRepo::is_same_repo` (case-insensitive).
-  `RepositoryContext` has `canonical_https_url`/`canonical_ssh_url`/`origin_is_ssh` for the refspec
-  fetch source.
-- M7 slots: `Section` in `picker.rs` (add the pull request section after the Local entries in
-  `StartReviewDelegate::set_matches`), `StartReviewFocus` (add
-  `PullRequests` for `OpenPullRequest { number: None }`), `ReviewTarget` (add `PullRequest`; override
-  `is_same_review` so `base_oid` is ignored), `DiffSource::new` (map it to
-  `BufferList(DiffBase::Merge { base_ref: base_oid })`), `TopBlockContent` (add the PR description).
-  PR base refs and `zed://review?target=branch:…` bases are untrusted: build them with
-  `BranchBase::new` / `ReviewTarget::branch` (and go through `check_branch_base` for a pre-open
-  error), and commit specs with `parse_commit_spec` + `resolve_commit_spec`.
+- **M7 slice (c) entry points** (from slice b): `PullRequestState` (`pull_request.rs`) is the per-key
+  shared state to extend (threads, summaries, commentable lines, head status, filters, `reload`); it is
+  set by the open flow before the tab opens and looked up by `ReviewView::new` (also for split
+  clones) — `ReviewView::pull_request()` exists (`#[cfg(test)]` so far: drop the cfg). After a
+  `GitHubError::Auth` the held `forge()` must be re-resolved (`resolve_forge(repo, Some(target repo
+  as ForgeRepoRef), …)`). `TopBlockContent::PullRequest { repo, number, state }` and
+  `ReviewTopBlock::render_pull_request` are the one-line placeholder: keep its "Checked out ‹local7›,
+  pull request head ‹pr7›" warning (it reads `ReviewView::head_sha`, the repository snapshot's
+  `head_commit`) in the description header. The `HeadChanged` arm for `PullRequest` in
+  `ReviewView::new` re-checks the base and retitles: add `reload` there. `ReviewView::title` is
+  "PR #N: ‹title›" (the plan's `#{n} {title}` with a prefix, as the slice brief asked).
+  `CopyPullRequestUrl` / "Copy Pull Request URL" in the panel menu are still to do (slice c), as are
+  the PR-specific view actions. A pull request tab follows HEAD: with another branch checked out it
+  shows that branch's changes since the base, with the warning (slice (c) should also mark threads
+  as moved then, C7).
+- Upstream behaviours seen in slice (b): Zed's `change_branch` splits `remote/branch` at the first
+  `/` (remote names with `/` fail); a clone whose fetch refspec lacks the PR branch (single-branch)
+  fails with "Branch 'origin/…' not found"; `create_worktree_workspace` creates a worktree for every
+  repository of the project. Not verified live: the askpass modal (the harness clone uses a token
+  credential helper), the `confirm_checkout` prompt (M8 calls it), SSH remotes.
 - DESIGN's file:line pointers checked on `v1.25.0-pre` for this slice (`diff_buffer_list.rs`,
   `diff_multibuffer.rs`, `split.rs:1192`, `git_store.rs`, `zed.rs`, `main.rs`) match within a line or
   two. `git_ui` on the tag also has `staged_diff.rs` — a read-only `DiffMultibuffer` item, the
@@ -1049,7 +1186,7 @@ covers it), tuicr's `tuicr review` CLI protocol.
 
 ## 3. Architecture
 
-### 3.1 Crate layout (proposed; as of M7 slice (a) `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,view}.rs`, `export.rs`, `forge.rs`, `github.rs` + `github/queries.graphql` exist too; `pull_request.rs`, `checkout.rs`, `submit.rs`, `cli.rs` don't yet)
+### 3.1 Crate layout (proposed; as of M7 slice (b) `session.rs`, `persistence.rs`, `gitattributes.rs`, `reviewed.rs`, `comments.rs` + `comments/{blocks,view}.rs`, `export.rs`, `forge.rs`, `github.rs` + `github/queries.graphql`, `pull_request.rs`, `checkout.rs` exist too; `submit.rs`, `cli.rs` don't yet)
 
 ```
 crates/code_review/
@@ -1071,7 +1208,8 @@ crates/code_review/
   src/forge.rs          # forge-neutral PR types, Forge trait, resolve_forge, error helpers (M7a)
   src/github.rs         # GitHub impl (GraphQL/REST via HttpClient), auth, parsing (M7a)
   src/github/queries.graphql  # every GraphQL operation (M7a)
-  src/checkout.rs       # PR checkout (change_branch / refs/pull fetch / worktree)
+  src/pull_request.rs   # PullRequestState, open_pull_request (in place / new worktree) (M7b)
+  src/checkout.rs       # PR checkout plan + executor (change_branch / refs/pull fetch) (M7b)
   src/submit.rs         # submit modal + payload mapping
   src/export.rs         # markdown export
   src/persistence.rs    # Zed DB domain (sqlez) for drafts & reviewed marks
