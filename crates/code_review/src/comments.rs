@@ -127,7 +127,6 @@ pub(crate) enum CommentState {
     /// the lines with the same numbers) until it is deleted.
     Outdated,
     /// Posted to GitHub as part of a review, so it can't change any more.
-    #[allow(dead_code, reason = "set once reviews can be submitted to GitHub")]
     Submitted {
         review_id: SharedString,
     },

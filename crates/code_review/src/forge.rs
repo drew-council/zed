@@ -445,6 +445,61 @@ impl CommentableLines {
     }
 }
 
+/// What a submitted review says about the pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl ReviewEvent {
+    pub const ALL: [Self; 3] = [Self::Comment, Self::Approve, Self::RequestChanges];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comment => "Comment",
+            Self::Approve => "Approve",
+            Self::RequestChanges => "Request Changes",
+        }
+    }
+}
+
+/// A comment on lines of the pull request's diff: on `line` of `side`, starting at `start` when
+/// it spans several lines. New lines are numbered in the reviewed commit, old ones in the base.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewLineComment {
+    /// The file's path in the reviewed commit (a renamed file's new path).
+    pub path: String,
+    pub side: DiffSide,
+    pub line: u32,
+    pub start: Option<(DiffSide, u32)>,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewFileComment {
+    pub path: String,
+    pub body: String,
+}
+
+/// A review to post, all at once: GitHub creates it with its comments, or not at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewSubmission {
+    /// The commit the comments' new lines are numbered in.
+    pub commit_id: Oid,
+    pub event: ReviewEvent,
+    pub body: String,
+    pub line_comments: Vec<ReviewLineComment>,
+    pub file_comments: Vec<ReviewFileComment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmittedReview {
+    pub id: u64,
+    pub url: SharedString,
+}
+
 /// A forge's pull request API for one repository. Futures are `'static` and `Send`, so callers
 /// can run them in the background.
 pub trait Forge: Send + Sync + 'static {
@@ -467,6 +522,15 @@ pub trait Forge: Send + Sync + 'static {
     -> BoxFuture<'static, Result<Vec<RemoteReviewSummary>>>;
 
     fn changed_files(&self, number: u64) -> BoxFuture<'static, Result<CommentableLines>>;
+
+    /// Posts a review of the pull request whose URL is `url`. Nothing is left behind when it
+    /// fails.
+    fn submit_review(
+        &self,
+        number: u64,
+        url: SharedString,
+        submission: ReviewSubmission,
+    ) -> BoxFuture<'static, Result<SubmittedReview>>;
 }
 
 /// The forge of `repository`'s GitHub remote (the current branch's upstream remote, else

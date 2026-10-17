@@ -34,6 +34,15 @@
     },
   },
   {
+    // The submit review modal: the arrows (and `tab`) choose Comment, Approve or Request
+    // Changes.
+    "context": "SubmitReviewModal",
+    "bindings": {
+      "left": "menu::SelectPrevious",
+      "right": "menu::SelectNext",
+    },
+  },
+  {
     // A comment being edited in a review. Auto-height editors have no `enter` binding of their
     // own; vim's normal mode binds it later, so this only applies while typing.
     "context": "ReviewComment > Editor",

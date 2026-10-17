@@ -4,7 +4,8 @@ use crate::{
     NextComment, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
     OpenPullRequestInBrowser, PreviousComment, PreviousFile, PreviousHunk, PreviousUnreviewedFile,
     ReloadPullRequest, ReviewBranch, ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft,
-    ScrollRight, ToggleBotReviews, ToggleFileReviewed, ToggleHeader, ToggleHunkReviewed,
+    ScrollRight, SubmitReview, ToggleBotReviews, ToggleFileReviewed, ToggleHeader,
+    ToggleHunkReviewed,
     ToggleOutdatedThreads, ToggleResolvedThreads, ToggleSingleFileMode,
     comments::{
         CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
@@ -25,6 +26,7 @@ use crate::{
     },
     reviewed::paint_reviewed_hunks,
     session::{ReviewKey, ReviewSession, ReviewSessionEvent},
+    submit::{SubmitReviewModal, finish_local_review},
     target::{BranchBase, ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
@@ -41,7 +43,7 @@ use gpui::{
     Action as _, AnyEntity, ClipboardItem, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     Subscription, Task, WeakEntity,
 };
-use language::{Capability, Point, language_settings::SoftWrap};
+use language::{Capability, LanguageRegistry, Point, language_settings::SoftWrap};
 use multi_buffer::MultiBufferRow;
 use project::{
     Project, ProjectPath,
@@ -113,6 +115,23 @@ pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ReloadPullRequest, _, cx| {
         if let Some(pull_request) = current_pull_request(workspace, cx) {
             pull_request.update(cx, |pull_request, cx| pull_request.reload(cx));
+        }
+    });
+    workspace.register_action(|workspace, _: &SubmitReview, window, cx| {
+        discard_vim_count(window, cx);
+        let Some(review) = current_review(workspace, cx) else {
+            workspace.show_toast(
+                Toast::new(NotificationId::unique::<SubmitReview>(), "Open a review first")
+                    .autohide(),
+                cx,
+            );
+            return;
+        };
+        match review.read(cx).pull_request().cloned() {
+            Some(pull_request) => {
+                SubmitReviewModal::open(workspace, review, pull_request, window, cx)
+            }
+            None => finish_local_review(workspace, &review, cx),
         }
     });
     workspace.register_action(|workspace, _: &OpenPullRequestInBrowser, window, cx| {
@@ -1012,7 +1031,6 @@ impl ReviewView {
         local_changes.update(cx, |local_changes, cx| local_changes.sync(files, cx));
     }
 
-    #[cfg(test)]
     pub(crate) fn local_changes(&self) -> Option<&Entity<LocalChanges>> {
         self.local_changes.as_ref()
     }
@@ -1425,6 +1443,25 @@ impl ReviewView {
 
     pub(crate) fn workspace(&self) -> &WeakEntity<Workspace> {
         &self.workspace
+    }
+
+    /// The reviewed repository's HEAD commit, as Zed last saw it.
+    pub(crate) fn head_oid(&self, cx: &App) -> Option<Oid> {
+        head_oid(&self.repo, cx)
+    }
+
+    /// The base commit a pull request review compares against.
+    pub(crate) fn pull_request_base(&self) -> Option<Oid> {
+        match &self.target {
+            ReviewTarget::PullRequest(target) => target.base.name().parse().ok(),
+            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
+                None
+            }
+        }
+    }
+
+    pub(crate) fn language_registry(&self, cx: &App) -> Arc<LanguageRegistry> {
+        self.project.read(cx).languages().clone()
     }
 
     /// The reviewed repository's HEAD commit, as Zed last saw it.

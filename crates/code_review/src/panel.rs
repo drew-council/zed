@@ -605,6 +605,13 @@ impl ReviewPanel {
             });
         }
         let blocks = review.read(cx).comments().clone();
+        if comment.submitted {
+            self.show_toast(
+                "This comment was submitted to GitHub: its thread shows in the diff",
+                cx,
+            );
+            return;
+        }
         if comment.is_review
             && let ItemKey::Comment(id) = comment.item
         {

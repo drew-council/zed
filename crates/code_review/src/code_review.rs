@@ -13,6 +13,7 @@ mod picker;
 mod pull_request;
 mod reviewed;
 mod session;
+mod submit;
 mod target;
 mod top_block;
 mod view;
@@ -27,7 +28,7 @@ pub use diff::ReviewDiff;
 pub use panel::ReviewPanel;
 pub use picker::StartReviewModal;
 pub use pull_request::{OpenPullRequestOptions, PullRequestState, open_pull_request};
-pub use session::ReviewKey;
+pub use session::{ReviewKey, ReviewOutcome};
 pub use target::{
     CommitRange, PullRequestReference, PullRequestTarget, ReviewTarget,
     parse_pull_request_reference,
@@ -161,6 +162,11 @@ actions!(
         CopyCommentAtCursor,
         /// Copies the text of the selected lines (of one side of the diff).
         CopySelectedLines,
+        /// Submits the review. A pull request review is posted to GitHub as a comment, an
+        /// approval or a change request, with its line and file comments and its review
+        /// comments as the body. A local review is finished: its comments are copied as Markdown
+        /// (or printed by `zed --review --wait`).
+        SubmitReview,
     ]
 );
 

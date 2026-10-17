@@ -1242,7 +1242,7 @@ impl CommentBlocks {
     }
 
     /// Keeps the text of every open comment editor, which closes.
-    fn save_open_editors(&mut self, cx: &mut App) {
+    pub(crate) fn save_open_editors(&mut self, cx: &mut App) {
         let mut closed = false;
         for (id, view) in &self.views {
             let Some(editing) = view.update(cx, |view, cx| view.take_editing(cx)) else {

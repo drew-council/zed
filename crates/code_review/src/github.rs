@@ -5,8 +5,8 @@ use crate::forge::{
     Actor, ChangedFile, ChangedFileStatus, CommentableLines, DiffSide, Forge, ForgeRepo,
     ForgeRepoRef, HeadStatus, Hunk, HunkRowKind, HunkRows, PendingReview, PullRequestDetails,
     PullRequestListFilter, PullRequestStatus, PullRequestSummary, RemoteComment,
-    RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewDecision, ReviewState,
-    ThreadAnchor,
+    RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewDecision, ReviewEvent,
+    ReviewLineComment, ReviewState, ReviewSubmission, SubmittedReview, ThreadAnchor,
 };
 use anyhow::anyhow;
 use collections::HashMap;
@@ -97,6 +97,18 @@ pub enum GitHubError {
     GraphQl {
         messages: Vec<String>,
     },
+    /// GitHub refused a review (a 422, see `Validation`) of the pull request at
+    /// `pull_request_url`, whose new lines were numbered in `commit`.
+    ReviewRefused {
+        messages: Vec<String>,
+        raw_message: String,
+        pull_request_url: SharedString,
+        commit: Oid,
+    },
+    /// GitHub didn't make a review's file comment (it says nothing about why).
+    FileCommentRefused {
+        path: SharedString,
+    },
     /// The request failed, GitHub answered with an unexpected status, or the response wasn't what
     /// GitHub sends.
     Transport(Arc<anyhow::Error>),
@@ -186,7 +198,16 @@ impl GitHubError {
             GitHubError::Validation {
                 messages,
                 raw_message,
-            } => validation_hint(messages, raw_message).into(),
+            } => validation_hint(messages, raw_message, None).into(),
+            GitHubError::ReviewRefused {
+                messages,
+                raw_message,
+                pull_request_url,
+                commit,
+            } => validation_hint(messages, raw_message, Some((pull_request_url, *commit))).into(),
+            GitHubError::FileCommentRefused { path } => {
+                format!("GitHub rejected the file comment on {path} (file not in the PR?).").into()
+            }
             GitHubError::GraphQl { messages } => {
                 format!("GitHub API error: {}", messages.join("; ")).into()
             }
@@ -219,15 +240,23 @@ fn rate_limit_hint(reset: Option<i64>, now: i64) -> String {
     }
 }
 
-/// The texts GitHub sends for a refused review (DESIGN §0, M7, "error hints").
-fn validation_hint(messages: &[String], raw_message: &str) -> String {
+/// The texts GitHub sends for a refused review (DESIGN §0, M7, "error hints"). `review` is the
+/// pull request's URL and the commit a refused review's lines were numbered in.
+fn validation_hint(
+    messages: &[String],
+    raw_message: &str,
+    review: Option<(&SharedString, Oid)>,
+) -> String {
     let mentions = |needle: &str| {
         raw_message.contains(needle) || messages.iter().any(|message| message.contains(needle))
     };
     if mentions("one pending review per pull request") {
-        return "You already have a pending review on this PR. Submit or discard it on GitHub, \
-                then retry."
-            .into();
+        let hint = "You already have a pending review on this PR. Submit or discard it on GitHub, \
+                    then retry.";
+        return match review {
+            Some((url, _)) => format!("{hint} {url}"),
+            None => hint.into(),
+        };
     }
     if mentions("could not be resolved") {
         return "GitHub rejected a comment's position (outside the PR diff). Reload the review \
@@ -235,8 +264,15 @@ fn validation_hint(messages: &[String], raw_message: &str) -> String {
             .into();
     }
     if mentions("is not part of the pull request") {
-        return "GitHub doesn't know the reviewed commit. Reload the review (drafts are kept)."
-            .into();
+        return match review {
+            Some((_, commit)) => format!(
+                "GitHub doesn't know the reviewed commit {}. Reload the review (drafts are kept).",
+                commit.display_short()
+            ),
+            None => "GitHub doesn't know the reviewed commit. Reload the review (drafts are \
+                     kept)."
+                .into(),
+        };
     }
     if let Some(message) = messages.iter().find(|message| {
         message.contains("Can not approve your own pull request")
@@ -1802,6 +1838,224 @@ impl GitHubClient {
         }
         Ok(CommentableLines::new(files, truncated))
     }
+
+    /// A REST request with a JSON body; returns the response body.
+    async fn rest_send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+        what: &SharedString,
+    ) -> Result<Vec<u8>, GitHubError> {
+        let url = format!("{}/{path}", self.endpoints.rest);
+        let body = body
+            .map(|body| serde_json::to_vec(&body))
+            .transpose()
+            .map_err(transport)?;
+        let (_, bytes) = self.send(method, &url, body, what, path).await?;
+        Ok(bytes)
+    }
+
+    /// Posts a review in one request, or, when it has file comments (which REST can't make), as
+    /// a pending review that gets them through GraphQL and is then submitted. A pending review
+    /// is deleted again when anything after it fails, since it would block every later review.
+    async fn submit_review(
+        &self,
+        repo: &ForgeRepo,
+        number: u64,
+        url: SharedString,
+        submission: ReviewSubmission,
+    ) -> Result<SubmittedReview, GitHubError> {
+        let what = pull_request_name(repo, number);
+        let reviews = format!("repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.name);
+        let refused = |error| review_refused(error, &url, submission.commit_id);
+        if submission.file_comments.is_empty() {
+            let bytes = self
+                .rest_send(
+                    Method::POST,
+                    &reviews,
+                    Some(review_payload(&submission)),
+                    &what,
+                )
+                .await
+                .map_err(refused)?;
+            let review: ReviewResponse = parse_json(&bytes, "create review")?;
+            return Ok(review.into());
+        }
+
+        let bytes = self
+            .rest_send(
+                Method::POST,
+                &reviews,
+                Some(pending_review_payload(&submission)),
+                &what,
+            )
+            .await
+            .map_err(refused)?;
+        let pending: ReviewResponse = parse_json(&bytes, "create pending review")?;
+        let submitted = self
+            .finish_pending_review(&reviews, &pending, &submission, &what)
+            .await
+            .map_err(refused);
+        if submitted.is_err() {
+            let delete = format!("{reviews}/{}", pending.id);
+            if let Err(error) = self.rest_send(Method::DELETE, &delete, None, &what).await {
+                log::error!(
+                    "deleting the pending review {} of {what} after a failed submit: {error}",
+                    pending.id
+                );
+            }
+        }
+        submitted
+    }
+
+    async fn finish_pending_review(
+        &self,
+        reviews: &str,
+        pending: &ReviewResponse,
+        submission: &ReviewSubmission,
+        what: &SharedString,
+    ) -> Result<SubmittedReview, GitHubError> {
+        for file_comment in &submission.file_comments {
+            let data: AddFileThreadData = self
+                .graphql(
+                    "AddFileThread",
+                    json!({
+                        "reviewId": pending.node_id,
+                        "path": file_comment.path,
+                        "body": file_comment.body,
+                    }),
+                    what,
+                )
+                .await?;
+            if data
+                .add_pull_request_review_thread
+                .and_then(|added| added.thread)
+                .is_none()
+            {
+                return Err(GitHubError::FileCommentRefused {
+                    path: file_comment.path.clone().into(),
+                });
+            }
+        }
+        // The body set when a pending review is created is replaced by this one.
+        let bytes = self
+            .rest_send(
+                Method::POST,
+                &format!("{reviews}/{}/events", pending.id),
+                Some(json!({
+                    "event": event_name(submission.event),
+                    "body": submission.body,
+                })),
+                what,
+            )
+            .await?;
+        let review: ReviewResponse = parse_json(&bytes, "submit review")?;
+        Ok(review.into())
+    }
+}
+
+#[derive(Deserialize)]
+struct ReviewResponse {
+    id: u64,
+    node_id: String,
+    html_url: String,
+}
+
+impl From<ReviewResponse> for SubmittedReview {
+    fn from(review: ReviewResponse) -> Self {
+        SubmittedReview {
+            id: review.id,
+            url: review.html_url.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddFileThreadData {
+    add_pull_request_review_thread: Option<AddedThread>,
+}
+
+#[derive(Deserialize)]
+struct AddedThread {
+    thread: Option<serde_json::Value>,
+}
+
+fn event_name(event: ReviewEvent) -> &'static str {
+    match event {
+        ReviewEvent::Comment => "COMMENT",
+        ReviewEvent::Approve => "APPROVE",
+        ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+    }
+}
+
+fn side_name(side: DiffSide) -> &'static str {
+    match side {
+        DiffSide::Left => "LEFT",
+        DiffSide::Right => "RIGHT",
+    }
+}
+
+/// A line comment of `POST /repos/{owner}/{repo}/pulls/{number}/reviews`. The sides are always
+/// sent (GitHub's defaults would put a left start on the right); a one-line comment has no
+/// start, or GitHub stores it as a range.
+fn line_comment_json(comment: &ReviewLineComment) -> serde_json::Value {
+    let mut json = json!({
+        "path": comment.path,
+        "line": comment.line,
+        "side": side_name(comment.side),
+        "body": comment.body,
+    });
+    if let Some((start_side, start)) = comment.start
+        && (start_side, start) != (comment.side, comment.line)
+    {
+        json["start_line"] = json!(start);
+        json["start_side"] = json!(side_name(start_side));
+    }
+    json
+}
+
+/// The request body of a review posted in one request (no file comments).
+fn review_payload(submission: &ReviewSubmission) -> serde_json::Value {
+    json!({
+        "commit_id": submission.commit_id.to_string(),
+        "event": event_name(submission.event),
+        "body": submission.body,
+        "comments": submission
+            .line_comments
+            .iter()
+            .map(line_comment_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// A pending review: no event (that would submit it) and no body (submitting sets it).
+fn pending_review_payload(submission: &ReviewSubmission) -> serde_json::Value {
+    json!({
+        "commit_id": submission.commit_id.to_string(),
+        "comments": submission
+            .line_comments
+            .iter()
+            .map(line_comment_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// A refused review's error, with what its hints name.
+fn review_refused(error: GitHubError, url: &SharedString, commit: Oid) -> GitHubError {
+    match error {
+        GitHubError::Validation {
+            messages,
+            raw_message,
+        } => GitHubError::ReviewRefused {
+            messages,
+            raw_message,
+            pull_request_url: url.clone(),
+            commit,
+        },
+        error => error,
+    }
 }
 
 fn pull_request_name(repo: &ForgeRepo, number: u64) -> SharedString {
@@ -1864,6 +2118,17 @@ impl Forge for GitHubForge {
         let client = self.client.clone();
         let repo = self.context.canonical.clone();
         async move { Ok(client.changed_files(&repo, number).await?) }.boxed()
+    }
+
+    fn submit_review(
+        &self,
+        number: u64,
+        url: SharedString,
+        submission: ReviewSubmission,
+    ) -> BoxFuture<'static, anyhow::Result<SubmittedReview>> {
+        let client = self.client.clone();
+        let repo = self.context.canonical.clone();
+        async move { Ok(client.submit_review(&repo, number, url, submission).await?) }.boxed()
     }
 }
 
@@ -2252,7 +2517,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::forge::{error_message, github_error, resolve_forge};
+    use crate::forge::{ReviewFileComment, error_message, github_error, resolve_forge};
     use anyhow::Context as _;
     use futures::{AsyncWriteExt as _, executor::block_on};
     use gpui::{BorrowAppContext as _, TestAppContext};
@@ -3609,6 +3874,252 @@ mod tests {
             ),
             "Variable $event of type PullRequestReviewEvent was provided invalid value"
         );
+    }
+
+    const PR2_URL: &str = "https://github.com/drew-council/code-review-sandbox/pull/2";
+
+    fn review_reply(id: u64, state: &str) -> Reply {
+        Reply::json(
+            json!({
+                "id": id,
+                "node_id": format!("PRR_{id}"),
+                "html_url": format!("{PR2_URL}#pullrequestreview-{id}"),
+                "state": state,
+            })
+            .to_string(),
+        )
+    }
+
+    fn submission(file_comments: &[&str]) -> ReviewSubmission {
+        let line = |side, line, start: Option<(DiffSide, u32)>, body: &str| ReviewLineComment {
+            path: "src/util/strings.rs".into(),
+            side,
+            line,
+            start,
+            body: body.into(),
+        };
+        ReviewSubmission {
+            commit_id: PR1_HEAD_OID.parse().unwrap(),
+            event: ReviewEvent::RequestChanges,
+            body: "[ISSUE] Overall\n\nSecond".into(),
+            line_comments: vec![
+                line(DiffSide::Right, 26, None, "[NOTE] one line"),
+                line(DiffSide::Right, 68, Some((DiffSide::Right, 65)), "a range"),
+                line(DiffSide::Left, 24, None, "an old line"),
+                line(DiffSide::Left, 25, Some((DiffSide::Left, 23)), "old lines"),
+                line(DiffSide::Right, 30, Some((DiffSide::Left, 28)), "old to new"),
+                // A one-line "range" is sent as one line.
+                line(DiffSide::Right, 7, Some((DiffSide::Right, 7)), "seven"),
+            ],
+            file_comments: file_comments
+                .iter()
+                .map(|path| ReviewFileComment {
+                    path: path.to_string(),
+                    body: format!("[PRAISE] about {path}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn sent(requests: &SentRequests) -> Vec<(Method, String, Value)> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| (request.method.clone(), request.uri.clone(), request.body.clone()))
+            .collect()
+    }
+
+    const REVIEWS: &str =
+        "https://api.github.com/repos/drew-council/code-review-sandbox/pulls/2/reviews";
+
+    fn expected_line_comments() -> Value {
+        json!([
+            { "path": "src/util/strings.rs", "line": 26, "side": "RIGHT", "body": "[NOTE] one line" },
+            { "path": "src/util/strings.rs", "line": 68, "side": "RIGHT", "body": "a range",
+              "start_line": 65, "start_side": "RIGHT" },
+            { "path": "src/util/strings.rs", "line": 24, "side": "LEFT", "body": "an old line" },
+            { "path": "src/util/strings.rs", "line": 25, "side": "LEFT", "body": "old lines",
+              "start_line": 23, "start_side": "LEFT" },
+            { "path": "src/util/strings.rs", "line": 30, "side": "RIGHT", "body": "old to new",
+              "start_line": 28, "start_side": "LEFT" },
+            { "path": "src/util/strings.rs", "line": 7, "side": "RIGHT", "body": "seven" },
+        ])
+    }
+
+    /// Without file comments, a review is one request, which GitHub carries out entirely or not
+    /// at all.
+    #[test]
+    fn test_submit_review_in_one_request() {
+        let (http, requests) = fake_github(|_| review_reply(5, "CHANGES_REQUESTED"));
+        let review = block_on(client(http).submit_review(
+            &sandbox(),
+            2,
+            PR2_URL.into(),
+            submission(&[]),
+        ))
+        .unwrap();
+        assert_eq!(
+            review,
+            SubmittedReview {
+                id: 5,
+                url: format!("{PR2_URL}#pullrequestreview-5").into(),
+            }
+        );
+        assert_eq!(
+            sent(&requests),
+            [(
+                Method::POST,
+                REVIEWS.to_string(),
+                json!({
+                    "commit_id": PR1_HEAD_OID,
+                    "event": "REQUEST_CHANGES",
+                    "body": "[ISSUE] Overall\n\nSecond",
+                    "comments": expected_line_comments(),
+                })
+            )]
+        );
+    }
+
+    /// File comments go through a pending review: created without event or body, given the
+    /// file comments through GraphQL, then submitted with both.
+    #[test]
+    fn test_submit_review_with_file_comments() {
+        let (http, requests) = fake_github(|request| match request.operation() {
+            Some("AddFileThread") => Reply::json(
+                r#"{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_1"}}}}"#,
+            ),
+            _ if request.uri.ends_with("/reviews/7/events") => review_reply(7, "CHANGES_REQUESTED"),
+            _ => review_reply(7, "PENDING"),
+        });
+        let review = block_on(client(http).submit_review(
+            &sandbox(),
+            2,
+            PR2_URL.into(),
+            submission(&["docs/notes.md", "src/settings.rs"]),
+        ))
+        .unwrap();
+        assert_eq!(review.id, 7);
+        let requests = sent(&requests);
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert_eq!(
+            requests[0],
+            (
+                Method::POST,
+                REVIEWS.to_string(),
+                json!({ "commit_id": PR1_HEAD_OID, "comments": expected_line_comments() })
+            )
+        );
+        for (request, path) in requests[1..3].iter().zip(["docs/notes.md", "src/settings.rs"]) {
+            assert_eq!(request.1, "https://api.github.com/graphql");
+            assert_eq!(request.2["operationName"], "AddFileThread");
+            assert_eq!(
+                request.2["variables"],
+                json!({ "reviewId": "PRR_7", "path": path, "body": format!("[PRAISE] about {path}") })
+            );
+        }
+        assert_eq!(
+            requests[3],
+            (
+                Method::POST,
+                format!("{REVIEWS}/7/events"),
+                json!({ "event": "REQUEST_CHANGES", "body": "[ISSUE] Overall\n\nSecond" })
+            )
+        );
+    }
+
+    /// A pending review is deleted when anything after it fails: it would keep GitHub from
+    /// taking any other review. A failed delete is only logged.
+    #[test]
+    fn test_failed_submit_deletes_the_pending_review() {
+        for (case, null_thread, events_status, delete_status, expected_hint) in [
+            (
+                "file not in the pull request",
+                true,
+                200,
+                200,
+                "GitHub rejected the file comment on docs/notes.md (file not in the PR?).",
+            ),
+            (
+                "submitting fails",
+                false,
+                422,
+                200,
+                "Could not comment pull request review.",
+            ),
+            (
+                "deleting fails too",
+                false,
+                422,
+                500,
+                "Could not comment pull request review.",
+            ),
+        ] {
+            let (http, requests) = fake_github(move |request| match request.operation() {
+                Some("AddFileThread") if null_thread => {
+                    Reply::json(r#"{"data":{"addPullRequestReviewThread":{"thread":null}}}"#)
+                }
+                Some("AddFileThread") => Reply::json(
+                    r#"{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_1"}}}}"#,
+                ),
+                _ if request.method == Method::DELETE => Reply::status(delete_status, "{}"),
+                _ if request.uri.ends_with("/events") => Reply::status(
+                    events_status,
+                    r#"{"message":"Validation Failed","errors":["Could not comment pull request review."]}"#,
+                ),
+                _ => review_reply(7, "PENDING"),
+            });
+            let error = block_on(client(http).submit_review(
+                &sandbox(),
+                2,
+                PR2_URL.into(),
+                submission(&["docs/notes.md"]),
+            ))
+            .unwrap_err();
+            assert_eq!(error.hint(), expected_hint, "{case}");
+            let requests = sent(&requests);
+            assert_eq!(
+                requests.last().map(|(method, uri, _)| (method.clone(), uri.clone())),
+                Some((Method::DELETE, format!("{REVIEWS}/7"))),
+                "{case}"
+            );
+        }
+    }
+
+    /// The hints of a refused review name the pull request and the commit.
+    #[test]
+    fn test_refused_review_hints() {
+        for (reply, expected) in [
+            (
+                r#"{"message":"Unprocessable Entity","errors":["User can only have one pending review per pull request"],"status":"422"}"#,
+                format!(
+                    "You already have a pending review on this PR. Submit or discard it on \
+                     GitHub, then retry. {PR2_URL}"
+                ),
+            ),
+            (
+                r#"{"message":"Unprocessable Entity","errors":["The commitOID is not part of the pull request"]}"#,
+                "GitHub doesn't know the reviewed commit 3f22f1b. Reload the review (drafts are \
+                 kept)."
+                    .to_string(),
+            ),
+            (
+                r#"{"message":"Unprocessable Entity","errors":["Review Can not approve your own pull request"]}"#,
+                "Can not approve your own pull request".to_string(),
+            ),
+        ] {
+            let (http, requests) = fake_github(move |_| Reply::status(422, reply));
+            let error = block_on(client(http).submit_review(
+                &sandbox(),
+                2,
+                PR2_URL.into(),
+                submission(&[]),
+            ))
+            .unwrap_err();
+            assert_eq!(error.hint(), expected);
+            // Nothing was created, so nothing is deleted.
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
     }
 
     async fn project_with_remotes(

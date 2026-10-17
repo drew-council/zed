@@ -116,6 +116,7 @@
       // tuicr's export keys; vim's yank operator has nothing to yank in the review.
       "y": "code_review::CopyReviewAsMarkdown",
       "shift-y": "code_review::CopyCommentAtCursor",
+      "; s": "code_review::SubmitReview",
     },
   },
   {

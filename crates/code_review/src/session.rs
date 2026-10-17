@@ -8,6 +8,7 @@ use crate::{
 use anyhow::Context as _;
 use buffer_diff::BufferDiffSnapshot;
 use collections::{HashMap, HashSet};
+use futures::channel::oneshot;
 use git::repository::RepoPath;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task, TaskExt as _,
@@ -34,6 +35,15 @@ pub struct ReviewKey(pub SharedString);
 struct ReviewSessions(HashMap<ReviewKey, WeakEntity<ReviewSession>>);
 
 impl Global for ReviewSessions {}
+
+/// How a review ended, for whoever waits for it (`zed --review --wait`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    /// The review was posted to the pull request; `url` is the posted review's.
+    Submitted { url: String },
+    /// A local review was finished: its comments as Markdown (`None` without comments).
+    Finished { markdown: Option<String> },
+}
 
 /// Set once old reviews have been pruned in this run.
 struct PrunedOldReviews;
@@ -65,6 +75,8 @@ pub(crate) struct ReviewSession {
     /// the text changed. Other tabs (maybe another project's buffers with other unsaved edits)
     /// take the result as is.
     unchecked: HashSet<CommentId>,
+    /// Who waits for the review to be submitted or finished.
+    outcome_waiters: Vec<oneshot::Sender<ReviewOutcome>>,
     _load_task: Task<()>,
 }
 
@@ -139,6 +151,7 @@ impl ReviewSession {
             comments: CommentStore::default(),
             moved_comments: HashSet::default(),
             unchecked: HashSet::default(),
+            outcome_waiters: Vec::new(),
             _load_task: load_task,
         }
     }
@@ -452,6 +465,49 @@ impl ReviewSession {
             self.save_comment(id, cx);
             cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(id)));
             cx.notify();
+        }
+    }
+
+    /// Records that the comments were posted to GitHub as part of the review `review_id`: they
+    /// can't change any more, and the pull request's threads show them from now on.
+    pub(crate) fn mark_submitted(
+        &mut self,
+        ids: &[CommentId],
+        review_id: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        for id in ids {
+            let Some(comment) = self.comments.get_mut(*id) else {
+                continue;
+            };
+            comment.state = CommentState::Submitted {
+                review_id: review_id.clone(),
+            };
+            self.save_comment(*id, cx);
+            cx.emit(ReviewSessionEvent::Comment(CommentEvent::Changed(*id)));
+        }
+        cx.notify();
+    }
+
+    /// Resolves once the review is submitted or finished; canceled when every tab of the review
+    /// is closed first (the session is released).
+    #[allow(dead_code, reason = "the CLI's `--wait` (milestone 8) waits for it")]
+    pub(crate) fn wait_for_outcome(&mut self) -> oneshot::Receiver<ReviewOutcome> {
+        let (sender, receiver) = oneshot::channel();
+        self.outcome_waiters.retain(|waiter| !waiter.is_canceled());
+        self.outcome_waiters.push(sender);
+        receiver
+    }
+
+    pub(crate) fn has_outcome_waiters(&mut self) -> bool {
+        self.outcome_waiters.retain(|waiter| !waiter.is_canceled());
+        !self.outcome_waiters.is_empty()
+    }
+
+    pub(crate) fn resolve_outcome(&mut self, outcome: ReviewOutcome) {
+        for waiter in self.outcome_waiters.drain(..) {
+            // A waiter that went away doesn't want it any more.
+            waiter.send(outcome.clone()).ok();
         }
     }
 
@@ -901,6 +957,34 @@ mod tests {
             cx.update(|cx| ReviewSession::for_key(ReviewKey("uncommitted:/other".into()), cx));
         cx.run_until_parked();
         assert!(comment_bodies(&other, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_submitted_comments_stay_submitted(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let key = ReviewKey("pr:github.com/o/r#1".into());
+        let session = cx.update(|cx| ReviewSession::for_key(key.clone(), cx));
+        cx.run_until_parked();
+        let submitted = add_line_comment(&session, "sent", cx);
+        let draft = add_line_comment(&session, "kept", cx);
+        session.update(cx, |session, cx| {
+            session.mark_submitted(&[submitted], "42".into(), cx)
+        });
+        drop(session);
+        cx.run_until_parked();
+
+        let session = cx.update(|cx| ReviewSession::for_key(key, cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let comments = session.comments();
+            assert_eq!(
+                comments.get(submitted).unwrap().state,
+                CommentState::Submitted {
+                    review_id: "42".into()
+                }
+            );
+            assert_eq!(comments.get(draft).unwrap().state, CommentState::Draft);
+        });
     }
 
     #[gpui::test]

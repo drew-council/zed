@@ -350,7 +350,15 @@ impl PullRequestState {
         });
     }
 
-    fn resolve_forge(&self, cx: &mut App) -> Option<Task<Result<Arc<dyn Forge>>>> {
+    /// Uses a forge resolved again (after GitHub rejected the token of the one before).
+    pub(crate) fn use_forge(&mut self, forge: Arc<dyn Forge>) {
+        self.forge = forge;
+        self.forge_is_stale = false;
+    }
+
+    /// Resolves the forge again from a checkout reviewing the pull request, which looks its
+    /// token up again; `None` when none is open.
+    pub(crate) fn resolve_forge(&self, cx: &mut App) -> Option<Task<Result<Arc<dyn Forge>>>> {
         let (repository, project) = self.checkouts.iter().rev().find_map(|(repository, project)| {
             Some((repository.upgrade()?, project.upgrade()?))
         })?;
@@ -1878,7 +1886,7 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("{id} isn't shown"))
         }
 
-        fn requests_of(requests: &SentRequests, operation: &str) -> usize {
+        pub(crate) fn requests_of(requests: &SentRequests, operation: &str) -> usize {
             requests
                 .lock()
                 .unwrap()
@@ -1887,7 +1895,7 @@ pub(crate) mod tests {
                 .count()
         }
 
-        fn notification_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+        pub(crate) fn notification_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
             workspace.update(cx, |workspace, cx| {
                 let ids = workspace.notification_ids();
                 for id in &ids {
@@ -1897,7 +1905,7 @@ pub(crate) mod tests {
             })
         }
 
-        fn has_open_comment_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> bool {
+        pub(crate) fn has_open_comment_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> bool {
             review.read_with(cx, |review, cx| review.comments().read(cx).is_editing(cx))
         }
 

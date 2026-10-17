@@ -176,3 +176,15 @@ query ReviewSummaries($owner: String!, $name: String!, $number: Int!, $after: St
     }
   }
 }
+
+# A file comment of a pending review (REST can't make one). `thread` is null when GitHub refuses
+# it, without an error.
+mutation AddFileThread($reviewId: ID!, $path: String!, $body: String!) {
+  addPullRequestReviewThread(
+    input: { pullRequestReviewId: $reviewId, path: $path, body: $body, subjectType: FILE }
+  ) {
+    thread {
+      id
+    }
+  }
+}
