@@ -2,6 +2,7 @@ mod checkout;
 pub mod cli;
 mod comments;
 mod commits;
+mod context_menu;
 mod diff;
 mod export;
 pub mod forge;
@@ -567,6 +568,33 @@ pub(crate) mod test_support {
             window.refresh();
             window.draw(cx).clear(cx);
         });
+    }
+
+    /// The middle of the text of `editor`'s row `row` (a multibuffer row), in window
+    /// coordinates, as last drawn.
+    pub(crate) fn row_center(
+        editor: &Entity<Editor>,
+        row: u32,
+        cx: &mut VisualTestContext,
+    ) -> gpui::Point<gpui::Pixels> {
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let display_point = snapshot
+                .display_snapshot
+                .point_to_display_point(Point::new(row, 0), editor::Bias::Left);
+            let line_height = editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size());
+            let position = editor
+                .display_to_pixel_point(display_point, &snapshot, window, cx)
+                .expect("the row is drawn");
+            let bounds = *editor.last_bounds().expect("the editor is drawn");
+            gpui::point(
+                bounds.center().x,
+                bounds.origin.y + position.y + line_height / 2.,
+            )
+        })
     }
 
     /// Clicks the middle of the element drawn with `selector` as its debug selector.

@@ -102,7 +102,8 @@ impl CommentBlocks {
         })
     }
 
-    fn refusal(&self, target: &CommentTarget, cx: &App) -> Option<SharedString> {
+    /// Why the review can't take a comment on `target`, if it can't.
+    pub(crate) fn refusal(&self, target: &CommentTarget, cx: &App) -> Option<SharedString> {
         let gate = self.gate.as_ref()?;
         gate(target, cx).err()
     }

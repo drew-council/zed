@@ -15,6 +15,7 @@ use crate::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
         resolve_commit_spec,
     },
+    context_menu,
     diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
     export::{self, ExportPreamble},
     gitattributes::{FileAttributes, GitAttributes},
@@ -929,13 +930,26 @@ impl ReviewView {
                 },
             ),
             cx.observe(&splittable, |this, splittable, cx| {
-                let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
+                let lhs_editor = splittable.read(cx).lhs_editor().cloned();
+                let lhs_editor_id = lhs_editor.as_ref().map(|lhs| lhs.entity_id());
                 if lhs_editor_id != this.lhs_editor_id {
                     this.lhs_editor_id = lhs_editor_id;
+                    if let Some(lhs_editor) = &lhs_editor {
+                        context_menu::install(lhs_editor, cx.weak_entity(), cx);
+                    }
                     this.repaint_reviewed_hunks(cx);
                 }
             }),
         ]);
+        for side in [
+            Some(splittable.read(cx).rhs_editor().clone()),
+            splittable.read(cx).lhs_editor().cloned(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            context_menu::install(&side, cx.weak_entity(), cx);
+        }
         let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
         let line_cursor = cx.new(|cx| LineCursor::new(splittable, cx));
         let session_subscription = cx.subscribe_in(&session, window, Self::handle_session_event);

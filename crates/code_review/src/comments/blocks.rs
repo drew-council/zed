@@ -637,14 +637,6 @@ impl CommentBlocks {
             .clone()
     }
 
-    fn focused_host(&self, cx: &App) -> Host {
-        if Some(self.focused_diff_editor(cx)) == self.lhs_editor(cx) {
-            Host::Lhs
-        } else {
-            Host::Rhs
-        }
-    }
-
     /// The text of the comment editors open in this tab, as leaving them would save it.
     pub(crate) fn unsaved_bodies(&self, cx: &App) -> HashMap<CommentId, String> {
         self.views
@@ -1045,7 +1037,7 @@ impl CommentBlocks {
     /// leaves the cursor on the last of them (or where the selection's head was). The side is
     /// passed in: a side focused directly only becomes the split editor's focused one on the
     /// next frame.
-    fn add_line_comment_on(
+    pub(crate) fn add_line_comment_on(
         &mut self,
         editor: Entity<Editor>,
         rows: Option<RangeInclusive<u32>>,
@@ -1061,11 +1053,7 @@ impl CommentBlocks {
         }
         match selected {
             SelectedLines::FoldedFile(buffer_id) => {
-                let diff = self.diff.read(cx);
-                let Some(path) = diff
-                    .repo_path_for_buffer(buffer_id, cx)
-                    .or_else(|| diff.base_buffer(buffer_id, cx).map(|(path, _)| path))
-                else {
+                let Some(path) = self.path_of_buffer(buffer_id, cx) else {
                     return;
                 };
                 self.add_file_comment_on(path, editor, window, cx);
@@ -1117,6 +1105,39 @@ impl CommentBlocks {
         })
     }
 
+    /// The file a buffer of either side of the diff shows.
+    fn path_of_buffer(&self, buffer_id: BufferId, cx: &App) -> Option<RepoPath> {
+        let diff = self.diff.read(cx);
+        diff.repo_path_for_buffer(buffer_id, cx)
+            .or_else(|| diff.base_buffer(buffer_id, cx).map(|(path, _)| path))
+    }
+
+    /// What `c` would comment on in a side of the diff: its selected lines (or the cursor's), or
+    /// the file of a folded header.
+    pub(crate) fn line_comment_target(
+        &self,
+        editor: &Entity<Editor>,
+        cx: &mut App,
+    ) -> Option<CommentTarget> {
+        match self.selected_lines(editor, None, cx)? {
+            SelectedLines::FoldedFile(buffer_id) => Some(CommentTarget::File {
+                path: self.path_of_buffer(buffer_id, cx)?,
+            }),
+            SelectedLines::Lines {
+                side,
+                buffer_id,
+                rows,
+            } => {
+                let (path, _) = self.file_of_side_buffer(side, buffer_id, cx)?;
+                Some(CommentTarget::Lines {
+                    path,
+                    side,
+                    lines: rows.start() + 1..=rows.end() + 1,
+                })
+            }
+        }
+    }
+
     /// The file a buffer of one side of the diff shows, and that buffer.
     fn file_of_side_buffer(
         &self,
@@ -1160,14 +1181,29 @@ impl CommentBlocks {
 
     /// A comment being written for the first time has no text yet.
     pub(crate) fn body_at_cursor(&self, cx: &mut App) -> Option<String> {
-        let body = match self.item_at_cursor(cx)? {
-            ItemKey::Comment(id) => self.session.read(cx).comments().get(id)?.body.clone(),
+        let key = self.item_at_cursor(cx)?;
+        self.item_body(&key, cx)
+    }
+
+    /// The text of a comment, or of a thread's first comment.
+    pub(crate) fn item_body(&self, key: &ItemKey, cx: &App) -> Option<String> {
+        let body = match key {
+            ItemKey::Comment(id) => self.session.read(cx).comments().get(*id)?.body.clone(),
             ItemKey::Remote(key) => {
-                let view = self.remote.get(&key)?.view.read(cx);
+                let view = self.remote.get(key)?.view.read(cx);
                 view.threads().next()?.comments.first()?.body.to_string()
             }
         };
         (!body.is_empty()).then_some(body)
+    }
+
+    /// Whether a comment of the review was submitted (it can't change any more).
+    pub(crate) fn is_submitted(&self, id: CommentId, cx: &App) -> bool {
+        self.session
+            .read(cx)
+            .comments()
+            .get(id)
+            .is_some_and(|comment| comment.is_submitted())
     }
 
     pub(crate) fn add_file_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1191,6 +1227,18 @@ impl CommentBlocks {
         cx: &mut Context<Self>,
     ) {
         let editor = self.focused_diff_editor(cx);
+        collapse_selection(&editor, window, cx);
+        self.add_file_comment_on(path, editor, window, cx);
+    }
+
+    /// The review context menu's "Comment on File", from a side of the diff.
+    pub(crate) fn add_file_comment_from(
+        &mut self,
+        path: RepoPath,
+        editor: Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         collapse_selection(&editor, window, cx);
         self.add_file_comment_on(path, editor, window, cx);
     }
@@ -1280,6 +1328,17 @@ impl CommentBlocks {
     /// Edits a comment (its edit button, the review panel).
     pub(crate) fn edit(&mut self, id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
         self.begin_edit(id, false, None, window, cx);
+    }
+
+    /// Edits a comment, returning to `editor` (a side of the diff) when done.
+    pub(crate) fn edit_from(
+        &mut self,
+        id: CommentId,
+        editor: Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_edit(id, false, Some(editor), window, cx);
     }
 
     fn begin_edit(
@@ -1688,8 +1747,9 @@ impl CommentBlocks {
             return;
         }
         let order = self.diff.read(cx).file_order();
+        let focused = self.focused_diff_editor(cx);
         let current = self
-            .items_at_cursor(cx)
+            .items_at_cursor(&focused, cx)
             .and_then(|at_cursor| self.selected.clone().filter(|key| at_cursor.contains(key)))
             .and_then(|key| items.iter().find(|item| item.5 == key).cloned());
         let target = match &current {
@@ -1884,7 +1944,18 @@ impl CommentBlocks {
     /// comment below the cursor row (on the focused side first), else the file comment above it.
     /// Threads on the cursor row don't count.
     fn comment_at_cursor(&self, cx: &mut App) -> Option<CommentId> {
-        let at_cursor = self.items_at_cursor(cx)?;
+        let editor = self.focused_diff_editor(cx);
+        self.comment_at_cursor_of(&editor, cx)
+    }
+
+    /// [`Self::comment_at_cursor`] with the cursor of a given side of the diff, which the split
+    /// editor only takes as its focused side on the next frame after focusing it.
+    pub(crate) fn comment_at_cursor_of(
+        &self,
+        editor: &Entity<Editor>,
+        cx: &mut App,
+    ) -> Option<CommentId> {
+        let at_cursor = self.items_at_cursor(editor, cx)?;
         let comment = |key: &ItemKey| match key {
             ItemKey::Comment(id) => Some(*id),
             ItemKey::Remote(_) => None,
@@ -1899,7 +1970,16 @@ impl CommentBlocks {
     /// The comment or thread at the cursor row: the one `]t`/`[t` moved to, else the review's
     /// own comment there (which `i` edits), else a thread.
     fn item_at_cursor(&self, cx: &mut App) -> Option<ItemKey> {
-        let at_cursor = self.items_at_cursor(cx)?;
+        let editor = self.focused_diff_editor(cx);
+        self.item_at_cursor_of(&editor, cx)
+    }
+
+    pub(crate) fn item_at_cursor_of(
+        &self,
+        editor: &Entity<Editor>,
+        cx: &mut App,
+    ) -> Option<ItemKey> {
+        let at_cursor = self.items_at_cursor(editor, cx)?;
         self.selected
             .clone()
             .filter(|key| at_cursor.contains(key))
@@ -1914,8 +1994,8 @@ impl CommentBlocks {
 
     /// The comments and threads shown at the cursor row: line ones before file ones, the focused
     /// side's first.
-    fn items_at_cursor(&self, cx: &mut App) -> Option<Vec<ItemKey>> {
-        let rows = self.cursor_rows(cx)?;
+    fn items_at_cursor(&self, editor: &Entity<Editor>, cx: &mut App) -> Option<Vec<ItemKey>> {
+        let rows = self.cursor_rows(editor, cx)?;
         let mut at_cursor = Vec::new();
         for (key, hosted) in &self.hosted {
             let Some(cursor_row) = rows.row(hosted.host) else {
@@ -1943,9 +2023,12 @@ impl CommentBlocks {
 
     /// The cursor's row on the focused side, and the row facing it on the other side of a split
     /// diff (spacers keep the sides' rows facing each other).
-    fn cursor_rows(&self, cx: &mut App) -> Option<CursorRows> {
-        let focused_host = self.focused_host(cx);
-        let focused = self.focused_diff_editor(cx);
+    fn cursor_rows(&self, focused: &Entity<Editor>, cx: &mut App) -> Option<CursorRows> {
+        let focused_host = if self.lhs_editor(cx).as_ref() == Some(focused) {
+            Host::Lhs
+        } else {
+            Host::Rhs
+        };
         let row = {
             let editor = focused.read(cx);
             let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -1960,7 +2043,7 @@ impl CommentBlocks {
             Host::Rhs => self.lhs_editor(cx),
             Host::Lhs => Some(self.rhs_editor(cx)),
         };
-        let facing = other.and_then(|other| facing_row(&focused, row, &other, cx));
+        let facing = other.and_then(|other| facing_row(focused, row, &other, cx));
         Some(match focused_host {
             Host::Rhs => CursorRows {
                 focused: Host::Rhs,
