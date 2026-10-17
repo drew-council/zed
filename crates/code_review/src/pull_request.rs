@@ -7,8 +7,8 @@ use crate::{
     comments::{CommentId, CommentTarget, Side},
     forge::{
         self, CommentableLines, DiffSide, Forge, ForgeRepoRef, GitHubError, PullRequestDetails,
-        RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewSubmission, SubmitAttempt,
-        SubmittedReview, ThreadAnchor,
+        RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewEvent, ReviewSubmission,
+        SubmitAttempt, SubmittedReview, ThreadAnchor,
     },
     github::{self, GitHubRemote},
     session::{ReviewKey, ReviewOutcome, ReviewSession},
@@ -70,6 +70,12 @@ pub struct PullRequestState {
     /// The last submit may have posted the review: GitHub is asked before the drafts can be
     /// sent again.
     uncertain_submit: Option<UncertainSubmit>,
+    /// What the last submit modal was set to send (Comment, Approve, Request Changes), which the
+    /// next one starts on, until a review is posted: closing the modal to write the review
+    /// comment it asked for mustn't lose it.
+    review_event: ReviewEvent,
+    /// The threads loaded since the last review was posted: the posted drafts are among them.
+    threads_include_submitted: bool,
     _load_task: Task<()>,
     /// Owned here, not by the submit modal: closing the modal (or every tab) mustn't cancel a
     /// review GitHub may already be making.
@@ -195,6 +201,8 @@ impl PullRequestState {
                 forge_is_stale: false,
                 submitting: false,
                 uncertain_submit: None,
+                review_event: ReviewEvent::Comment,
+                threads_include_submitted: false,
                 _load_task: Task::ready(()),
                 _submit_task: Task::ready(()),
             };
@@ -299,6 +307,20 @@ impl PullRequestState {
             cx.emit(PullRequestEvent::FiltersChanged);
             cx.notify();
         }
+    }
+
+    pub(crate) fn review_event(&self) -> ReviewEvent {
+        self.review_event
+    }
+
+    pub(crate) fn set_review_event(&mut self, event: ReviewEvent) {
+        self.review_event = event;
+    }
+
+    /// Whether the threads shown include those of the drafts marked submitted: then the
+    /// drafts needn't be listed next to them.
+    pub(crate) fn threads_include_submitted(&self) -> bool {
+        self.threads_include_submitted
     }
 
     /// Loads the details, threads, summaries and GitHub's diff again (on request, after a
@@ -617,6 +639,8 @@ impl PullRequestState {
                 url: url.to_string(),
             });
         });
+        self.review_event = ReviewEvent::Comment;
+        self.threads_include_submitted = false;
         self.reload(cx);
         let toast = Toast::new(
             NotificationId::unique::<ReviewSubmittedToast>(),
@@ -663,7 +687,10 @@ impl PullRequestState {
             }
         }
         match loaded.threads {
-            Ok(threads) => self.threads = threads.into_iter().map(Arc::new).collect(),
+            Ok(threads) => {
+                self.threads = threads.into_iter().map(Arc::new).collect();
+                self.threads_include_submitted = true;
+            }
             Err(error) => record(error),
         }
         match loaded.summaries {

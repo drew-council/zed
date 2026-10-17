@@ -82,9 +82,9 @@ pub(crate) struct PlannedReview {
     pub outdated: Vec<SharedString>,
     /// Drafts GitHub wouldn't take: where they are, and why.
     pub refused: Vec<(SharedString, SharedString)>,
-    /// Line comments wait for the pull request's head to be checked out: GitHub numbers lines
-    /// in that commit.
-    pub needs_head: bool,
+    /// Line comments waiting for the pull request's head to be checked out: GitHub numbers
+    /// lines in that commit.
+    pub waiting_for_head: usize,
     pub has_old_lines: bool,
 }
 
@@ -137,7 +137,7 @@ pub(crate) fn plan_review(
             }
             CommentTarget::Lines { path, side, lines } => {
                 if !at_head {
-                    planned.needs_head = true;
+                    planned.waiting_for_head += 1;
                     continue;
                 }
                 let Some(commentable) = commentable else {
@@ -209,6 +209,40 @@ pub(crate) fn plan_review(
     planned
 }
 
+/// What the review sends, and how many drafts it doesn't (what keeps them is said below it).
+fn counts_line(planned: &PlannedReview) -> String {
+    let counts = planned.counts;
+    let plural = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    let mut parts = Vec::new();
+    if counts.lines > 0 {
+        let mut lines = plural(counts.lines, "line comment", "line comments");
+        if counts.ranges > 0 {
+            lines.push_str(&format!(" ({})", plural(counts.ranges, "range", "ranges")));
+        }
+        parts.push(lines);
+    }
+    if counts.files > 0 {
+        parts.push(plural(counts.files, "file comment", "file comments"));
+    }
+    if counts.review > 0 {
+        parts.push(plural(counts.review, "review comment", "review comments"));
+    }
+    let blocked = planned.waiting_for_head + planned.refused.len();
+    if blocked > 0 {
+        parts.push(format!("{blocked} blocked"));
+    }
+    if !planned.outdated.is_empty() {
+        parts.push(format!("{} outdated", planned.outdated.len()));
+    }
+    if parts.is_empty() {
+        "No comments".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 /// The toast saying where a finished local review went.
 pub(crate) struct FinishedReviewToast;
 
@@ -224,10 +258,15 @@ pub(crate) fn finish_local_review(
     let markdown = review.read(cx).review_markdown(cx);
     let session = review.read(cx).session().clone();
     let message = if session.update(cx, |session, _| session.has_outcome_waiters()) {
+        let message = if markdown.is_some() {
+            "Review sent to the terminal"
+        } else {
+            "Review finished (no comments)"
+        };
         session.update(cx, |session, _| {
             session.resolve_outcome(ReviewOutcome::Finished { markdown })
         });
-        "Review sent to the terminal"
+        message
     } else {
         match markdown {
             Some(markdown) => {
@@ -364,12 +403,15 @@ impl SubmitReviewModal {
     ) {
         let comments = review.read(cx).comments().clone();
         comments.update(cx, |comments, cx| comments.save_open_editors(cx));
-        workspace.toggle_modal(window, cx, |_, cx| Self::new(review, pull_request, cx));
+        workspace.toggle_modal(window, cx, |window, cx| {
+            Self::new(review, pull_request, window, cx)
+        });
     }
 
     fn new(
         review: Entity<ReviewView>,
         pull_request: Entity<PullRequestState>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = review.read(cx);
@@ -380,24 +422,7 @@ impl SubmitReviewModal {
         let local_changes = view.local_changes().cloned();
         let language_registry = view.language_registry(cx);
         let details = pull_request.read(cx).details().clone();
-        let forge = pull_request.read(cx).forge().clone();
-        let check = cx
-            .background_executor()
-            .spawn(forge.pull_request_head(details.number));
-        let head_check_task = cx.spawn(async move |this, cx| {
-            let head_check = match check.await {
-                Ok(status) => HeadCheck::Checked(status),
-                Err(error) => {
-                    log::error!("checking the pull request before submitting: {error:#}");
-                    HeadCheck::Failed(forge::error_message(&error))
-                }
-            };
-            this.update(cx, |this, cx| {
-                this.head_check = head_check;
-                cx.notify();
-            })
-            .log_err();
-        });
+        let event = pull_request.read(cx).review_event();
         let mut subscriptions = vec![
             cx.subscribe(
                 &session,
@@ -413,6 +438,21 @@ impl SubmitReviewModal {
             cx.subscribe(&repository, |this, _, event: &RepositoryEvent, cx| {
                 if matches!(event, RepositoryEvent::HeadChanged) {
                     this.replan(cx);
+                }
+            }),
+            // Back from GitHub, where the pending review may have been submitted or discarded
+            // (or the network is back).
+            cx.observe_window_activation(window, |this, window, cx| {
+                let blocked_on_github = match &this.head_check {
+                    HeadCheck::Checked(status) => status.pending_review.is_some(),
+                    HeadCheck::Failed(_) => true,
+                    HeadCheck::Checking => false,
+                };
+                if window.is_window_active()
+                    && blocked_on_github
+                    && this.submit_state != SubmitState::Submitting
+                {
+                    this.check_head(cx);
                 }
             }),
         ];
@@ -433,7 +473,7 @@ impl SubmitReviewModal {
             local_changes,
             language_registry,
             planned: PlannedReview::default(),
-            event: ReviewEvent::Comment,
+            event,
             own_pull_request: details.viewer_is_author,
             commit: details.head_oid,
             local_head: None,
@@ -449,12 +489,47 @@ impl SubmitReviewModal {
             submit_state: SubmitState::Ready,
             body: None,
             focus_handle: cx.focus_handle(),
-            _head_check_task: head_check_task,
+            _head_check_task: Task::ready(()),
             _reply_task: Task::ready(()),
             _subscriptions: subscriptions,
         };
+        modal.check_head(cx);
         modal.replan(cx);
         modal
+    }
+
+    /// Asks GitHub about the pull request now: whether it moved on, was closed, or has a
+    /// pending review of the viewer's (which keeps GitHub from taking another review).
+    fn check_head(&mut self, cx: &mut Context<Self>) {
+        let pull_request = self.pull_request.read(cx);
+        let forge = pull_request.forge().clone();
+        let check = cx
+            .background_executor()
+            .spawn(forge.pull_request_head(pull_request.details().number));
+        self.head_check = HeadCheck::Checking;
+        cx.notify();
+        self._head_check_task = cx.spawn(async move |this, cx| {
+            let head_check = match check.await {
+                Ok(status) => HeadCheck::Checked(status),
+                Err(error) => {
+                    log::error!("checking the pull request before submitting: {error:#}");
+                    HeadCheck::Failed(forge::error_message(&error))
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.head_check = head_check;
+                // A refusal the check explains (a pending review made meanwhile, say) shows as
+                // the check's blocker, worded as when the modal opened, instead of GitHub's
+                // own words.
+                if matches!(this.submit_state, SubmitState::Failed(_))
+                    && !this.blockers().is_empty()
+                {
+                    this.submit_state = SubmitState::Ready;
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
     }
 
     /// Plans the review again from the drafts, the pull request and the checkout as they are
@@ -561,6 +636,8 @@ impl SubmitReviewModal {
     pub(crate) fn select_event(&mut self, event: ReviewEvent, cx: &mut Context<Self>) {
         if self.is_allowed(event) && self.submit_state != SubmitState::Submitting {
             self.event = event;
+            self.pull_request
+                .update(cx, |pull_request, _| pull_request.set_review_event(event));
             if matches!(self.submit_state, SubmitState::Failed(_)) {
                 self.submit_state = SubmitState::Ready;
             }
@@ -607,7 +684,7 @@ impl SubmitReviewModal {
                 link: Some(self.url.clone()),
             });
         }
-        if self.planned.needs_head {
+        if self.planned.waiting_for_head > 0 {
             let checked_out = match self.local_head {
                 Some(local_head) => format!("{} is checked out", local_head.display_short()),
                 None => "nothing is checked out".to_string(),
@@ -806,7 +883,11 @@ impl SubmitReviewModal {
                 cx.emit(DismissEvent);
                 return;
             }
-            Ok(SubmitReply::Failed(message)) => self.submit_state = SubmitState::Failed(message),
+            // What GitHub refused may be what the check finds now.
+            Ok(SubmitReply::Failed(message)) => {
+                self.submit_state = SubmitState::Failed(message);
+                self.check_head(cx);
+            }
             // The notice says so.
             Ok(SubmitReply::Uncertain(_)) => {}
             Err(oneshot::Canceled) => {
@@ -817,30 +898,9 @@ impl SubmitReviewModal {
     }
 
     fn render_counts(&self) -> impl IntoElement {
-        let counts = self.planned.counts;
-        let plural = |count: usize, one: &str, many: &str| {
-            format!("{count} {}", if count == 1 { one } else { many })
-        };
-        let mut parts = Vec::new();
-        if counts.lines > 0 {
-            let mut lines = plural(counts.lines, "line comment", "line comments");
-            if counts.ranges > 0 {
-                lines.push_str(&format!(" ({})", plural(counts.ranges, "range", "ranges")));
-            }
-            parts.push(lines);
-        }
-        if counts.files > 0 {
-            parts.push(plural(counts.files, "file comment", "file comments"));
-        }
-        if counts.review > 0 {
-            parts.push(plural(counts.review, "review comment", "review comments"));
-        }
-        let text = if parts.is_empty() {
-            "No comments".to_string()
-        } else {
-            parts.join(" · ")
-        };
-        Label::new(text).size(LabelSize::Small).color(Color::Muted)
+        Label::new(counts_line(&self.planned))
+            .size(LabelSize::Small)
+            .color(Color::Muted)
     }
 
     fn render_notice(
@@ -1098,6 +1158,29 @@ mod tests {
     }
 
     #[test]
+    fn test_counts_line() {
+        let mut planned = PlannedReview::default();
+        assert_eq!(counts_line(&planned), "No comments");
+        planned.waiting_for_head = 1;
+        assert_eq!(counts_line(&planned), "1 blocked");
+        planned.waiting_for_head = 0;
+        planned.outdated = vec!["a.rs:3".into()];
+        assert_eq!(counts_line(&planned), "1 outdated");
+        planned.counts = Counts {
+            lines: 2,
+            ranges: 1,
+            files: 1,
+            review: 0,
+        };
+        planned.refused = vec![("b.rs:1".into(), "outside the diff".into())];
+        planned.waiting_for_head = 1;
+        assert_eq!(
+            counts_line(&planned),
+            "2 line comments (1 range) · 1 file comment · 2 blocked · 1 outdated"
+        );
+    }
+
+    #[test]
     fn test_review_body_and_when_it_is_needed() {
         let mut overall = comment(0, CommentTarget::Review, "Overall\nfine");
         overall.comment_type = Some(CommentType::Issue);
@@ -1251,13 +1334,13 @@ mod tests {
                 ),
             ]
         );
-        assert!(!planned.needs_head);
+        assert_eq!(planned.waiting_for_head, 0);
         assert!(planned.has_old_lines);
 
         // Another commit checked out: line comments wait for the pull request's head, the rest
         // can go.
         let planned = plan_review(&comments, Some(&commentable), false, working_to_head);
-        assert!(planned.needs_head);
+        assert_eq!(planned.waiting_for_head, 7);
         assert!(planned.line_comments.is_empty());
         assert_eq!(planned.file_comments.len(), 1);
         assert_eq!(planned.counts.review, 2);
@@ -1497,6 +1580,10 @@ mod review_tests {
         );
         outcome = session.update(cx, |session, _| session.wait_for_outcome());
         assert!(notification_count(&workspace, cx) > 0);
+        // Once the threads are loaded again, the panel lists them, not the submitted drafts.
+        let rows = review.read_with(cx, |review, cx| review.panel_comments(cx));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.remote), "{:?}", rows.len());
 
         // Nothing is left to submit: a comment review then needs a body.
         cx.simulate_keystrokes("; s");
@@ -1582,6 +1669,71 @@ mod review_tests {
         assert!(super::review_tests::modal(&review, cx).is_none());
         assert!(has_open_comment_editor(&review, cx));
         assert_eq!(posted(&requests), Vec::<String>::new());
+        // The modal opens on Request Changes again, with the review comment it asked for.
+        cx.simulate_input("Please split this");
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.simulate_keystrokes("; s");
+        let modal = super::review_tests::modal(&review, cx).unwrap();
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.event(), ReviewEvent::RequestChanges);
+            assert_eq!(modal.action(), SubmitAction::Submit);
+        });
+        cx.simulate_keystrokes("escape");
+    }
+
+    /// A review GitHub refuses because of a pending review made since the modal opened shows
+    /// the same blocker as one found when it opens, and can't be sent again.
+    #[gpui::test]
+    async fn test_refused_for_a_pending_review(cx: &mut TestAppContext) {
+        let with_pending_review = PR1_HEAD.replace(
+            r#""nodes": []"#,
+            r#""nodes": [{"id": "PRR_pending", "databaseId": 77, "viewerDidAuthor": true}]"#,
+        );
+        let head = Arc::new(Mutex::new(PR1_HEAD.to_string()));
+        let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> = Arc::new({
+            let head = head.clone();
+            move |request| match request.operation() {
+                Some("PullRequestHead") => Some(Reply::json(head.lock().unwrap().clone())),
+                None if request.uri.ends_with("/pulls/1/reviews") => Some(Reply::status(
+                    422,
+                    r#"{"message":"Unprocessable Entity","errors":["User can only have one pending review per pull request"]}"#,
+                )),
+                _ => None,
+            }
+        });
+        let fixture = Fixture {
+            respond: Some(respond),
+            ..Fixture::default()
+        };
+        let (_fs, _workspace, review, _requests, cx) = open_review(fixture, cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "ENGINE 59", cx);
+        comment("c", "fifty-nine", cx);
+
+        cx.simulate_keystrokes("; s");
+        let modal = modal(&review, cx).unwrap();
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.action(), SubmitAction::Submit)
+        });
+        *head.lock().unwrap() = with_pending_review;
+        cx.simulate_keystrokes("enter");
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.submit_state(), &SubmitState::Ready);
+            let blockers = modal.blockers();
+            assert_eq!(blockers.len(), 1, "{blockers:?}");
+            assert!(blockers[0].text.starts_with("You have a pending review"));
+            assert_eq!(modal.action(), SubmitAction::Blocked);
+        });
+
+        // Back from GitHub, where it was discarded: the modal asks again.
+        *head.lock().unwrap() = PR1_HEAD.to_string();
+        cx.deactivate_window();
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        modal.read_with(cx, |modal, _| {
+            assert!(modal.blockers().is_empty());
+            assert_eq!(modal.action(), SubmitAction::Submit);
+        });
     }
 
     /// After GitHub rejected the token, the forge (and so the token) is resolved again and the

@@ -2230,18 +2230,24 @@ impl ReviewView {
     /// The comments and threads the review panel lists: review comments first, then by file in
     /// review order, file comments and threads before line ones, those by their last line (a
     /// thread before a comment). Comments still being written for the first time (without text)
-    /// aren't listed.
+    /// aren't listed, nor submitted ones once the threads shown include theirs (their review
+    /// comment is a review summary in the top block).
     pub(crate) fn panel_comments(&self, cx: &App) -> Vec<PanelComment> {
         let line_of = |target: &CommentTarget| match target {
             CommentTarget::Lines { lines, .. } => Some(*lines.end()),
             CommentTarget::Review | CommentTarget::File { .. } => None,
         };
+        let hide_submitted = self
+            .pull_request
+            .as_ref()
+            .is_some_and(|pull_request| pull_request.read(cx).threads_include_submitted());
         let mut rows = self
             .session
             .read(cx)
             .comments()
             .iter()
             .filter(|comment| !comment.body.is_empty())
+            .filter(|comment| !(hide_submitted && comment.is_submitted()))
             .map(|comment| {
                 let sort_key = (
                     comment.target.path().map(review_path_key),
