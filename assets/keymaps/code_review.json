@@ -1,1 +1,9 @@
-[]
+[
+  {
+    // `tab` toggles the commit under the cursor and moves on, so a range is a run of `tab`s.
+    "context": "StartReview > Picker > Editor",
+    "bindings": {
+      "tab": "picker::MultiSelectNext",
+    },
+  },
+]

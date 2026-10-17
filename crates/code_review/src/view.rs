@@ -5,6 +5,7 @@ use crate::{
     commits::{TOP_BLOCK_COMMIT_LIMIT, first_parent_chain, resolve_commit_spec, validate_ref},
     diff::ReviewDiff,
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
+    picker::{StartReviewFocus, StartReviewModal},
     target::{ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
 };
@@ -44,7 +45,10 @@ pub(crate) fn register(workspace: &mut Workspace) {
         review_branch(workspace, action.base.clone(), window, cx);
     });
     workspace.register_action(|workspace, action: &ReviewCommits, window, cx| {
-        review_commits(workspace, action.commits.as_deref().unwrap_or_default(), window, cx);
+        match &action.commits {
+            Some(commits) => review_commits(workspace, commits, window, cx),
+            None => StartReviewModal::toggle(workspace, StartReviewFocus::Commits, window, cx),
+        }
     });
     workspace.register_action(|workspace, _: &FocusDiff, window, cx| {
         focus_diff(workspace, window, cx);

@@ -2,6 +2,7 @@ mod commits;
 mod diff;
 mod line_cursor;
 mod panel;
+mod picker;
 mod target;
 mod top_block;
 mod view;
@@ -16,6 +17,7 @@ use workspace::Workspace;
 
 pub use diff::ReviewDiff;
 pub use panel::ReviewPanel;
+pub use picker::StartReviewModal;
 pub use target::{CommitRange, ReviewTarget};
 pub use view::ReviewView;
 
@@ -25,6 +27,9 @@ actions!(
         /// Opens a review of the uncommitted changes (staged and unstaged) in the active
         /// repository.
         ReviewUncommitted,
+        /// Chooses what to review: the uncommitted changes, the current branch against its base,
+        /// or recent commits (select several for a range).
+        StartReview,
         /// Changes the base the current branch review compares against.
         ChangeBase,
         /// Shows or hides the commit messages at the top of a commit review.
@@ -69,7 +74,8 @@ pub struct ReviewBranch {
 }
 
 /// Opens a review of one commit ("abc1234", "HEAD~2") or a range of commits ("A..B": the commits
-/// after A up to and including B).
+/// after A up to and including B). Without `commits`, opens the Start Review picker at the
+/// recent commits.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = code_review)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +93,7 @@ const VIM_KEYMAP: &str = include_str!("../../../assets/keymaps/code_review_vim.j
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         panel::register(workspace);
+        picker::register(workspace);
         view::register(workspace);
     })
     .detach();

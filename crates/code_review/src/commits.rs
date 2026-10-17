@@ -25,6 +25,8 @@ use project::{
 use std::{future::Future, path::PathBuf, sync::Arc};
 use util::{ResultExt as _, paths::PathStyle, rel_path::RelPath};
 
+/// How many commits the Start Review picker lists, following first parents from HEAD.
+pub(crate) const RECENT_COMMITS_LIMIT: usize = 50;
 /// How many commits of a range the top block shows.
 pub(crate) const TOP_BLOCK_COMMIT_LIMIT: usize = 100;
 
