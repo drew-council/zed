@@ -42,12 +42,25 @@ impl CommentType {
         Some(Self::Praise),
     ];
 
+    /// Every type, in the order the export's legend lists them.
+    pub(crate) const ALL: [Self; 4] = [Self::Issue, Self::Suggestion, Self::Note, Self::Praise];
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Issue => "ISSUE",
             Self::Suggestion => "SUGGESTION",
             Self::Note => "NOTE",
             Self::Praise => "PRAISE",
+        }
+    }
+
+    /// What the type means, as the export's legend explains it to the reader.
+    pub(crate) fn definition(self) -> &'static str {
+        match self {
+            Self::Issue => "problems to fix",
+            Self::Suggestion => "improvements",
+            Self::Note => "observations",
+            Self::Praise => "positive feedback",
         }
     }
 

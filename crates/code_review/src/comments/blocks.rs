@@ -573,14 +573,8 @@ impl CommentBlocks {
     /// `c`: comments on the cursor line or the selected lines. On a folded file header, comments
     /// on the file.
     pub(crate) fn add_line_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let splittable = self.diff.read(cx).editor().read(cx);
-        let editor = splittable.focused_editor().clone();
-        let rhs = splittable.rhs_editor().clone();
-        let is_lhs = splittable.lhs_editor() == Some(&editor);
-        let diff = self.diff.clone();
-        let Some(selected) = editor.update(cx, |editor, cx| {
-            selected_lines(editor, is_lhs, &rhs, &diff, cx)
-        }) else {
+        let editor = self.focused_diff_editor(cx);
+        let Some(selected) = self.selected_lines(cx) else {
             return;
         };
         collapse_selection(&editor, window, cx);
@@ -600,15 +594,7 @@ impl CommentBlocks {
                 buffer_id,
                 rows,
             } => {
-                let diff = self.diff.read(cx);
-                let file = match side {
-                    Side::New => diff.repo_path_for_buffer(buffer_id, cx).and_then(|path| {
-                        let buffer = diff.display_buffer(&review_path_key(&path))?.clone();
-                        Some((path, buffer))
-                    }),
-                    Side::Old => diff.base_buffer(buffer_id, cx),
-                };
-                let Some((path, buffer)) = file else {
+                let Some((path, buffer)) = self.file_of_side_buffer(side, buffer_id, cx) else {
                     return;
                 };
                 let snapshot = buffer.read(cx).snapshot();
@@ -625,6 +611,65 @@ impl CommentBlocks {
                 self.add_comment(new_comment, editor, window, cx);
             }
         }
+    }
+
+    /// What `c` comments on in the focused side of the diff.
+    fn selected_lines(&self, cx: &mut App) -> Option<SelectedLines> {
+        let splittable = self.diff.read(cx).editor().read(cx);
+        let editor = splittable.focused_editor().clone();
+        let rhs = splittable.rhs_editor().clone();
+        let is_lhs = splittable.lhs_editor() == Some(&editor);
+        let diff = self.diff.clone();
+        editor.update(cx, |editor, cx| {
+            selected_lines(editor, is_lhs, &rhs, &diff, cx)
+        })
+    }
+
+    /// The file a buffer of one side of the diff shows, and that buffer.
+    fn file_of_side_buffer(
+        &self,
+        side: Side,
+        buffer_id: BufferId,
+        cx: &App,
+    ) -> Option<(RepoPath, Entity<Buffer>)> {
+        let diff = self.diff.read(cx);
+        match side {
+            Side::New => {
+                let path = diff.repo_path_for_buffer(buffer_id, cx)?;
+                let buffer = diff.display_buffer(&review_path_key(&path))?.clone();
+                Some((path, buffer))
+            }
+            Side::Old => diff.base_buffer(buffer_id, cx),
+        }
+    }
+
+    /// Visual `y`: the text of the selected lines, of the side `c` would comment on, and how many
+    /// lines that is. Leaves visual mode, like a yank.
+    pub(crate) fn selected_text(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, usize)> {
+        let editor = self.focused_diff_editor(cx);
+        let selected = self.selected_lines(cx);
+        collapse_selection(&editor, window, cx);
+        let SelectedLines::Lines {
+            side,
+            buffer_id,
+            rows,
+        } = selected?
+        else {
+            return None;
+        };
+        let (_, buffer) = self.file_of_side_buffer(side, buffer_id, cx)?;
+        let (_, text) = line_anchor_and_text(&buffer.read(cx).snapshot(), rows.clone());
+        Some((text, rows.count()))
+    }
+
+    /// `Y`: the text of the comment at the cursor.
+    pub(crate) fn body_at_cursor(&self, cx: &mut App) -> Option<String> {
+        let id = self.comment_at_cursor(cx)?;
+        Some(self.session.read(cx).comments().get(id)?.body.clone())
     }
 
     /// `C`: comments on the file at the cursor.
@@ -2911,5 +2956,77 @@ mod tests {
             let view = blocks.view(id).unwrap().read(cx);
             assert_eq!(view.markdown_source(cx), "shared");
         });
+    }
+
+    #[gpui::test]
+    async fn test_copy_review_comment_and_lines(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let clipboard = |cx: &mut VisualTestContext| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        };
+
+        cx.simulate_keystrokes("y");
+        assert_eq!(clipboard(cx), "");
+        for (row_text, keys, body, types) in [
+            ("line 3", "c", "fix this\nplease", "tab"),
+            ("gone 1", "c", "why removed", ""),
+            ("line 4", "; c", "Looks good", "tab tab tab tab"),
+        ] {
+            move_to_row_with_text(&rhs, row_text, cx);
+            cx.simulate_keystrokes(keys);
+            cx.simulate_input(body);
+            cx.simulate_keystrokes("escape");
+            if !types.is_empty() {
+                cx.simulate_keystrokes(types);
+            }
+            cx.simulate_keystrokes("ctrl-enter");
+        }
+
+        move_to_row_with_text(&rhs, "line 1", cx);
+        cx.simulate_keystrokes("y");
+        assert_eq!(
+            clipboard(cx),
+            "\
+I reviewed your code and have the following comments. Please address them.
+
+Reviewing staged + unstaged changes
+
+Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
+
+## Local tuicr Comments
+
+1. **[PRAISE]** `Review Comment (scope: staged + unstaged changes)` - Looks good
+2. **[ISSUE]** `a.rs:3` - fix this
+   please
+3. `deleted.txt:~1` - why removed
+"
+        );
+        // Nothing is left pending: `j` moves one line.
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor_line(&rhs, cx), "line 2");
+
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("shift-y");
+        assert_eq!(clipboard(cx), "fix this\nplease");
+        move_to_row_with_text(&rhs, "line 5", cx);
+        cx.simulate_keystrokes("shift-y");
+        assert_eq!(clipboard(cx), "fix this\nplease");
+
+        // Visual `y` copies the lines and leaves visual mode.
+        move_to_row_with_text(&rhs, "line 4", cx);
+        cx.simulate_keystrokes("v j y");
+        assert_eq!(clipboard(cx), "line 4\nline 5");
+        assert_back_in_diff(&rhs, cx);
+        // Over removed and added lines, the added lines (and unchanged ones) count.
+        move_to_row_with_text(&rhs, "line 1", cx);
+        cx.simulate_keystrokes("shift-v j j y");
+        assert_eq!(clipboard(cx), "line 1\nLINE 2");
+        move_to_row_with_text(&rhs, "gone 1", cx);
+        cx.simulate_keystrokes("v j y");
+        assert_eq!(clipboard(cx), "gone 1\ngone 2");
     }
 }

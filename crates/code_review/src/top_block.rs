@@ -145,6 +145,28 @@ impl ReviewTopBlock {
         cx.notify();
     }
 
+    /// The reviewed commits' short shas, oldest first, once they are loaded (and not too many to
+    /// list).
+    pub(crate) fn commit_shas(&self) -> Option<Vec<String>> {
+        let TopBlockContent::Commits {
+            commits: CommitsState::Loaded { commits, truncated },
+            ..
+        } = &self.content
+        else {
+            return None;
+        };
+        if *truncated || commits.is_empty() {
+            return None;
+        }
+        Some(
+            commits
+                .iter()
+                .rev()
+                .map(|commit| commit.data.sha.display_short())
+                .collect(),
+        )
+    }
+
     /// The tab title of a commit review: the commit, or the size and ends of the range.
     pub(crate) fn commits_title(&self) -> Option<SharedString> {
         let TopBlockContent::Commits { range, commits } = &self.content else {

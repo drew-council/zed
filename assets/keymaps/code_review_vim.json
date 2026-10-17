@@ -86,6 +86,8 @@
       "i": null,
       "a": null,
       "c": "code_review::AddComment",
+      "y": "code_review::CopySelectedLines",
+      "shift-y": "code_review::CopySelectedLines",
       "s": null,
       "shift-s": null,
       "r": null,
@@ -111,6 +113,9 @@
       "[ t": "code_review::PreviousComment",
       "m": "code_review::NextComment",
       "shift-m": "code_review::PreviousComment",
+      // tuicr's export keys; vim's yank operator has nothing to yank in the review.
+      "y": "code_review::CopyReviewAsMarkdown",
+      "shift-y": "code_review::CopyCommentAtCursor",
     },
   },
   {

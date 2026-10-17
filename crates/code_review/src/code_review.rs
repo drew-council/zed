@@ -1,6 +1,7 @@
 mod comments;
 mod commits;
 mod diff;
+mod export;
 mod gitattributes;
 mod line_cursor;
 mod panel;
@@ -127,6 +128,12 @@ actions!(
         CycleCommentType,
         /// Changes the type of the comment being edited, in reverse order.
         CycleCommentTypeBackward,
+        /// Copies the review's comments as Markdown for a coding agent, in tuicr's format.
+        CopyReviewAsMarkdown,
+        /// Copies the text of the comment at the cursor.
+        CopyCommentAtCursor,
+        /// Copies the text of the selected lines (of one side of the diff).
+        CopySelectedLines,
     ]
 );
 
@@ -779,6 +786,9 @@ mod tests {
                 "code_review::SaveComment",
                 "code_review::CycleCommentType",
                 "code_review::CycleCommentTypeBackward",
+                "code_review::CopyReviewAsMarkdown",
+                "code_review::CopyCommentAtCursor",
+                "code_review::CopySelectedLines",
             ] {
                 assert!(
                     vim_bindings

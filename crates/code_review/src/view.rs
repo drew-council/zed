@@ -1,15 +1,17 @@
 use crate::{
-    AddComment, AddFileComment, AddReviewComment, ChangeBase, DeleteComment, EditComment,
-    FocusDiff, FocusPanel, NextComment, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
-    PreviousComment, PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch,
-    ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed,
-    ToggleHeader, ToggleHunkReviewed, ToggleSingleFileMode,
+    AddComment, AddFileComment, AddReviewComment, ChangeBase, CopyCommentAtCursor,
+    CopyReviewAsMarkdown, CopySelectedLines, DeleteComment, EditComment, FocusDiff, FocusPanel,
+    NextComment, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor, PreviousComment,
+    PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
+    ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
+    ToggleHunkReviewed, ToggleSingleFileMode,
     comments::{CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType},
     commits::{
         CommitDiffList, TOP_BLOCK_COMMIT_LIMIT, check_branch_base, first_parent_chain,
         resolve_commit_spec,
     },
     diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
+    export::{self, ExportPreamble},
     gitattributes::{FileAttributes, GitAttributes},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
@@ -28,8 +30,8 @@ use editor::{
 use git::{repository::RepoPath, status::FileStatus};
 use git_ui::branch_picker::{self, SelectBranchCallback};
 use gpui::{
-    Action as _, AnyEntity, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Subscription,
-    Task, WeakEntity,
+    Action as _, AnyEntity, ClipboardItem, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    Subscription, Task, WeakEntity,
 };
 use language::{Capability, Point, language_settings::SoftWrap};
 use multi_buffer::MultiBufferRow;
@@ -66,6 +68,23 @@ pub(crate) fn register(workspace: &mut Workspace) {
     });
     workspace.register_action(|workspace, _: &FocusDiff, window, cx| {
         focus_diff(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &CopyReviewAsMarkdown, window, cx| {
+        discard_vim_count(window, cx);
+        let Some(review) = current_review(workspace, cx) else {
+            return;
+        };
+        let message = match review.read(cx).review_markdown(cx) {
+            Some(markdown) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+                "Review copied to clipboard"
+            }
+            None => "No comments to copy",
+        };
+        workspace.show_toast(
+            Toast::new(NotificationId::unique::<CopyReviewAsMarkdown>(), message).autohide(),
+            cx,
+        );
     });
 }
 
@@ -1604,6 +1623,108 @@ impl ReviewView {
         &self.comments
     }
 
+    /// The review's comments as Markdown for a coding agent (what `y` copies), or `None` when
+    /// there are none to send.
+    pub fn review_markdown(&self, cx: &App) -> Option<String> {
+        let comments = self
+            .session
+            .read(cx)
+            .comments()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        export::review_markdown(&self.export_preamble(cx), &comments)
+    }
+
+    /// What tuicr's export says about the review's scope, for each kind of review.
+    fn export_preamble(&self, cx: &App) -> ExportPreamble {
+        match &self.target {
+            ReviewTarget::Uncommitted => ExportPreamble {
+                banner: vec!["Reviewing staged + unstaged changes".into()],
+                scope: "staged + unstaged changes".into(),
+            },
+            // tuicr has no merge-base review; this says what is compared.
+            ReviewTarget::Branch { base } => {
+                let branch = branch_name(&self.repo, cx);
+                ExportPreamble {
+                    banner: vec![format!(
+                        "Reviewing branch {branch} against {base} (its commits since the merge \
+                         base + staged + unstaged changes)"
+                    )],
+                    scope: format!("branch {branch} vs {base}"),
+                }
+            }
+            ReviewTarget::Commits(range) => {
+                let banner = match self.top_block.read(cx).commit_shas().as_deref() {
+                    Some([commit]) => format!("Reviewing commit: {commit}"),
+                    Some(commits) => format!("Reviewing commits: {}", commits.join(", ")),
+                    None => match range.base {
+                        Some(base) => format!(
+                            "Reviewing commits: {}..{}",
+                            base.display_short(),
+                            range.head.display_short()
+                        ),
+                        None => format!("Reviewing commits up to {}", range.head.display_short()),
+                    },
+                };
+                ExportPreamble {
+                    banner: vec![banner],
+                    scope: "selected commit range".into(),
+                }
+            }
+        }
+    }
+
+    fn copy_comment_at_cursor(
+        &mut self,
+        _: &CopyCommentAtCursor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        discard_vim_count(window, cx);
+        let body = self
+            .comments
+            .update(cx, |comments, cx| comments.body_at_cursor(cx));
+        let message = match body {
+            Some(body) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(body));
+                "Comment copied to clipboard"
+            }
+            None => "No comment at the cursor",
+        };
+        self.show_toast(
+            Toast::new(NotificationId::unique::<CopyCommentAtCursor>(), message).autohide(),
+            cx,
+        );
+    }
+
+    fn copy_selected_lines(
+        &mut self,
+        _: &CopySelectedLines,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        discard_vim_count(window, cx);
+        let text = self
+            .comments
+            .update(cx, |comments, cx| comments.selected_text(window, cx));
+        let message = match text {
+            Some((text, count)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if count == 1 {
+                    "Copied 1 line".to_string()
+                } else {
+                    format!("Copied {count} lines")
+                }
+            }
+            None => "No lines to copy".to_string(),
+        };
+        self.show_toast(
+            Toast::new(NotificationId::unique::<CopySelectedLines>(), message).autohide(),
+            cx,
+        );
+    }
+
     /// The comments the review panel lists: review comments first, then by file in review order,
     /// file comments before line comments, those by their last line. Comments still being
     /// written for the first time (without text) aren't listed.
@@ -1733,6 +1854,8 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::delete_comment))
             .on_action(cx.listener(Self::next_comment))
             .on_action(cx.listener(Self::previous_comment))
+            .on_action(cx.listener(Self::copy_comment_at_cursor))
+            .on_action(cx.listener(Self::copy_selected_lines))
             .when(is_branch_review, |view| {
                 view.on_action(cx.listener(Self::change_base_action))
             })
