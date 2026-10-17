@@ -564,4 +564,42 @@ mod tests {
         cx.simulate_keystrokes("escape h");
         assert!(panel_focused(cx));
     }
+
+    #[gpui::test]
+    async fn test_long_lines_scroll_instead_of_wrapping(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Split);
+        cx.update(|cx| {
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.all_languages.defaults.soft_wrap =
+                        Some(language::language_settings::SoftWrap::EditorWidth);
+                });
+            });
+        });
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+        let wraps = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |editor, cx| {
+                !matches!(editor.soft_wrap_mode(cx), editor::SoftWrap::None)
+            })
+        };
+        assert!(!wraps(&rhs, cx));
+        assert!(!wraps(&lhs, cx));
+
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(editor::actions::ToggleSoftWrap), cx)
+        });
+        cx.run_until_parked();
+        assert!(wraps(&rhs, cx));
+        assert!(wraps(&lhs, cx));
+
+        cx.simulate_keystrokes("ctrl-w h");
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(editor::actions::ToggleSoftWrap), cx)
+        });
+        cx.run_until_parked();
+        assert!(!wraps(&rhs, cx));
+        assert!(!wraps(&lhs, cx));
+    }
 }

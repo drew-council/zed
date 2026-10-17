@@ -6,12 +6,15 @@ use crate::{
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     target::ReviewTarget,
 };
-use editor::{Editor, EditorEvent, PathKey, SplittableEditor, actions::OpenExcerpts};
+use editor::{
+    Editor, EditorEvent, PathKey, SplittableEditor,
+    actions::{OpenExcerpts, ToggleSoftWrap},
+};
 use gpui::{
     Action as _, AnyEntity, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
     WeakEntity,
 };
-use language::{Capability, Point};
+use language::{Capability, Point, language_settings::SoftWrap};
 use project::{Project, ProjectPath, git_store::Repository};
 use std::{
     any::{Any, TypeId},
@@ -271,6 +274,25 @@ impl ReviewView {
         discard_vim_count(window, cx);
     }
 
+    /// Both sides switch between wrapping and not wrapping together. Zed's own toggle would fall
+    /// back to the language settings first, which may not change anything.
+    fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.diff.read(cx).editor().clone();
+        let wraps = !matches!(
+            editor.read(cx).rhs_editor().read(cx).soft_wrap_mode(cx),
+            editor::SoftWrap::None
+        );
+        let mode = if wraps {
+            SoftWrap::None
+        } else {
+            SoftWrap::EditorWidth
+        };
+        editor.update(cx, |editor, cx| {
+            editor.update_editors(cx, |editor, cx| editor.set_soft_wrap_mode(mode, cx))
+        });
+        cx.stop_propagation();
+    }
+
     fn has_visual_selection(&self, cx: &mut App) -> bool {
         let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
         editor.update(cx, |editor, cx| {
@@ -304,6 +326,7 @@ impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("CodeReview")
+            .capture_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::scroll_left))
             .on_action(cx.listener(Self::scroll_right))
             .on_action(cx.listener(Self::next_file))

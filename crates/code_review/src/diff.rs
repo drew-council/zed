@@ -13,7 +13,7 @@ use gpui::{
     AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
     WeakEntity,
 };
-use language::{Anchor, Buffer, Capability, OffsetRangeExt as _};
+use language::{Anchor, Buffer, Capability, OffsetRangeExt as _, language_settings::SoftWrap};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
@@ -91,9 +91,13 @@ impl ReviewDiff {
             // Staged and unstaged hunks are equally under review, so none is drawn as staged,
             // and a review offers no stage/restore controls.
             editor.set_diff_hunk_renderer(Some(Arc::new(HiddenUnstagedDiffHunkRenderer)), cx);
-            editor
-                .rhs_editor()
-                .update(cx, |editor, _| editor.set_read_only(true));
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.set_read_only(true);
+                // Long lines scroll horizontally instead of wrapping, like tuicr. Without an
+                // override the first file's language settings would decide for the whole
+                // review. The left side copies this when it is created.
+                editor.set_soft_wrap_mode(SoftWrap::None, cx);
+            });
             editor
         });
 
