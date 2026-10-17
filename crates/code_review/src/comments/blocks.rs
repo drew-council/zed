@@ -1538,7 +1538,13 @@ impl CommentBlocks {
             });
         let remote = self.remote.iter().filter_map(|(key, block)| {
             let (file_index, row, side) = position(&block.target, block.anchor.as_ref())?;
-            Some((file_index, row, side, block.order, ItemKey::Remote(key.clone())))
+            Some((
+                file_index,
+                row,
+                side,
+                block.order,
+                ItemKey::Remote(key.clone()),
+            ))
         });
         let mut items = comments.chain(remote).collect::<Vec<_>>();
         items.sort();

@@ -156,7 +156,11 @@ impl PullRequestState {
 
     /// Records a checkout that reviews the pull request (a tab's), which the forge can be
     /// resolved from again.
-    pub(crate) fn add_checkout(&mut self, repository: &Entity<Repository>, project: &Entity<Project>) {
+    pub(crate) fn add_checkout(
+        &mut self,
+        repository: &Entity<Repository>,
+        project: &Entity<Project>,
+    ) {
         self.checkouts.retain(|(known, _)| {
             known.upgrade().is_some() && known.entity_id() != repository.entity_id()
         });
@@ -359,9 +363,11 @@ impl PullRequestState {
     /// Resolves the forge again from a checkout reviewing the pull request, which looks its
     /// token up again; `None` when none is open.
     pub(crate) fn resolve_forge(&self, cx: &mut App) -> Option<Task<Result<Arc<dyn Forge>>>> {
-        let (repository, project) = self.checkouts.iter().rev().find_map(|(repository, project)| {
-            Some((repository.upgrade()?, project.upgrade()?))
-        })?;
+        let (repository, project) = self
+            .checkouts
+            .iter()
+            .rev()
+            .find_map(|(repository, project)| Some((repository.upgrade()?, project.upgrade()?)))?;
         let canonical = &self.forge.context().canonical;
         let reference = ForgeRepoRef {
             host: Some(canonical.host.clone()),
@@ -438,7 +444,9 @@ struct LocalFile {
 }
 
 enum LocalFileState {
-    Loading { _task: Task<()> },
+    Loading {
+        _task: Task<()>,
+    },
     /// The file's diff against HEAD, recalculated as the buffer changes.
     Loaded {
         diff: Entity<BufferDiff>,
@@ -511,7 +519,12 @@ impl LocalChanges {
         }
     }
 
-    fn compared(&mut self, path: RepoPath, diff: Result<Entity<BufferDiff>>, cx: &mut Context<Self>) {
+    fn compared(
+        &mut self,
+        path: RepoPath,
+        diff: Result<Entity<BufferDiff>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(file) = self.files.get_mut(&path) else {
             return;
         };
@@ -604,7 +617,9 @@ fn head_lines_in_working_tree(
         // Lines inserted right before or after the row leave it as it is.
         if diff
             .hunks_intersecting_base_text_range(start..end, buffer)
-            .any(|hunk| hunk.diff_base_byte_range.start < end && hunk.diff_base_byte_range.end > start)
+            .any(|hunk| {
+                hunk.diff_base_byte_range.start < end && hunk.diff_base_byte_range.end > start
+            })
         {
             return LineMapping::Changed;
         }
@@ -1087,8 +1102,9 @@ async fn open_in_new_worktree(
                 Err(_) => format!("is at {}", existing.sha),
             },
         };
-        let answer = cx.update(|window, cx| {
-            window.prompt(
+        let answer =
+            cx.update(|window, cx| {
+                window.prompt(
                 PromptLevel::Warning,
                 &format!("Move the worktree {worktree_name} to pull request #{}?", details.number),
                 Some(&format!(
@@ -1102,7 +1118,7 @@ async fn open_in_new_worktree(
                 &["Check Out", "Cancel"],
                 cx,
             )
-        })?;
+            })?;
         if answer.await? != 0 {
             bail!("Review cancelled");
         }
@@ -1307,10 +1323,11 @@ pub(crate) mod tests {
             fetch("upstream")
         );
         assert_eq!(
-            plan_worktree_fetch(&details(Some(repo("someone"))), &context, &[remote(
-                "origin",
-                repo("me")
-            )])
+            plan_worktree_fetch(
+                &details(Some(repo("someone"))),
+                &context,
+                &[remote("origin", repo("me"))]
+            )
             .unwrap(),
             fetch("git@github.com:o/r.git")
         );
@@ -1561,7 +1578,8 @@ pub(crate) mod tests {
             .unwrap()
             .clone();
         outdated.anchor_commit = Some("2222222222222222222222222222222222222222".parse().unwrap());
-        outdated.original_commit = Some("1111111111111111111111111111111111111111".parse().unwrap());
+        outdated.original_commit =
+            Some("1111111111111111111111111111111111111111".parse().unwrap());
         assert_eq!(
             thread_location(&outdated, true).as_deref(),
             Some("Originally line 223 at 1111111")
@@ -1895,7 +1913,10 @@ pub(crate) mod tests {
                 .count()
         }
 
-        pub(crate) fn notification_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+        pub(crate) fn notification_count(
+            workspace: &Entity<Workspace>,
+            cx: &mut VisualTestContext,
+        ) -> usize {
             workspace.update(cx, |workspace, cx| {
                 let ids = workspace.notification_ids();
                 for id in &ids {
@@ -1905,7 +1926,10 @@ pub(crate) mod tests {
             })
         }
 
-        pub(crate) fn has_open_comment_editor(review: &Entity<ReviewView>, cx: &VisualTestContext) -> bool {
+        pub(crate) fn has_open_comment_editor(
+            review: &Entity<ReviewView>,
+            cx: &VisualTestContext,
+        ) -> bool {
             review.read_with(cx, |review, cx| review.comments().read(cx).is_editing(cx))
         }
 
@@ -2331,9 +2355,8 @@ pub(crate) mod tests {
             {
                 let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
                 cx.run_until_parked();
-                let repository = project.read_with(cx, |project, cx| {
-                    project.active_repository(cx).unwrap()
-                });
+                let repository =
+                    project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
                 pull_request.update(cx, |pull_request, _| {
                     pull_request.add_checkout(&repository, &project)
                 });
@@ -2396,7 +2419,11 @@ pub(crate) mod tests {
             let blocks = review.read_with(cx, |review, _| review.comments().clone());
             blocks.read_with(cx, |blocks, cx| {
                 assert_eq!(
-                    blocks.remote_view(&filters_moved).unwrap().read(cx).locations(),
+                    blocks
+                        .remote_view(&filters_moved)
+                        .unwrap()
+                        .read(cx)
+                        .locations(),
                     [Some("Lines 20–25 at 3f22f1b · changed locally".into())]
                 );
             });
@@ -2462,8 +2489,10 @@ pub(crate) mod tests {
                 assert_eq!(check(&engine(61..=61), head), Ok(()));
                 assert_eq!(
                     check(&engine(1..=3), head),
-                    Err("These lines have local changes, which the pull request doesn't have"
-                        .into())
+                    Err(
+                        "These lines have local changes, which the pull request doesn't have"
+                            .into()
+                    )
                 );
                 // Line 100 of the working tree is HEAD's 98, outside GitHub's hunks.
                 assert_eq!(
@@ -2472,9 +2501,11 @@ pub(crate) mod tests {
                 );
                 assert_eq!(
                     check(&engine(61..=61), other),
-                    Err("Check out the pull request's head 3f22f1b to comment on its lines: \
+                    Err(
+                        "Check out the pull request's head 3f22f1b to comment on its lines: \
                          GitHub numbers them in that commit"
-                        .into())
+                            .into()
+                    )
                 );
                 assert_eq!(check(&file, other), Ok(()));
             });

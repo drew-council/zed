@@ -5,8 +5,7 @@ use crate::{
     OpenPullRequestInBrowser, PreviousComment, PreviousFile, PreviousHunk, PreviousUnreviewedFile,
     ReloadPullRequest, ReviewBranch, ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft,
     ScrollRight, SubmitReview, ToggleBotReviews, ToggleFileReviewed, ToggleHeader,
-    ToggleHunkReviewed,
-    ToggleOutdatedThreads, ToggleResolvedThreads, ToggleSingleFileMode,
+    ToggleHunkReviewed, ToggleOutdatedThreads, ToggleResolvedThreads, ToggleSingleFileMode,
     comments::{
         CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
         RemoteItem, RemoteKey, RemoteThreadContent, Side, open_web_link, thread_location,
@@ -121,8 +120,11 @@ pub(crate) fn register(workspace: &mut Workspace) {
         discard_vim_count(window, cx);
         let Some(review) = current_review(workspace, cx) else {
             workspace.show_toast(
-                Toast::new(NotificationId::unique::<SubmitReview>(), "Open a review first")
-                    .autohide(),
+                Toast::new(
+                    NotificationId::unique::<SubmitReview>(),
+                    "Open a review first",
+                )
+                .autohide(),
                 cx,
             );
             return;

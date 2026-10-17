@@ -337,9 +337,14 @@ pub(crate) async fn run_checkout(
                 let askpass = askpass_delegate_in(workspace, format!("git fetch {source}"), cx)?;
                 let mut args = vec!["fetch".to_string(), "--end-of-options".to_string(), source];
                 args.extend(refspecs.iter().cloned());
-                run_git_job(repository, "git fetch", cx, move |context, executor| async move {
-                    run_git(&context, &args, Some((askpass, executor))).await
-                })
+                run_git_job(
+                    repository,
+                    "git fetch",
+                    cx,
+                    move |context, executor| async move {
+                        run_git(&context, &args, Some((askpass, executor))).await
+                    },
+                )
                 .await
                 .map_err(|error| fetch_error(error, &refspecs))?;
             }
@@ -386,7 +391,9 @@ pub(crate) async fn fast_forward(context: &GitContext, branch: &str, to: &str) -
         let now = match &checked_out {
             Some(checked_out) => format!(
                 "{} is checked out now",
-                checked_out.strip_prefix("refs/heads/").unwrap_or(checked_out)
+                checked_out
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(checked_out)
             ),
             None => "HEAD is detached now".to_string(),
         };
@@ -412,7 +419,11 @@ pub(crate) async fn fast_forward(context: &GitContext, branch: &str, to: &str) -
 }
 
 /// Refuses a local branch that has diverged from `to`: neither contains the other.
-pub(crate) async fn ensure_fast_forward(context: &GitContext, branch: &str, to: &str) -> Result<()> {
+pub(crate) async fn ensure_fast_forward(
+    context: &GitContext,
+    branch: &str,
+    to: &str,
+) -> Result<()> {
     let branch_ref = format!("refs/heads/{branch}");
     if is_ancestor(context, &branch_ref, to).await? || is_ancestor(context, to, &branch_ref).await?
     {
@@ -524,7 +535,10 @@ where
 }
 
 /// git with Zed's safety settings (`GitBinary::build_command`).
-fn git_command(context: &GitContext, args: &[impl AsRef<std::ffi::OsStr>]) -> util::command::Command {
+fn git_command(
+    context: &GitContext,
+    args: &[impl AsRef<std::ffi::OsStr>],
+) -> util::command::Command {
     let mut command = new_command("git");
     command
         .current_dir(&context.work_dir)
@@ -798,7 +812,12 @@ mod tests {
             ..at_head
         };
         assert_eq!(
-            plan(&same_repo, &origin_canonical, &canonical_remotes, &without_base),
+            plan(
+                &same_repo,
+                &origin_canonical,
+                &canonical_remotes,
+                &without_base
+            ),
             [fetch_refspec("origin", &["refs/heads/main"])]
         );
 
@@ -838,7 +857,12 @@ mod tests {
             )],
         );
         assert_eq!(
-            plan(&same_repo, &origin_canonical, &canonical_remotes, &on_tracking),
+            plan(
+                &same_repo,
+                &origin_canonical,
+                &canonical_remotes,
+                &on_tracking
+            ),
             [fetch_remote("origin"), fast_forward_step("feature/filters")]
         );
         // The user's own branch of that name (tracking something else, or nothing) is left
@@ -846,7 +870,12 @@ mod tests {
         for upstream in [Some("refs/remotes/upstream/feature/filters"), None] {
             let own_branch = local(Some("main"), Some(BASE), &[("feature/filters", upstream)]);
             assert_eq!(
-                plan(&same_repo, &origin_canonical, &canonical_remotes, &own_branch),
+                plan(
+                    &same_repo,
+                    &origin_canonical,
+                    &canonical_remotes,
+                    &own_branch
+                ),
                 [
                     fetch_refspec(
                         "origin",
@@ -1150,7 +1179,11 @@ mod tests {
         let clone = temp.path().join("clone");
         let context = git_context(&clone);
 
-        fetch(&clone, &["refs/pull/7/head:refs/heads/pr/7", "refs/heads/main"]).unwrap();
+        fetch(
+            &clone,
+            &["refs/pull/7/head:refs/heads/pr/7", "refs/heads/main"],
+        )
+        .unwrap();
         assert_eq!(git(&clone, &["rev-parse", "pr/7"]), first);
         git(&clone, &["checkout", "-q", "pr/7"]);
 
@@ -1169,12 +1202,16 @@ mod tests {
         git(&work, &["reset", "-q", "--hard", &base]);
         let rewritten = commit(&work, "a.txt", "one\nTWO\n");
         push_pull_request(temp.path(), true);
-        let error = fetch(&clone, &["refs/pull/7/head:refs/heads/pr/7", "refs/heads/main"])
-            .unwrap_err();
+        let error = fetch(
+            &clone,
+            &["refs/pull/7/head:refs/heads/pr/7", "refs/heads/main"],
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("git fetch failed"), "{message}");
         assert!(
-            message.contains("pr/7 has diverged from the pull request") && !message.contains("Delete"),
+            message.contains("pr/7 has diverged from the pull request")
+                && !message.contains("Delete"),
             "{message}"
         );
         assert_eq!(git(&clone, &["rev-parse", "pr/7"]), second);
@@ -1261,7 +1298,15 @@ mod tests {
         let clone = temp.path().join("clone");
         // The pull request's branch `patch-1` is on origin; the user's own `patch-1` tracks
         // their other remote.
-        git(&work, &["push", "-q", "../remote.git", "contribution:refs/heads/patch-1"]);
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                "../remote.git",
+                "contribution:refs/heads/patch-1",
+            ],
+        );
         git(&clone, &["remote", "add", "mine", "../remote.git"]);
         git(&clone, &["fetch", "-q", "mine"]);
         git(&clone, &["branch", "-q", "--track", "patch-1", "mine/main"]);
@@ -1312,7 +1357,8 @@ mod tests {
         for step in steps {
             match step {
                 CheckoutStep::FetchRefspec { source, refspecs } => {
-                    let mut args = vec!["fetch".to_string(), "--end-of-options".to_string(), source];
+                    let mut args =
+                        vec!["fetch".to_string(), "--end-of-options".to_string(), source];
                     args.extend(refspecs);
                     run_git(&context, &args, None).await.unwrap();
                 }
@@ -1334,7 +1380,16 @@ mod tests {
         // Tracking the pull request's branch: reused.
         git(&clone, &["checkout", "-q", "main"]);
         git(&clone, &["fetch", "-q", "origin"]);
-        git(&clone, &["branch", "-q", "--set-upstream-to", "origin/patch-1", "patch-1"]);
+        git(
+            &clone,
+            &[
+                "branch",
+                "-q",
+                "--set-upstream-to",
+                "origin/patch-1",
+                "patch-1",
+            ],
+        );
         let state = local_state(&backend, base_oid).await.unwrap();
         let steps = plan_checkout(&pull_request, &checkout_context, &remotes, &state).unwrap();
         assert_eq!(

@@ -5,8 +5,8 @@
 use crate::{
     comments::{Comment, CommentId, CommentState, CommentTarget, Side, open_web_link},
     forge::{
-        self, CommentableLines, DiffSide, GitHubError, HeadStatus, PullRequestStatus,
-        ReviewEvent, ReviewFileComment, ReviewLineComment, ReviewSubmission, SubmittedReview,
+        self, CommentableLines, DiffSide, GitHubError, HeadStatus, PullRequestStatus, ReviewEvent,
+        ReviewFileComment, ReviewLineComment, ReviewSubmission, SubmittedReview,
     },
     pull_request::{LineMapping, PullRequestState, check_comment_target},
     session::{ReviewOutcome, ReviewSession},
@@ -520,8 +520,7 @@ impl SubmitReviewModal {
     }
 
     pub(crate) fn action(&self) -> SubmitAction {
-        if self.submit_state == SubmitState::Submitting || self.head_check == HeadCheck::Checking
-        {
+        if self.submit_state == SubmitState::Submitting || self.head_check == HeadCheck::Checking {
             SubmitAction::Busy
         } else if !self.blockers().is_empty() {
             SubmitAction::Blocked
@@ -609,9 +608,8 @@ impl SubmitReviewModal {
                 if let Some(resolve) = resolve
                     && let Some(forge) = resolve.await.log_err()
                 {
-                    pull_request.update(cx, |pull_request, _| {
-                        pull_request.use_forge(forge.clone())
-                    });
+                    pull_request
+                        .update(cx, |pull_request, _| pull_request.use_forge(forge.clone()));
                     submitted = executor
                         .spawn(forge.submit_review(number, url, submission))
                         .await;
@@ -712,9 +710,7 @@ impl SubmitReviewModal {
                                 .label_size(LabelSize::Small)
                                 .color(Color::Muted)
                                 .tooltip(Tooltip::text("Open on GitHub"))
-                                .on_click(move |_, window, cx| {
-                                    open_web_link(&link, window, cx)
-                                }),
+                                .on_click(move |_, window, cx| open_web_link(&link, window, cx)),
                         )
                     }),
             )
@@ -770,9 +766,11 @@ impl Render for SubmitReviewModal {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             ),
-            (SubmitState::Failed(error), _, _) => {
-                Some(Label::new(error.clone()).size(LabelSize::Small).color(Color::Error))
-            }
+            (SubmitState::Failed(error), _, _) => Some(
+                Label::new(error.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Error),
+            ),
             (_, HeadCheck::Checking, _) => Some(
                 Label::new("Checking the pull request on GitHub…")
                     .size(LabelSize::Small)
@@ -839,7 +837,13 @@ impl Render for SubmitReviewModal {
                     .child(body),
             )
             .children(blockers.into_iter().enumerate().map(|(index, blocker)| {
-                self.render_notice("submit-blocker", index, blocker, IconName::XCircle, Color::Error)
+                self.render_notice(
+                    "submit-blocker",
+                    index,
+                    blocker,
+                    IconName::XCircle,
+                    Color::Error,
+                )
             }))
             .children(warnings.into_iter().enumerate().map(|(index, warning)| {
                 self.render_notice(
@@ -869,10 +873,7 @@ impl Render for SubmitReviewModal {
                         Button::new("submit-review-confirm", confirm_label)
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Filled)
-                            .disabled(matches!(
-                                action,
-                                SubmitAction::Blocked | SubmitAction::Busy
-                            ))
+                            .disabled(matches!(action, SubmitAction::Blocked | SubmitAction::Busy))
                             .key_binding(KeyBinding::for_action_in(
                                 &menu::Confirm,
                                 &focus_handle,
@@ -925,7 +926,10 @@ mod tests {
         overall.comment_type = Some(CommentType::Issue);
         let plain = comment(1, CommentTarget::Review, "Second");
         assert_eq!(comment_body(&overall), "[ISSUE] Overall\nfine");
-        assert_eq!(review_body([&overall, &plain]), "[ISSUE] Overall\nfine\n\nSecond");
+        assert_eq!(
+            review_body([&overall, &plain]),
+            "[ISSUE] Overall\nfine\n\nSecond"
+        );
         assert_eq!(review_body([]), "");
 
         // GitHub: COMMENT and REQUEST_CHANGES need a body or a line or file comment; APPROVE
@@ -981,7 +985,11 @@ mod tests {
             fifty_nine,
             comment(3, lines("src/engine.rs", Side::New, 132..=136), "range"),
             comment(4, lines("src/engine.rs", Side::Old, 193..=193), "deleted"),
-            comment(5, lines("src/engine.rs", Side::Old, 191..=193), "deleted range"),
+            comment(
+                5,
+                lines("src/engine.rs", Side::Old, 191..=193),
+                "deleted range",
+            ),
             comment(6, lines("src/format.rs", Side::Old, 18..=18), "renamed"),
             comment(7, file("docs/guide.md"), "file"),
             comment(8, lines("src/engine.rs", Side::New, 102..=102), "outside"),
@@ -1002,7 +1010,13 @@ mod tests {
         assert_eq!(
             planned.line_comments,
             [
-                line("src/engine.rs", DiffSide::Right, 59, None, "[SUGGESTION] 59"),
+                line(
+                    "src/engine.rs",
+                    DiffSide::Right,
+                    59,
+                    None,
+                    "[SUGGESTION] 59"
+                ),
                 line(
                     "src/engine.rs",
                     DiffSide::Right,
@@ -1193,7 +1207,9 @@ mod review_tests {
         // The viewer wrote the pull request: no approving or requesting changes.
         for keys in ["right", "tab", "left"] {
             cx.simulate_keystrokes(keys);
-            modal.read_with(cx, |modal, _| assert_eq!(modal.event(), ReviewEvent::Comment));
+            modal.read_with(cx, |modal, _| {
+                assert_eq!(modal.event(), ReviewEvent::Comment)
+            });
         }
 
         cx.simulate_keystrokes("enter");
@@ -1201,9 +1217,13 @@ mod review_tests {
         assert_eq!(
             posted(&requests),
             [
-                format!("POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews"),
+                format!(
+                    "POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews"
+                ),
                 "AddFileThread".to_string(),
-                format!("POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews/9/events"),
+                format!(
+                    "POST https://api.github.com/repos/drew-council/code-review-sandbox/pulls/1/reviews/9/events"
+                ),
             ]
         );
         let review_post = requests
@@ -1239,8 +1259,15 @@ mod review_tests {
             }
         });
         let blocks = review.read_with(cx, |review, _| review.comments().clone());
-        assert!(cx.update(|_, cx| blocks.update(cx, |blocks, cx| blocks.hosted_rows(cx))).is_empty());
-        assert!(blocks.read_with(cx, |blocks, cx| blocks.review_comment_views(cx)).is_empty());
+        assert!(
+            cx.update(|_, cx| blocks.update(cx, |blocks, cx| blocks.hosted_rows(cx)))
+                .is_empty()
+        );
+        assert!(
+            blocks
+                .read_with(cx, |blocks, cx| blocks.review_comment_views(cx))
+                .is_empty()
+        );
         assert!(requests_of(&requests, "ReviewThreads") > threads_loaded);
         assert_eq!(
             outcome.now_or_never(),
@@ -1275,7 +1302,8 @@ mod review_tests {
             );
         let head = Arc::new(Mutex::new(moved_on_with_pending_review));
         // Someone else's pull request.
-        let details = PR1_DETAILS.replace(r#""viewerDidAuthor": true"#, r#""viewerDidAuthor": false"#);
+        let details =
+            PR1_DETAILS.replace(r#""viewerDidAuthor": true"#, r#""viewerDidAuthor": false"#);
         let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> = Arc::new({
             let head = head.clone();
             move |request| match request.operation() {

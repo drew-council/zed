@@ -836,7 +836,10 @@ async fn gh_auth_token(
     }
     // `gh` would print these for any host. The environment's tokens were looked at already, and
     // a host that only looks like GitHub's counts only when `gh` has a login for it.
-    for name in CLOUD_TOKEN_VARIABLES.iter().chain(&ENTERPRISE_TOKEN_VARIABLES) {
+    for name in CLOUD_TOKEN_VARIABLES
+        .iter()
+        .chain(&ENTERPRISE_TOKEN_VARIABLES)
+    {
         command.env_remove(name);
     }
     let output = pin!(command.output());
@@ -888,7 +891,9 @@ fn ssh_hostnames(
                     })
                     .clone(),
                 #[cfg(test)]
-                Lookups::Fake(fake) => Task::ready(fake.ssh_hostnames.get(&alias).cloned()).shared(),
+                Lookups::Fake(fake) => {
+                    Task::ready(fake.ssh_hostnames.get(&alias).cloned()).shared()
+                }
             };
             (alias, task)
         })
@@ -2315,13 +2320,7 @@ fn resolve_uncached(
         Ok((remote, follow_parent)) => (remote.clone(), follow_parent),
         Err(error) => return Task::ready(Err(error)),
     };
-    let token = token_for_host(
-        &remote.repo.host,
-        remote.host_kind,
-        project,
-        work_dir,
-        cx,
-    );
+    let token = token_for_host(&remote.repo.host, remote.host_kind, project, work_dir, cx);
     let http = cx.http_client();
     cx.spawn(async move |_| {
         let token = token.await?;
@@ -2662,7 +2661,10 @@ mod tests {
             assert_eq!(parse(url, &hosts).as_deref(), expected, "{url}");
         }
         let nothing_known = GitHubHosts::default();
-        assert_eq!(parse("git@github.example.com:team/app.git", &nothing_known), None);
+        assert_eq!(
+            parse("git@github.example.com:team/app.git", &nothing_known),
+            None
+        );
         assert_eq!(parse("git@github-work:team/app.git", &nothing_known), None);
         assert_eq!(
             parse("https://octo.ghe.com/team/app.git", &nothing_known).as_deref(),
@@ -2780,24 +2782,53 @@ mod tests {
 
         // github.com: `GH_TOKEN`, then `GITHUB_TOKEN`, Zed's before the project's, then gh.
         assert_eq!(
-            resolve(&github, GitHubHost::Cloud, &everything, Some(&project), Some("gh")).unwrap(),
+            resolve(
+                &github,
+                GitHubHost::Cloud,
+                &everything,
+                Some(&project),
+                Some("gh")
+            )
+            .unwrap(),
             ("gh-variable".into(), TokenOrigin::Variable("GH_TOKEN"))
         );
         assert!(!gh_ran.get());
         let github_only = variables(&[("GH_TOKEN", " \n"), ("GITHUB_TOKEN", "github-variable")]);
         assert_eq!(
-            resolve(&github, GitHubHost::Cloud, &github_only, Some(&project), Some("gh"))
-                .unwrap(),
-            ("github-variable".into(), TokenOrigin::Variable("GITHUB_TOKEN"))
+            resolve(
+                &github,
+                GitHubHost::Cloud,
+                &github_only,
+                Some(&project),
+                Some("gh")
+            )
+            .unwrap(),
+            (
+                "github-variable".into(),
+                TokenOrigin::Variable("GITHUB_TOKEN")
+            )
         );
         assert_eq!(
-            resolve(&github, GitHubHost::Cloud, &HashMap::default(), Some(&project), Some("gh"))
-                .unwrap(),
+            resolve(
+                &github,
+                GitHubHost::Cloud,
+                &HashMap::default(),
+                Some(&project),
+                Some("gh")
+            )
+            .unwrap(),
             ("project".into(), TokenOrigin::Variable("GITHUB_TOKEN"))
         );
         assert!(!gh_ran.get());
         assert_eq!(
-            resolve(&github, GitHubHost::Cloud, &HashMap::default(), None, Some("gh\n")).unwrap(),
+            resolve(
+                &github,
+                GitHubHost::Cloud,
+                &HashMap::default(),
+                None,
+                Some("gh\n")
+            )
+            .unwrap(),
             ("gh".into(), TokenOrigin::GitHubCli)
         );
 
@@ -2805,11 +2836,25 @@ mod tests {
         let enterprise = SharedString::from("ghe.corp");
         let cloud_only = variables(&[("GITHUB_TOKEN", "github-variable")]);
         assert_eq!(
-            resolve(&enterprise, GitHubHost::Configured, &cloud_only, None, Some("gh")).unwrap(),
+            resolve(
+                &enterprise,
+                GitHubHost::Configured,
+                &cloud_only,
+                None,
+                Some("gh")
+            )
+            .unwrap(),
             ("gh".into(), TokenOrigin::GitHubCli)
         );
         assert_eq!(
-            resolve(&enterprise, GitHubHost::Configured, &everything, None, Some("gh")).unwrap(),
+            resolve(
+                &enterprise,
+                GitHubHost::Configured,
+                &everything,
+                None,
+                Some("gh")
+            )
+            .unwrap(),
             (
                 "enterprise-variable".into(),
                 TokenOrigin::Variable("GH_ENTERPRISE_TOKEN")
@@ -2820,8 +2865,14 @@ mod tests {
         // that login's token goes to it.
         let lookalike = SharedString::from("github.attacker.dev");
         assert_eq!(
-            resolve(&lookalike, GitHubHost::Unverified, &everything, Some(&project), Some("gh"))
-                .unwrap(),
+            resolve(
+                &lookalike,
+                GitHubHost::Unverified,
+                &everything,
+                Some(&project),
+                Some("gh")
+            )
+            .unwrap(),
             ("gh".into(), TokenOrigin::GitHubCli)
         );
         assert!(matches!(
@@ -3706,7 +3757,10 @@ mod tests {
         rate_limit_hint(Some(i64::MAX), i64::MIN);
         rate_limit_hint(Some(i64::MIN), i64::MAX);
         let mut headers = HeaderMap::new();
-        headers.insert("retry-after", HeaderValue::from_static("9223372036854775807"));
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("9223372036854775807"),
+        );
         assert_eq!(rate_limit_reset(&headers), Some(i64::MAX));
 
         let error = error_for(
@@ -3733,7 +3787,11 @@ mod tests {
             assert_eq!(sso_url(&format!("required; url={url}"), "github.com"), None);
         }
         assert_eq!(
-            sso_url("required; url=https://ghe.corp:8443/orgs/a/sso", "ghe.corp:8443").as_deref(),
+            sso_url(
+                "required; url=https://ghe.corp:8443/orgs/a/sso",
+                "ghe.corp:8443"
+            )
+            .as_deref(),
             Some("https://ghe.corp:8443/orgs/a/sso")
         );
 
@@ -3907,7 +3965,12 @@ mod tests {
                 line(DiffSide::Right, 68, Some((DiffSide::Right, 65)), "a range"),
                 line(DiffSide::Left, 24, None, "an old line"),
                 line(DiffSide::Left, 25, Some((DiffSide::Left, 23)), "old lines"),
-                line(DiffSide::Right, 30, Some((DiffSide::Left, 28)), "old to new"),
+                line(
+                    DiffSide::Right,
+                    30,
+                    Some((DiffSide::Left, 28)),
+                    "old to new",
+                ),
                 // A one-line "range" is sent as one line.
                 line(DiffSide::Right, 7, Some((DiffSide::Right, 7)), "seven"),
             ],
@@ -3926,7 +3989,13 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|request| (request.method.clone(), request.uri.clone(), request.body.clone()))
+            .map(|request| {
+                (
+                    request.method.clone(),
+                    request.uri.clone(),
+                    request.body.clone(),
+                )
+            })
             .collect()
     }
 
@@ -3952,13 +4021,9 @@ mod tests {
     #[test]
     fn test_submit_review_in_one_request() {
         let (http, requests) = fake_github(|_| review_reply(5, "CHANGES_REQUESTED"));
-        let review = block_on(client(http).submit_review(
-            &sandbox(),
-            2,
-            PR2_URL.into(),
-            submission(&[]),
-        ))
-        .unwrap();
+        let review =
+            block_on(client(http).submit_review(&sandbox(), 2, PR2_URL.into(), submission(&[])))
+                .unwrap();
         assert_eq!(
             review,
             SubmittedReview {
@@ -3986,9 +4051,9 @@ mod tests {
     #[test]
     fn test_submit_review_with_file_comments() {
         let (http, requests) = fake_github(|request| match request.operation() {
-            Some("AddFileThread") => Reply::json(
-                r#"{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_1"}}}}"#,
-            ),
+            Some("AddFileThread") => {
+                Reply::json(r#"{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_1"}}}}"#)
+            }
             _ if request.uri.ends_with("/reviews/7/events") => review_reply(7, "CHANGES_REQUESTED"),
             _ => review_reply(7, "PENDING"),
         });
@@ -4010,7 +4075,10 @@ mod tests {
                 json!({ "commit_id": PR1_HEAD_OID, "comments": expected_line_comments() })
             )
         );
-        for (request, path) in requests[1..3].iter().zip(["docs/notes.md", "src/settings.rs"]) {
+        for (request, path) in requests[1..3]
+            .iter()
+            .zip(["docs/notes.md", "src/settings.rs"])
+        {
             assert_eq!(request.1, "https://api.github.com/graphql");
             assert_eq!(request.2["operationName"], "AddFileThread");
             assert_eq!(
@@ -4079,7 +4147,9 @@ mod tests {
             assert_eq!(error.hint(), expected_hint, "{case}");
             let requests = sent(&requests);
             assert_eq!(
-                requests.last().map(|(method, uri, _)| (method.clone(), uri.clone())),
+                requests
+                    .last()
+                    .map(|(method, uri, _)| (method.clone(), uri.clone())),
                 Some((Method::DELETE, format!("{REVIEWS}/7"))),
                 "{case}"
             );
@@ -4461,8 +4531,11 @@ mod tests {
     async fn test_forge_follows_remote_urls(cx: &mut TestAppContext) {
         crate::init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({ ".git": {}, "file.txt": "text\n" }))
-            .await;
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "file.txt": "text\n" }),
+        )
+        .await;
         let dot_git = Path::new(path!("/project/.git"));
         fs.set_remote_for_repo(dot_git, "origin", "https://github.com/zed-industries/zed");
         fs.set_remote_for_repo(dot_git, "alice", "https://github.com/drew-council/zed");
