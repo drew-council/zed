@@ -1,6 +1,6 @@
 use crate::{
     ReviewView,
-    commits::CommitDiffList,
+    commits::{CommitDiffList, check_branch_base},
     reviewed::{ReviewHunkRenderer, render_file_checkbox},
     session::{FileDigest, file_digest},
     target::{BranchBase, ReviewTarget},
@@ -91,6 +91,13 @@ impl DiffSource {
     }
 }
 
+/// Whether git can compare HEAD with a branch review's base.
+enum BaseCheck {
+    Pending,
+    Passed,
+    Failed(SharedString),
+}
+
 /// Shows each file header's status against the review's base (merge base, commit range base)
 /// rather than against HEAD, and the file's reviewed checkbox. Headers render the controls of
 /// only one addon, so every header control of the review lives here.
@@ -169,6 +176,11 @@ pub struct ReviewDiff {
     /// A merge-base list has no files until its first tree diff; until that starts, the review
     /// is loading rather than empty.
     awaiting_tree_diff: bool,
+    /// The base of a branch review. `DiffBufferList` only logs a failed comparison and then
+    /// lists no files, so the review checks the base itself rather than claim "No changes".
+    branch_base: Option<BranchBase>,
+    base_check: BaseCheck,
+    base_check_task: Task<()>,
     editor: Entity<SplittableEditor>,
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
     /// Single-file mode: only this file's excerpts are in the multibuffer.
@@ -250,9 +262,16 @@ impl ReviewDiff {
             ]),
         }
 
+        let branch_base = match target {
+            ReviewTarget::Branch { base } => Some(base.clone()),
+            ReviewTarget::Uncommitted | ReviewTarget::Commits(_) => None,
+        };
         let mut this = Self {
             multibuffer,
-            awaiting_tree_diff: matches!(target, ReviewTarget::Branch { .. }),
+            awaiting_tree_diff: branch_base.is_some(),
+            branch_base,
+            base_check: BaseCheck::Pending,
+            base_check_task: Task::ready(()),
             source,
             editor,
             buffer_subscriptions: HashMap::default(),
@@ -266,6 +285,7 @@ impl ReviewDiff {
             _subscriptions: subscriptions,
         };
         this.refresh_in(window, cx);
+        this.check_base(cx);
         this
     }
 
@@ -298,7 +318,9 @@ impl ReviewDiff {
     fn is_source_loading(&self, cx: &App) -> bool {
         match &self.source {
             DiffSource::BufferList(list) => {
-                self.awaiting_tree_diff || list.read(cx).is_tree_base_loading()
+                self.awaiting_tree_diff
+                    || list.read(cx).is_tree_base_loading()
+                    || (self.branch_base.is_some() && matches!(self.base_check, BaseCheck::Pending))
             }
             DiffSource::Commits(list) => list.read(cx).is_loading(),
         }
@@ -306,9 +328,41 @@ impl ReviewDiff {
 
     fn source_error(&self, cx: &App) -> Option<SharedString> {
         match &self.source {
-            DiffSource::BufferList(_) => None,
+            DiffSource::BufferList(list) => {
+                let base = self.branch_base.as_ref()?;
+                if let BaseCheck::Failed(error) = &self.base_check {
+                    return Some(error.clone());
+                }
+                // The base checked out, but git still failed to compare (and logged why).
+                let list = list.read(cx);
+                let tree_diff_failed = !self.awaiting_tree_diff
+                    && !list.is_tree_base_loading()
+                    && list.statuses_by_path().is_none();
+                tree_diff_failed
+                    .then(|| format!("Couldn't compare HEAD with {base} (see the log)").into())
+            }
             DiffSource::Commits(list) => list.read(cx).error(),
         }
+    }
+
+    /// Checks a branch review's base again, e.g. after HEAD moved. The last result shows until
+    /// the new one is known.
+    pub(crate) fn check_base(&mut self, cx: &mut Context<Self>) {
+        let (Some(base), Some(repo)) = (self.branch_base.clone(), self.source.repo(cx)) else {
+            return;
+        };
+        let check = check_branch_base(&repo, base, cx);
+        self.base_check_task = cx.spawn(async move |this, cx| {
+            let result = check.await;
+            this.update(cx, |this, cx| {
+                this.base_check = match result {
+                    Ok(()) => BaseCheck::Passed,
+                    Err(error) => BaseCheck::Failed(error.to_string().into()),
+                };
+                cx.notify();
+            })
+            .log_err();
+        });
     }
 
     /// Changes the base of a branch review. The list empties and reloads against the new base.
@@ -317,11 +371,14 @@ impl ReviewDiff {
             return;
         };
         let base_ref = base.name().clone();
-        self.empty_label = ReviewTarget::Branch { base }.empty_label();
+        self.empty_label = ReviewTarget::Branch { base: base.clone() }.empty_label();
         self.awaiting_tree_diff = true;
+        self.branch_base = Some(base);
+        self.base_check = BaseCheck::Pending;
         list.update(cx, |list, cx| {
             list.set_diff_base(DiffBase::Merge { base_ref }, cx)
         });
+        self.check_base(cx);
         cx.notify();
     }
 

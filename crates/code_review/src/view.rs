@@ -471,6 +471,8 @@ impl ReviewView {
                         let base = base.name().clone();
                         this.top_block
                             .update(cx, |top_block, cx| top_block.set_branch(branch, base, cx));
+                        // The merge base depends on HEAD.
+                        this.diff.update(cx, |diff, cx| diff.check_base(cx));
                         this.update_session(window, cx);
                         cx.emit(EditorEvent::TitleChanged);
                         cx.notify();
@@ -2036,6 +2038,39 @@ mod tests {
             assert_eq!(review_count(&workspace, cx), 2);
             let main_review = active_review(&workspace, cx);
             assert_eq!(tab_title(&main_review, cx), "Review: feature vs main");
+        }
+
+        #[gpui::test]
+        async fn test_branch_review_says_why_it_cant_compare(cx: &mut TestAppContext) {
+            crate::init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "a\n" }))
+                .await;
+            fs.set_head_and_index_for_repo(dot_git(), &[("a.txt", "a\n".into())]);
+            fs.set_branch_name(dot_git(), Some("feature"));
+            let (workspace, cx) = open_workspace(fs.clone(), cx).await;
+            let empty_label = |review: &Entity<ReviewView>, cx: &mut VisualTestContext| {
+                review.read_with(cx, |review, cx| {
+                    let diff = review.diff().read(cx);
+                    assert!(!diff.is_loading(cx));
+                    diff.empty_label(cx).to_string()
+                })
+            };
+
+            // The default branch isn't checked before the review opens, and the fake repository
+            // doesn't know it: the review says so instead of "No changes against origin/main".
+            dispatch(ReviewBranch::default(), cx);
+            let review = active_review(&workspace, cx);
+            assert_eq!(empty_label(&review, cx), "Unknown revision origin/main");
+
+            insert_commit_ref(&fs, "main", C2);
+            cx.focus(&review);
+            workspace.update_in(cx, |workspace, window, cx| {
+                let base = BranchBase::new("main").unwrap();
+                ReviewView::select_base(review.clone(), base, workspace, window, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(empty_label(&review, cx), "No changes against main");
         }
 
         #[gpui::test]
