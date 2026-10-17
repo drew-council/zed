@@ -72,6 +72,8 @@ actions!(
         /// Marks the file at the cursor (or selected in the review panel) as reviewed, or not.
         /// In the diff, marking also moves to the next file.
         ToggleFileReviewed,
+        /// Marks the hunk at the cursor as reviewed, or not. Reviewed hunks are drawn dimmed.
+        ToggleHunkReviewed,
         /// Moves to the next hunk, skipping files folded as reviewed.
         NextHunk,
         /// Moves to the previous hunk, skipping files folded as reviewed.

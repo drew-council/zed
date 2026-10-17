@@ -1,7 +1,7 @@
 use crate::{
     ReviewView,
     commits::CommitDiffList,
-    reviewed::render_file_checkbox,
+    reviewed::{ReviewHunkRenderer, render_file_checkbox},
     session::{FileDigest, file_digest},
     target::ReviewTarget,
 };
@@ -9,8 +9,8 @@ use anyhow::Result;
 use buffer_diff::{BufferDiff, BufferDiffEvent};
 use collections::{HashMap, HashSet};
 use editor::{
-    Addon, EditorEvent, EditorSettings, HiddenUnstagedDiffHunkRenderer, SelectionEffects,
-    SplittableEditor, multibuffer_context_lines, scroll::Autoscroll,
+    Addon, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
@@ -204,9 +204,10 @@ impl ReviewDiff {
                 window,
                 cx,
             );
-            // Staged and unstaged hunks are equally under review, so none is drawn as staged,
-            // and a review offers no stage/restore controls.
-            editor.set_diff_hunk_renderer(Some(Arc::new(HiddenUnstagedDiffHunkRenderer)), cx);
+            editor.set_diff_hunk_renderer(
+                Some(Arc::new(ReviewHunkRenderer { view: view.clone() })),
+                cx,
+            );
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_read_only(true);
                 editor.register_addon(ReviewAddon {
@@ -520,6 +521,16 @@ impl ReviewDiff {
 
     pub(crate) fn digest(&self, path_key: &PathKey) -> Option<&FileDigest> {
         self.entry(path_key)?.digest.as_ref()
+    }
+
+    /// The digest of every file that has one, by excerpt key.
+    pub(crate) fn digests(&self) -> HashMap<&PathKey, (&RepoPath, &FileDigest)> {
+        self.buffer_subscriptions
+            .iter()
+            .filter_map(|(repo_path, entry)| {
+                Some((&entry.path_key, (repo_path, entry.digest.as_ref()?)))
+            })
+            .collect()
     }
 
     /// Whether the file's excerpts are in the multibuffer.

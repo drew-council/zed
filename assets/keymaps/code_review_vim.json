@@ -72,7 +72,7 @@
       "c": null,
       "shift-c": null,
       "r": "code_review::ToggleFileReviewed",
-      "shift-r": null,
+      "shift-r": "code_review::ToggleHunkReviewed",
       "] c": "code_review::NextHunk",
       "[ c": "code_review::PreviousHunk",
       "g i": null,

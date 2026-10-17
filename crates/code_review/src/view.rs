@@ -2,11 +2,12 @@ use crate::{
     ChangeBase, FocusDiff, FocusPanel, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
     PreviousFile, PreviousHunk, PreviousUnreviewedFile, ReviewBranch, ReviewCommits, ReviewPanel,
     ReviewUncommitted, ScrollLeft, ScrollRight, ToggleFileReviewed, ToggleHeader,
-    ToggleSingleFileMode,
+    ToggleHunkReviewed, ToggleSingleFileMode,
     commits::{TOP_BLOCK_COMMIT_LIMIT, first_parent_chain, resolve_commit_spec, validate_ref},
     diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
+    reviewed::paint_reviewed_hunks,
     session::{ReviewSession, ReviewSessionEvent},
     target::{ReviewTarget, parse_commit_spec},
     top_block::{CommitsState, ReviewTopBlock, TopBlockContent},
@@ -20,10 +21,12 @@ use editor::{
 };
 use git_ui::branch_picker::{self, SelectBranchCallback};
 use gpui::{
-    Action as _, AnyEntity, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
-    WeakEntity,
+    Action as _, AnyEntity, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Subscription,
+    Task, WeakEntity,
 };
+use editor::ToPoint as _;
 use language::{Capability, Point, language_settings::SoftWrap};
+use multi_buffer::MultiBufferRow;
 use project::{
     Project, ProjectPath,
     git_store::{Repository, RepositoryEvent},
@@ -269,6 +272,8 @@ pub struct ReviewView {
     session: Entity<ReviewSession>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
+    /// The left side is recreated on every split; its reviewed hunks are repainted then.
+    lhs_editor_id: Option<EntityId>,
     _load_commits_task: Task<()>,
     _session_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
@@ -368,7 +373,7 @@ impl ReviewView {
             ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } => Task::ready(()),
         };
 
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| cx.emit(event.clone())),
             cx.subscribe_in(&diff, window, Self::handle_diff_event),
             // The review panel shows the diff's loading state.
@@ -388,7 +393,24 @@ impl ReviewView {
                 }
             }),
         ];
-        let line_cursor = cx.new(|cx| LineCursor::new(diff.read(cx).editor().clone(), cx));
+        let splittable = diff.read(cx).editor().clone();
+        subscriptions.extend([
+            cx.subscribe(&splittable, |this, _, event: &EditorEvent, cx| match event {
+                EditorEvent::BufferRangesUpdated { .. }
+                | EditorEvent::BuffersRemoved { .. }
+                | EditorEvent::BufferFoldToggled { .. } => this.repaint_reviewed_hunks(cx),
+                _ => {}
+            }),
+            cx.observe(&splittable, |this, splittable, cx| {
+                let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
+                if lhs_editor_id != this.lhs_editor_id {
+                    this.lhs_editor_id = lhs_editor_id;
+                    this.repaint_reviewed_hunks(cx);
+                }
+            }),
+        ]);
+        let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
+        let line_cursor = cx.new(|cx| LineCursor::new(splittable, cx));
         let session = ReviewSession::for_key(target.review_key(&repo.read(cx)), cx);
         let session_subscription = cx.subscribe(&session, Self::handle_session_event);
         Self {
@@ -400,6 +422,7 @@ impl ReviewView {
             session,
             project,
             workspace: workspace.downgrade(),
+            lhs_editor_id,
             _load_commits_task: load_commits_task,
             _session_subscription: session_subscription,
             _subscriptions: subscriptions,
@@ -421,6 +444,7 @@ impl ReviewView {
         if self.session.read(cx).is_loaded() {
             self.apply_session(cx);
         }
+        self.repaint_reviewed_hunks(cx);
         cx.notify();
     }
 
@@ -443,13 +467,16 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ReviewSessionEvent::Loaded => self.apply_session(cx),
+            ReviewSessionEvent::Loaded => {
+                self.apply_session(cx);
+                self.repaint_reviewed_hunks(cx);
+            }
             ReviewSessionEvent::FilesChanged(changes) => {
                 for (repo_path, _) in changes {
                     self.sync_fold(&review_path_key(repo_path), cx);
                 }
             }
-            ReviewSessionEvent::HunksChanged(_) => {}
+            ReviewSessionEvent::HunksChanged => self.repaint_reviewed_hunks(cx),
         }
         cx.notify();
     }
@@ -478,6 +505,7 @@ impl ReviewView {
                 if *newly_shown {
                     self.sync_fold(path_key, cx);
                 }
+                self.repaint_reviewed_hunks(cx);
             }
             ReviewDiffEvent::SingleFileChanged { previous, current } => {
                 match current {
@@ -568,6 +596,111 @@ impl ReviewView {
             self.diff
                 .update(cx, |diff, cx| diff.select_path_start(&path_key, window, cx));
         }
+    }
+
+    /// `R`: toggles the mark of the hunk at the cursor.
+    fn toggle_hunk_reviewed(
+        &mut self,
+        _: &ToggleHunkReviewed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        discard_vim_count(window, cx);
+        if !self.session.read(cx).is_loaded() {
+            return;
+        }
+        let editor = self.diff.read(cx).editor().read(cx).focused_editor().clone();
+        let cursor = editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let head = editor.selections.newest::<Point>(&display_snapshot).head();
+            display_snapshot
+                .buffer_snapshot()
+                .anchor_before(Point::new(head.row, 0))
+        });
+        match self.hunk_key_at(&editor, cursor, cx) {
+            Some((repo_path, hunk_key)) => self.toggle_hunk(&repo_path, hunk_key, cx),
+            None => {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<ToggleHunkReviewed>(),
+                                "Move the cursor onto a changed line to mark its hunk reviewed",
+                            )
+                            .autohide(),
+                            cx,
+                        )
+                    })
+                    .ok();
+            }
+        }
+    }
+
+    pub(crate) fn toggle_hunk(&mut self, repo_path: &RepoPath, hunk_key: SharedString, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |session, cx| session.toggle_hunk(repo_path, hunk_key, cx));
+    }
+
+    /// The file and key of the hunk whose rows contain `position` in `editor` (either side).
+    pub(crate) fn hunk_key_at(
+        &self,
+        editor: &Entity<Editor>,
+        position: editor::Anchor,
+        cx: &App,
+    ) -> Option<(RepoPath, SharedString)> {
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+        let row = position.to_point(&snapshot).row;
+        let line_end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+        let hunk = snapshot
+            .diff_hunks_in_range(Point::new(row, 0)..line_end)
+            .find(|hunk| hunk.row_range.start.0 <= row && row < hunk.row_range.end.0)?;
+        let path_key = snapshot.path_for_buffer(hunk.buffer_id)?;
+        let diff = self.diff.read(cx);
+        let repo_path = diff.repo_path_for(path_key)?;
+        let base_range = hunk.diff_base_byte_range.start.0..hunk.diff_base_byte_range.end.0;
+        let hunk_key = diff.digest(path_key)?.hunk_key(&base_range)?.clone();
+        Some((repo_path, hunk_key))
+    }
+
+    /// Repaints the reviewed hunks on both sides, then the line cursor, which must stay on top
+    /// (the newest row highlight wins).
+    fn repaint_reviewed_hunks(&mut self, cx: &mut Context<Self>) {
+        let splittable = self.diff.read(cx).editor().read(cx);
+        let editors = [
+            Some(splittable.rhs_editor().clone()),
+            splittable.lhs_editor().cloned(),
+        ];
+        for editor in editors.into_iter().flatten() {
+            let rows = self.reviewed_hunk_rows(&editor, cx);
+            editor.update(cx, |editor, cx| paint_reviewed_hunks(editor, rows, cx));
+        }
+        self.line_cursor
+            .update(cx, |line_cursor, cx| line_cursor.refresh(cx));
+    }
+
+    fn reviewed_hunk_rows(&self, editor: &Entity<Editor>, cx: &App) -> Vec<std::ops::Range<u32>> {
+        let session = self.session.read(cx);
+        if !session.has_reviewed_hunks() {
+            return Vec::new();
+        }
+        let digests = self.diff.read(cx).digests();
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+        snapshot
+            .diff_hunks_in_range(Point::zero()..snapshot.max_point())
+            .filter(|hunk| {
+                let Some((repo_path, digest)) = snapshot
+                    .path_for_buffer(hunk.buffer_id)
+                    .and_then(|path_key| digests.get(path_key))
+                else {
+                    return false;
+                };
+                let base_range = hunk.diff_base_byte_range.start.0..hunk.diff_base_byte_range.end.0;
+                digest
+                    .hunk_key(&base_range)
+                    .is_some_and(|hunk_key| session.is_hunk_reviewed(repo_path, hunk_key))
+            })
+            .map(|hunk| hunk.row_range.start.0..hunk.row_range.end.0)
+            .collect()
     }
 
     fn next_hunk(&mut self, _: &NextHunk, window: &mut Window, cx: &mut Context<Self>) {
@@ -993,6 +1126,7 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::toggle_single_file_mode))
             .on_action(cx.listener(Self::open_file_at_cursor))
             .on_action(cx.listener(Self::toggle_file_reviewed))
+            .on_action(cx.listener(Self::toggle_hunk_reviewed))
             .on_action(cx.listener(Self::next_hunk))
             .on_action(cx.listener(Self::previous_hunk))
             .when(is_branch_review, |view| {

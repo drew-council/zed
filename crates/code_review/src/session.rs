@@ -35,7 +35,7 @@ pub(crate) enum ReviewSessionEvent {
     Loaded,
     /// Files whose reviewed mark changed, with the new state.
     FilesChanged(Vec<(RepoPath, bool)>),
-    HunksChanged(Vec<RepoPath>),
+    HunksChanged,
 }
 
 impl EventEmitter<ReviewSessionEvent> for ReviewSession {}
@@ -116,6 +116,10 @@ impl ReviewSession {
         self.reviewed_files.contains_key(path)
     }
 
+    pub(crate) fn has_reviewed_hunks(&self) -> bool {
+        self.reviewed_hunks.values().any(|hunks| !hunks.is_empty())
+    }
+
     pub(crate) fn is_hunk_reviewed(&self, path: &RepoPath, hunk_key: &str) -> bool {
         self.reviewed_hunks
             .get(path)
@@ -190,7 +194,7 @@ impl ReviewSession {
             );
             true
         };
-        cx.emit(ReviewSessionEvent::HunksChanged(vec![path.clone()]));
+        cx.emit(ReviewSessionEvent::HunksChanged);
         cx.notify();
         reviewed
     }
@@ -244,7 +248,7 @@ impl ReviewSession {
                 cx,
             );
         }
-        cx.emit(ReviewSessionEvent::HunksChanged(vec![path.clone()]));
+        cx.emit(ReviewSessionEvent::HunksChanged);
         cx.notify();
     }
 }
