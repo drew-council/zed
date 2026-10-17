@@ -47,7 +47,7 @@ use language::{Capability, LanguageRegistry, Point, language_settings::SoftWrap}
 use multi_buffer::MultiBufferRow;
 use project::{
     Project, ProjectPath,
-    git_store::{Repository, RepositoryEvent},
+    git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use regex::{Regex, RegexBuilder};
 use std::{
@@ -770,6 +770,7 @@ impl ReviewView {
             | ReviewTarget::PullRequest(_) => Task::ready(()),
         };
 
+        let git_store = project.read(cx).git_store().clone();
         let mut subscriptions = vec![
             // `zed --review --wait` ends once no tab shows the review.
             cx.on_release(|this, cx| this.session.update(cx, |session, _| session.hide(None))),
@@ -783,6 +784,16 @@ impl ReviewView {
             cx.subscribe(&comments, |_, _, _: &CommentBlocksEvent, cx| {
                 cx.emit(EditorEvent::TitleChanged);
                 cx.notify();
+            }),
+            // Titles name the repository once the project has several (the panel header too).
+            cx.subscribe(&git_store, |_, _, event: &GitStoreEvent, cx| {
+                if matches!(
+                    event,
+                    GitStoreEvent::RepositoryAdded | GitStoreEvent::RepositoryRemoved(_)
+                ) {
+                    cx.emit(EditorEvent::TitleChanged);
+                    cx.notify();
+                }
             }),
             // A branch review is titled and keyed after the checked-out branch. The merge base of
             // a branch or pull request review depends on HEAD.
@@ -2948,6 +2959,67 @@ mod tests {
                     .ends_with(&format!("{name}"))
             );
         });
+    }
+
+    /// A repository added to the project renames the open reviews at once, which redraws the
+    /// panel's header too (R1: it kept the plain title until something else redrew it).
+    #[gpui::test]
+    async fn test_titles_name_the_repository_once_another_is_added(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        crate::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "one": { ".git": {}, "a.txt": "A\n" },
+                "two": { ".git": {}, "b.txt": "B\n" },
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/root/one/.git")),
+            &[("a.txt", "a\n".into())],
+        );
+        let project = Project::test(fs, [Path::new(path!("/root/one"))], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        cx.focus(&workspace);
+        cx.update(|window, cx| window.dispatch_action(ReviewUncommitted.boxed_clone(), cx));
+        cx.run_until_parked();
+        let review = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ReviewView>(cx).unwrap()
+        });
+        assert_eq!(
+            review.read_with(cx, |review, cx| review.title_with_repository(cx)),
+            "Uncommitted changes"
+        );
+
+        let renamed = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let renamed = renamed.clone();
+            cx.subscribe(&review, move |_, event: &EditorEvent, _| {
+                if matches!(event, EditorEvent::TitleChanged) {
+                    renamed.set(renamed.get() + 1);
+                }
+            })
+        });
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/root/two"), true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert!(renamed.get() > 0);
+        assert_eq!(
+            review.read_with(cx, |review, cx| review.title_with_repository(cx)),
+            "one \u{b7} Uncommitted changes"
+        );
     }
 
     mod targets {

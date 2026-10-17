@@ -2090,6 +2090,43 @@ mod tests {
         assert!(is_folded(&review, "src/lib.rs", cx));
     }
 
+    /// `]t` from one side of a split diff onto the other side's item in another file selects
+    /// that file (R2: from an old line on the left side, the panel stayed on the first file).
+    #[gpui::test]
+    async fn test_panel_follows_comment_jumps_across_sides(cx: &mut TestAppContext) {
+        use crate::test_support::{lhs_editor, move_to_row_with_text, open_review_fixture};
+
+        init_vim_test(cx, DiffViewStyle::Split);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let panel = add_review_panel(&workspace, cx);
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+        let comment = |cx: &mut VisualTestContext, text: &str| {
+            cx.simulate_keystrokes("c");
+            cx.simulate_input(text);
+            cx.simulate_keystrokes("ctrl-enter");
+        };
+        move_to_row_with_text(&rhs, "three", cx);
+        comment(cx, "new side");
+        cx.simulate_keystrokes("ctrl-w h");
+        move_to_row_with_text(&lhs, "gone 1", cx);
+        comment(cx, "old side");
+
+        move_to_row_with_text(&lhs, "line 2", cx);
+        assert_eq!(selected(&panel, cx), "a.rs M");
+        cx.simulate_keystrokes("] t");
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("deleted.txt"));
+        assert_eq!(selected(&panel, cx), "deleted.txt D");
+        // From an old line on the left side onto the right side of the next file, and around
+        // onto the left side again.
+        cx.simulate_keystrokes("] t");
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("modified.txt"));
+        assert_eq!(selected(&panel, cx), "modified.txt M");
+        cx.simulate_keystrokes("] t");
+        assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("deleted.txt"));
+        assert_eq!(selected(&panel, cx), "deleted.txt D");
+    }
+
     #[gpui::test]
     async fn test_panel_follows_active_review(cx: &mut TestAppContext) {
         init_vim_test(cx, DiffViewStyle::Unified);

@@ -461,8 +461,16 @@ impl ReviewDiff {
         cx: &mut Context<Self>,
     ) {
         match event {
+            // Either side counts: landing on an item of the other side moves that side's cursor
+            // and focuses it before the splittable editor's last focused side changes (on the
+            // next frame), and the cursor mirrored onto the side left behind is the last change.
             EditorEvent::SelectionsChanged { local: true } => {
-                if editor.focus_handle(cx).contains_focused(window, cx) {
+                let splittable = editor.read(cx);
+                if [Some(splittable.rhs_editor()), splittable.lhs_editor()]
+                    .into_iter()
+                    .flatten()
+                    .any(|side| side.focus_handle(cx).contains_focused(window, cx))
+                {
                     cx.emit(event.clone());
                 }
             }
