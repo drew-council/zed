@@ -16,6 +16,7 @@ mod reviewed;
 mod session;
 mod submit;
 mod target;
+mod toolbar;
 mod top_block;
 mod view;
 
@@ -212,10 +213,13 @@ const KEYMAP: &str = include_str!("../../../assets/keymaps/code_review.json");
 const VIM_KEYMAP: &str = include_str!("../../../assets/keymaps/code_review_vim.json");
 
 pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
         panel::register(workspace);
         picker::register(workspace);
         view::register(workspace);
+        if let Some(window) = window {
+            toolbar::register(workspace, window, cx);
+        }
     })
     .detach();
 }
@@ -555,6 +559,24 @@ pub(crate) mod test_support {
         });
         cx.run_until_parked();
         committed.await.unwrap().unwrap();
+    }
+
+    /// Draws the window, so that `debug_bounds` and mouse events see what it shows now.
+    pub(crate) fn redraw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    /// Clicks the middle of the element drawn with `selector` as its debug selector.
+    pub(crate) fn click_selector(selector: &'static str, cx: &mut VisualTestContext) {
+        redraw(cx);
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} isn't drawn"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
     }
 
     pub(crate) fn dispatch(action: impl Action, cx: &mut VisualTestContext) {

@@ -56,7 +56,7 @@ use std::{
     collections::BTreeMap,
     sync::Arc,
 };
-use ui::{KeyBinding, prelude::*};
+use ui::prelude::*;
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
     ItemNavHistory, Toast, Workspace,
@@ -83,20 +83,9 @@ pub(crate) fn register(workspace: &mut Workspace) {
     });
     workspace.register_action(|workspace, _: &CopyReviewAsMarkdown, window, cx| {
         discard_vim_count(window, cx);
-        let Some(review) = current_review(workspace, cx) else {
-            return;
-        };
-        let message = match review.read(cx).review_markdown(cx) {
-            Some(markdown) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(markdown));
-                "Review copied to clipboard"
-            }
-            None => "No comments to copy",
-        };
-        workspace.show_toast(
-            Toast::new(NotificationId::unique::<CopyReviewAsMarkdown>(), message).autohide(),
-            cx,
-        );
+        if let Some(review) = current_review(workspace, cx) {
+            copy_review_as_markdown(workspace, &review, cx);
+        }
     });
     workspace.register_action(|workspace, _: &ToggleResolvedThreads, _, cx| {
         update_thread_filters(workspace, cx, |filters| {
@@ -133,12 +122,7 @@ pub(crate) fn register(workspace: &mut Workspace) {
             );
             return;
         };
-        match review.read(cx).pull_request().cloned() {
-            Some(pull_request) => {
-                SubmitReviewModal::open(workspace, review, pull_request, window, cx)
-            }
-            None => finish_local_review(workspace, &review, cx),
-        }
+        submit_review(workspace, review, window, cx);
     });
     workspace.register_action(|workspace, _: &OpenPullRequestInBrowser, window, cx| {
         if let Some(pull_request) = current_pull_request(workspace, cx) {
@@ -146,6 +130,38 @@ pub(crate) fn register(workspace: &mut Workspace) {
             open_web_link(&url, window, cx);
         }
     });
+}
+
+/// `y`: the review's comments as Markdown, on the clipboard.
+pub(crate) fn copy_review_as_markdown(
+    workspace: &mut Workspace,
+    review: &Entity<ReviewView>,
+    cx: &mut Context<Workspace>,
+) {
+    let message = match review.read(cx).review_markdown(cx) {
+        Some(markdown) => {
+            cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+            "Review copied to clipboard"
+        }
+        None => "No comments to copy",
+    };
+    workspace.show_toast(
+        Toast::new(NotificationId::unique::<CopyReviewAsMarkdown>(), message).autohide(),
+        cx,
+    );
+}
+
+/// `; s`: opens the submit modal of a pull request review, or finishes a local review.
+pub(crate) fn submit_review(
+    workspace: &mut Workspace,
+    review: Entity<ReviewView>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    match review.read(cx).pull_request().cloned() {
+        Some(pull_request) => SubmitReviewModal::open(workspace, review, pull_request, window, cx),
+        None => finish_local_review(workspace, &review, cx),
+    }
 }
 
 /// The pull request of the current review, or a toast saying it isn't a pull request review.
@@ -2068,13 +2084,11 @@ impl ReviewView {
         cx.stop_propagation();
     }
 
-    /// Says that only one file is shown, which one, and how to see the others again.
-    fn render_single_file_bar(
-        &self,
-        path_key: &PathKey,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// Which file single-file mode shows: its place among the review's files, their number and
+    /// its path (the review toolbar shows them).
+    pub(crate) fn single_file_position(&self, cx: &App) -> Option<(usize, usize, SharedString)> {
         let diff = self.diff.read(cx);
+        let path_key = diff.single_file()?;
         let order = diff.file_order();
         let position = order
             .iter()
@@ -2082,42 +2096,29 @@ impl ReviewView {
             .map_or(0, |index| index + 1);
         let path = diff
             .repo_path_for(path_key)
-            .map(|repo_path| repo_path.as_unix_str().to_string())
+            .map(|repo_path| SharedString::from(repo_path.as_unix_str().to_string()))
             .unwrap_or_default();
-        let focus_handle = self.focus_handle(cx);
-        h_flex()
-            .w_full()
-            .flex_none()
-            .px_3()
-            .py_0p5()
-            .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
-            .bg(cx.theme().colors().editor_subheader_background)
-            .child(
-                Label::new(format!("Single file · {position} of {}", order.len()))
-                    .size(LabelSize::Small),
-            )
-            .child(
-                Label::new(path)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .truncate(),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("review-show-all-files", "Show All Files")
-                    .label_size(LabelSize::Small)
-                    .key_binding(KeyBinding::for_action_in(
-                        &ToggleSingleFileMode,
-                        &focus_handle,
-                        cx,
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.diff
-                            .update(cx, |diff, cx| diff.set_single_file(None, window, cx));
-                    })),
-            )
+        Some((position, order.len(), path))
+    }
+
+    /// The review's own comments with text, not yet submitted: what submitting or finishing
+    /// it sends.
+    pub(crate) fn draft_comment_count(&self, cx: &App) -> usize {
+        self.session
+            .read(cx)
+            .comments()
+            .iter()
+            .filter(|comment| !comment.body.is_empty() && !comment.is_submitted())
+            .count()
+    }
+
+    /// The pull request's threads this tab shows (the thread filters hide the others).
+    pub(crate) fn shown_thread_count(&self, cx: &App) -> usize {
+        self.comments
+            .read(cx)
+            .remote_items()
+            .map(|(_, _, view)| view.read(cx).threads().count())
+            .sum()
     }
 
     fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
@@ -2477,7 +2478,6 @@ impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_branch_review = matches!(self.target, ReviewTarget::Branch { .. });
         let has_top_block = self.top_block.read(cx).has_content();
-        let single_file = self.diff.read(cx).single_file().cloned();
         // Without rows (loading, no changes, every file hidden) the diff shows a placeholder
         // instead of its editor, which hosts the overview otherwise.
         let overview_above_placeholder =
@@ -2517,9 +2517,6 @@ impl Render for ReviewView {
                 view.on_action(cx.listener(Self::toggle_header))
             })
             .size_full()
-            .when_some(single_file, |view, path_key| {
-                view.child(self.render_single_file_bar(&path_key, cx))
-            })
             .map(|view| {
                 if overview_above_placeholder {
                     // One scroll for both, as in the diff.
