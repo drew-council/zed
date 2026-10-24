@@ -2076,6 +2076,13 @@ own) are unchanged. **Decision**: no setting; drafts show when the search names 
 `is:draft`, or `(is:draft OR draft:false)` for all). The sandbox's empty list with the default
 search is intended: nothing there requests the viewer's review (`review-requested:@me`).
 
+**Bugs 2, item 7 (the panel's tree looks like the project panel's)** — **Decision**: the review
+panel's tree (and its comment rows) reads the `project_panel` settings (`indent_size`,
+`entry_spacing`, `file_icons`, `folder_indicator`, `bold_folder_labels`, `indent_guides.show`; new
+dependency on `project_panel` for `ProjectPanelSettings`) and the project panel's sizes (default
+label and icon size, `h_6` names, its indent guide offsets); a long name is now cut off instead of
+pushing the status letter out of the panel.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group

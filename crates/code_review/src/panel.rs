@@ -20,11 +20,13 @@ use editor::{
 use file_icons::FileIcons;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
-    Action, Anchor, AsyncWindowContext, ClipboardItem, DismissEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent, Point,
-    ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity, anchored, deferred,
-    uniform_list,
+    Action, Anchor, AsyncWindowContext, Bounds, ClipboardItem, DismissEvent, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, FontWeight, KeyContext, MouseButton, MouseDownEvent,
+    Point, ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity, anchored, deferred,
+    point, size, uniform_list,
 };
+use project_panel::project_panel_settings::ProjectPanelSettings;
+use settings::{ProjectPanelEntrySpacing, Settings as _, ShowIndentGuides};
 use smallvec::SmallVec;
 use std::{collections::BTreeMap, ops::Range};
 use ui::{
@@ -39,7 +41,6 @@ use workspace::{
 };
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
-const TREE_INDENT: f32 = 16.0;
 
 pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &EditIncludeFilter, window, cx| {
@@ -1163,6 +1164,12 @@ impl ReviewPanel {
         cx: &Context<Self>,
     ) -> AnyElement {
         let selected = self.selected == Some(index);
+        // The tree follows the project panel's settings and sizes, so both trees look alike.
+        let settings = *ProjectPanelSettings::get_global(cx);
+        let spacing = match settings.entry_spacing {
+            ProjectPanelEntrySpacing::Comfortable => ListItemSpacing::Dense,
+            ProjectPanelEntrySpacing::Standard => ListItemSpacing::ExtraDense,
+        };
         match entry {
             TreeEntry::Directory {
                 path,
@@ -1170,25 +1177,30 @@ impl ReviewPanel {
                 depth,
                 expanded,
             } => {
-                let icon = FileIcons::get_folder_icon(*expanded, path.as_std_path(), cx)
-                    .map(Icon::from_path)
-                    .unwrap_or_else(|| {
-                        Icon::new(if *expanded {
-                            IconName::FolderOpen
-                        } else {
-                            IconName::Folder
-                        })
-                    })
-                    .size(IconSize::Small)
-                    .color(Color::Muted);
+                let indicators = FileIcons::get_folder_indicators(
+                    settings.folder_indicator,
+                    *expanded,
+                    path.as_std_path(),
+                    cx,
+                );
                 ListItem::new(("review-directory", index))
-                    .spacing(ListItemSpacing::Sparse)
+                    .spacing(spacing)
                     .indent_level(*depth)
-                    .indent_step_size(px(TREE_INDENT))
+                    .indent_step_size(px(settings.indent_size))
                     .toggle_state(selected)
                     .focused(selected && focused)
-                    .start_slot(icon)
-                    .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
+                    .start_slot(render_tree_icons(
+                        indicators.chevron,
+                        indicators.icon,
+                        false,
+                    ))
+                    .child(render_tree_label(
+                        Label::new(name.clone())
+                            .when(settings.bold_folder_labels, |label| {
+                                label.weight(FontWeight::SEMIBOLD)
+                            })
+                            .truncate(),
+                    ))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.selected = Some(index);
@@ -1201,11 +1213,12 @@ impl ReviewPanel {
                     .into_any_element()
             }
             TreeEntry::File { file, name, depth } => {
-                let icon = FileIcons::get_icon(file.repo_path.as_std_path(), cx)
-                    .map(Icon::from_path)
-                    .unwrap_or_else(|| Icon::new(IconName::File))
-                    .size(IconSize::Small)
-                    .color(Color::Muted);
+                let icon = settings
+                    .file_icons
+                    .then(|| FileIcons::get_icon(file.repo_path.as_std_path(), cx))
+                    .flatten();
+                let reserves_chevron_slot = settings.folder_indicator.shows_chevron()
+                    && settings.folder_indicator.shows_icon();
                 let (letter, color) = status_letter(file.status);
                 let is_deleted = file.status.is_deleted();
                 let path = file.repo_path.as_unix_str().to_string();
@@ -1237,18 +1250,37 @@ impl ReviewPanel {
                             })),
                     );
                 ListItem::new(("review-file", index))
-                    .spacing(ListItemSpacing::Sparse)
+                    .spacing(spacing)
                     .indent_level(*depth)
-                    .indent_step_size(px(TREE_INDENT))
+                    .indent_step_size(px(settings.indent_size))
                     .toggle_state(selected)
                     .focused(selected && focused)
-                    .start_slot(icon)
+                    .start_slot(render_tree_icons(None, icon, reserves_chevron_slot))
                     .child(
-                        Label::new(name.clone())
-                            .size(LabelSize::Small)
-                            .color(if is_deleted { Color::Disabled } else { color })
-                            .when(is_deleted, Label::strikethrough)
-                            .truncate(),
+                        render_tree_label(
+                            Label::new(name.clone())
+                                .color(if is_deleted { Color::Disabled } else { color })
+                                .when(is_deleted, Label::strikethrough)
+                                .truncate(),
+                        )
+                        .when(
+                            file.attributes.generated || file.attributes.vendored,
+                            |name| {
+                                name.child(
+                                    Label::new(if file.attributes.generated {
+                                        "(generated)"
+                                    } else {
+                                        "(vendored)"
+                                    })
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                            },
+                        )
+                        .debug_selector({
+                            let path = path.clone();
+                            move || format!("review-panel-file-name-{path}")
+                        }),
                     )
                     .end_slot(
                         h_flex()
@@ -1270,20 +1302,6 @@ impl ReviewPanel {
                             .gap_1()
                             .child(reviewed_checkbox)
                             .child(status_label()),
-                    )
-                    .when(
-                        file.attributes.generated || file.attributes.vendored,
-                        |item| {
-                            item.child(
-                                Label::new(if file.attributes.generated {
-                                    "(generated)"
-                                } else {
-                                    "(vendored)"
-                                })
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            )
-                        },
                     )
                     .tooltip({
                         let path = SharedString::from(file.repo_path.as_unix_str().to_string());
@@ -1337,12 +1355,12 @@ impl ReviewPanel {
                     None
                 };
                 ListItem::new(("review-comment", index))
-                    .spacing(ListItemSpacing::Sparse)
+                    .spacing(spacing)
                     .toggle_state(selected)
                     .focused(selected && focused)
                     .start_slot(match comment.comment_type {
                         Some(comment_type) => Label::new(comment_type.label())
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Small)
                             .color(comment_type.color())
                             .buffer_font(cx)
                             .into_any_element(),
@@ -1351,12 +1369,12 @@ impl ReviewPanel {
                         } else {
                             IconName::Chat
                         })
-                        .size(IconSize::Small)
                         .color(Color::Muted)
                         .into_any_element(),
                     })
                     .child(
                         h_flex()
+                            .h_6()
                             .w_full()
                             .min_w_0()
                             .gap_1()
@@ -1371,7 +1389,6 @@ impl ReviewPanel {
                                     })
                                     .child(
                                         Label::new(comment.location.clone())
-                                            .size(LabelSize::Small)
                                             .color(if muted {
                                                 Color::Muted
                                             } else {
@@ -1383,14 +1400,13 @@ impl ReviewPanel {
                             .child(
                                 div().flex_1().min_w_0().child(
                                     Label::new(comment.first_line.clone())
-                                        .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .truncate(),
                                 ),
                             ),
                     )
                     .when_some(state, |item, (state, color)| {
-                        item.end_slot(Label::new(state).size(LabelSize::XSmall).color(color))
+                        item.end_slot(Label::new(state).size(LabelSize::Small).color(color))
                     })
                     .when_some(
                         match comment.key {
@@ -1745,6 +1761,79 @@ fn render_prompt(prompt: &Prompt, cx: &App) -> impl IntoElement {
         })
 }
 
+/// A tree row's chevron and icon, laid out as the project panel lays out its rows.
+fn render_tree_icons(
+    chevron: Option<SharedString>,
+    icon: Option<SharedString>,
+    reserves_chevron_slot: bool,
+) -> Div {
+    let spacer = || {
+        h_flex()
+            .size(IconSize::default().rems())
+            .invisible()
+            .flex_none()
+    };
+    let has_chevron = chevron.is_some();
+    h_flex()
+        .flex_none()
+        .gap_0p5()
+        .map(|icons| match chevron {
+            Some(chevron) => icons.child(Icon::from_path(chevron).color(Color::Muted)),
+            None if reserves_chevron_slot => icons.child(spacer()),
+            None => icons,
+        })
+        .map(|icons| match icon {
+            Some(icon) => icons.child(Icon::from_path(icon).color(Color::Muted)),
+            // The chevron already fills the icon's slot.
+            None if has_chevron => icons,
+            None => icons.child(spacer()),
+        })
+}
+
+/// A tree row's name, as tall as a project panel row's. Its zero width and hidden overflow keep
+/// a long name out of the row's minimum width, so `ListItem` cuts the name off instead of
+/// pushing the row's status out of the panel.
+fn render_tree_label(label: Label) -> Div {
+    h_flex()
+        .h_6()
+        .w_0()
+        .flex_grow_1()
+        .overflow_hidden()
+        .gap_1()
+        .child(div().min_w_0().child(label))
+}
+
+/// The project panel's indent guides: at its icon column, and short of the rows' edges.
+fn render_indent_guides(
+    params: ui::RenderIndentGuideParams,
+) -> SmallVec<[ui::RenderedIndentGuide; 12]> {
+    const PADDING_Y: Pixels = px(4.);
+    params
+        .indent_guides
+        .into_iter()
+        .map(|layout| {
+            let padding = if layout.continues_offscreen {
+                px(0.)
+            } else {
+                PADDING_Y
+            };
+            ui::RenderedIndentGuide {
+                bounds: Bounds::new(
+                    point(
+                        layout.offset.x * params.indent_size
+                            + ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET,
+                        layout.offset.y * params.item_height + padding,
+                    ),
+                    size(px(1.), layout.length * params.item_height - padding * 2.),
+                ),
+                layout,
+                is_active: false,
+                hitbox: None,
+            }
+        })
+        .collect()
+}
+
 impl EventEmitter<PanelEvent> for ReviewPanel {}
 
 impl Focusable for ReviewPanel {
@@ -1756,6 +1845,10 @@ impl Focusable for ReviewPanel {
 impl Render for ReviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let review = self.active_review();
+        let project_panel_settings = ProjectPanelSettings::get_global(cx);
+        let indent_size = project_panel_settings.indent_size;
+        let show_indent_guides =
+            project_panel_settings.indent_guides.show == ShowIndentGuides::Always;
         let editing = self
             .prompt
             .as_ref()
@@ -1806,13 +1899,17 @@ impl Render for ReviewPanel {
                                     .collect()
                             }),
                         )
-                        .with_decoration(
-                            ui::indent_guides(px(TREE_INDENT), IndentGuideColors::panel(cx))
-                                .with_left_offset(ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.))
-                                .with_compute_indents_fn(cx.entity(), |this, range, _, _| {
-                                    this.compute_indents(range)
-                                }),
-                        )
+                        .when(show_indent_guides, |list| {
+                            list.with_decoration(
+                                ui::indent_guides(px(indent_size), IndentGuideColors::panel(cx))
+                                    .with_compute_indents_fn(cx.entity(), |this, range, _, _| {
+                                        this.compute_indents(range)
+                                    })
+                                    .with_render_fn(cx.entity(), |_, params, _, _| {
+                                        render_indent_guides(params)
+                                    }),
+                            )
+                        })
                         .flex_1()
                         .size_full()
                         .track_scroll(&self.scroll_handle),
@@ -2601,6 +2698,96 @@ mod tests {
             .unwrap();
         assert!(short.size.width > px(0.));
         assert_eq!(short.size.width, long.size.width);
+    }
+
+    /// The tree is indented and spaced by the project panel's settings, so it looks like the
+    /// project panel's tree.
+    #[gpui::test]
+    async fn test_tree_follows_project_panel_settings(cx: &mut TestAppContext) {
+        use gpui::BorrowAppContext as _;
+        use settings::SettingsStore;
+
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, _review, cx) = open_tree_fixture(cx).await;
+        add_review_panel(&workspace, cx);
+        cx.simulate_keystrokes("; h");
+        cx.run_until_parked();
+        let name_bounds =
+            |selector: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(selector).unwrap();
+        let indent = |cx: &mut VisualTestContext| {
+            name_bounds("review-panel-file-name-src/lib.rs", cx)
+                .origin
+                .x
+                - name_bounds("review-panel-file-name-z.txt", cx).origin.x
+        };
+        let row_height = |cx: &mut VisualTestContext| {
+            name_bounds("review-panel-file-name-src/mod_b.rs", cx)
+                .origin
+                .y
+                - name_bounds("review-panel-file-name-src/lib.rs", cx)
+                    .origin
+                    .y
+        };
+        assert_eq!(indent(cx), px(20.));
+        let comfortable_row_height = row_height(cx);
+
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let project_panel = settings.project_panel.get_or_insert_default();
+                    project_panel.indent_size = Some(settings::PixelSetting(32.));
+                    project_panel.entry_spacing =
+                        Some(settings::ProjectPanelEntrySpacing::Standard);
+                });
+            });
+        });
+        redraw(cx);
+        assert_eq!(indent(cx), px(32.));
+        assert!(row_height(cx) < comfortable_row_height);
+    }
+
+    /// A long name deep in the tree is cut off; it doesn't push its row's status letter out of
+    /// the panel.
+    #[gpui::test]
+    async fn test_long_names_keep_the_status_in_view(cx: &mut TestAppContext) {
+        use crate::test_support::{dot_git, open_workspace};
+        use project::FakeFs;
+        use serde_json::json;
+        use util::path;
+
+        init_vim_test(cx, DiffViewStyle::Unified);
+        let fs = FakeFs::new(cx.executor());
+        let long_path = "one/two/three/four/five/a_name_far_too_long_for_the_review_panel.txt";
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "short.txt": "ONE\n",
+                "one": { "two": { "three": { "four": { "five": {
+                    "a_name_far_too_long_for_the_review_panel.txt": "ONE\n",
+                } } } } },
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            dot_git(),
+            &[("short.txt", "one\n".into()), (long_path, "one\n".into())],
+        );
+        let (workspace, cx) = open_workspace(fs.clone(), cx).await;
+        add_review_panel(&workspace, cx);
+        dispatch(ReviewUncommitted, cx);
+        cx.run_until_parked();
+        redraw(cx);
+
+        let short = cx
+            .debug_bounds("review-panel-file-status-short.txt")
+            .unwrap();
+        let long = cx
+            .debug_bounds(
+                "review-panel-file-status-one/two/three/four/five/a_name_far_too_long_for_the_review_panel.txt",
+            )
+            .unwrap();
+        assert_eq!(long.right(), short.right());
     }
 
     /// Opening a review shows the panel in the left dock, whichever panel the dock showed and
