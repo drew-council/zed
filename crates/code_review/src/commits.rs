@@ -1091,6 +1091,48 @@ mod tests {
         assert_eq!(cursor_point(&opened, cx).row, 1);
     }
 
+    /// A pull request's squash-merge commit ("Subject (#N)") leads its tab with the pull
+    /// request's number; the tooltip keeps the sha and the whole subject.
+    #[gpui::test]
+    async fn test_squash_merge_commit_tab_leads_with_pull_request(cx: &mut TestAppContext) {
+        crate::init_test(cx);
+        let (fs, workspace, cx) = history_fixture(cx).await;
+        fs.set_commit_data(
+            dot_git(),
+            [
+                (commit_data(C1, None, "Add a"), false),
+                (
+                    commit_data(
+                        C2,
+                        Some(C1),
+                        "Read the pnpm version from package.json (#30007)\n\nWhy.",
+                    ),
+                    false,
+                ),
+                (commit_data(C3, Some(C2), "Tweak b (#a1)"), false),
+            ],
+        );
+
+        review_commits(C2, cx);
+        let review = active_review(&workspace, cx);
+        assert_eq!(
+            tab_title(&review, cx),
+            "Review: #30007 Read the pnpm versio…"
+        );
+        assert_eq!(
+            review
+                .read_with(cx, |review, cx| review.tab_tooltip_text(cx))
+                .unwrap(),
+            "Review: 2222222 Read the pnpm version from package.json (#30007)\n\
+             Read-only snapshot (no language server)"
+        );
+
+        // Not a pull request's number: the sha leads as usual.
+        review_commits(C3, cx);
+        let review = active_review(&workspace, cx);
+        assert_eq!(tab_title(&review, cx), "Review: 3333333 Tweak b (#a1)");
+    }
+
     /// `e` on a removed row of a snapshot shown unified opens the working tree's file at the
     /// removed row's line, as on the left side of a split diff (V1.F1).
     #[gpui::test]
