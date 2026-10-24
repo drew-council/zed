@@ -473,8 +473,12 @@ state dir):**
 - **Editors**: vim auto-height editors (`set_use_modal_editing(true)` inside `cx.new`) created with
   their text (undo can't empty them), editor-width wrap, placeholder "Leave a comment…". They enter
   insert mode on their first `Focused` event (the vim action needs the painted node), at the end for a
-  new comment and at the start for `i`/`Enter` (tuicr's `i`). UI font, like the rendered markdown
-  (`hover_markdown_style`, as the top block).
+  new comment and at the start for `i`/`Enter` (tuicr's `i`). Written like code (bugs 2 item 6): the
+  buffer font and size (`comments::view::comment_editor_style`, rendered through `EditorElement`, as
+  auto-height editors default to the UI font), a Markdown buffer with the `LanguageRegistry` so fenced
+  code blocks get their language's highlighting through the grammar's injections (the language loads
+  in the background; the editor works before it does). Saved comments still render as markdown in
+  the UI font (`hover_markdown_style`, as the top block).
 - **Leave/keep** (on the card's `ReviewComment` context): `SaveComment` (`ctrl-enter`, `ctrl-s` in both
   keymaps; vim insert mode's `ctrl-s` is signature help otherwise), `editor::Cancel` (vim normal-mode
   `Esc`, which the child passes on), `workspace::Save`, `workspace::CloseActiveItem` (`:q`, `:wq`, `:x`,

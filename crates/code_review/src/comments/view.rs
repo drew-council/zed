@@ -3,11 +3,13 @@ use super::{
     remote::comment_markdown_style,
 };
 use crate::{CycleCommentType, CycleCommentTypeBackward, DiscardCommentChanges, SaveComment};
-use editor::Editor;
-use gpui::{Entity, Focusable as _, Subscription, WeakEntity};
+use editor::{Editor, EditorElement, EditorStyle};
+use gpui::{Entity, Focusable as _, Subscription, TextStyle, WeakEntity, relative};
 use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement};
+use settings::Settings as _;
 use std::sync::Arc;
+use theme_settings::ThemeSettings;
 use ui::{ContextMenu, IconPosition, KeyBinding, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{CloseActiveItem, CloseItemInAllPanes, SaveIntent};
@@ -390,6 +392,32 @@ fn location_label(target: &CommentTarget) -> Option<SharedString> {
     }
 }
 
+/// Comments are markdown that often holds code, so they are written like code: in the buffer font,
+/// which Zed's auto-height editors would otherwise swap for the UI font.
+fn comment_editor_style(cx: &App) -> EditorStyle {
+    let settings = ThemeSettings::get_global(cx);
+    EditorStyle {
+        background: cx.theme().system().transparent,
+        border: cx.theme().colors().border,
+        local_player: cx.theme().players().local(),
+        text: TextStyle {
+            color: cx.theme().colors().editor_foreground,
+            font_family: settings.buffer_font.family.clone(),
+            font_features: settings.buffer_font.features.clone(),
+            font_fallbacks: settings.buffer_font.fallbacks.clone(),
+            font_size: settings.buffer_font_size(cx).into(),
+            font_weight: settings.buffer_font.weight,
+            line_height: relative(settings.buffer_line_height.value()),
+            ..Default::default()
+        },
+        syntax: cx.theme().syntax().clone(),
+        status: cx.theme().status().clone(),
+        inlay_hints_style: editor::make_inlay_hints_style(cx),
+        edit_prediction_styles: editor::make_suggestion_styles(cx),
+        ..Default::default()
+    }
+}
+
 fn state_badge(label: &'static str, color: Color, cx: &App) -> impl IntoElement {
     div()
         .px_1()
@@ -439,7 +467,7 @@ impl Render for CommentView {
                     div()
                         .w_full()
                         .min_h(window.line_height())
-                        .child(editing.editor.clone()),
+                        .child(EditorElement::new(&editing.editor, comment_editor_style(cx))),
                 )
                 .child(self.render_footer(editing, cx))
                 .into_any_element(),
