@@ -24,7 +24,8 @@ use editor::{
 use git::repository::CommitData;
 use gpui::{AnyView, Entity, FontWeight, Subscription, WeakEntity};
 use language::LanguageRegistry;
-use markdown::{Markdown, MarkdownElement};
+use markdown::{Markdown, MarkdownElement, parser::PARSE_OPTIONS};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{ButtonLike, Checkbox, Disclosure, ToggleState, Tooltip, prelude::*};
@@ -935,7 +936,71 @@ fn render_commit(
 /// The commit message after its subject line.
 fn commit_body(message: &str) -> Option<String> {
     let body = message.split_once('\n')?.1.trim();
-    (!body.is_empty()).then(|| body.to_string())
+    (!body.is_empty()).then(|| join_bare_list_markers(body))
+}
+
+/// Commit messages are hard-wrapped, and wrapping a list item whose first word doesn't fit on the
+/// line (usually a long URL) leaves its marker alone on a line. Markdown reads that as an empty
+/// item followed by a paragraph outside the list, so such a marker gets its next line back.
+fn join_bare_list_markers(body: &str) -> String {
+    let events = Parser::new_ext(body, PARSE_OPTIONS)
+        .into_offset_iter()
+        .collect::<Vec<_>>();
+    let mut joins = Vec::new();
+    for (index, (event, range)) in events.iter().enumerate() {
+        if !matches!(event, Event::Start(Tag::Item))
+            || !matches!(events.get(index + 1), Some((Event::End(TagEnd::Item), _)))
+        {
+            continue;
+        }
+        let Some((next, next_range)) = events
+            .iter()
+            .skip(index + 2)
+            .find(|(event, _)| !matches!(event, Event::End(TagEnd::List(_))))
+        else {
+            continue;
+        };
+        if !starts_paragraph(next) {
+            continue;
+        }
+        let Some(marker) = body.get(range.clone()) else {
+            continue;
+        };
+        let marker_end = range.start + marker.trim_end().len();
+        let Some(gap) = body.get(marker_end..next_range.start) else {
+            continue;
+        };
+        // Only a line break and indentation: anything else (a quote's `>`, a blank line) means
+        // the paragraph isn't the marker's wrapped text.
+        if gap.matches('\n').count() == 1 && gap.chars().all(char::is_whitespace) {
+            joins.push(marker_end..next_range.start);
+        }
+    }
+    let mut joined = body.to_string();
+    for range in joins.into_iter().rev() {
+        joined.replace_range(range, " ");
+    }
+    joined
+}
+
+/// Whether the event begins a paragraph, which in a tight list has no paragraph event of its own.
+fn starts_paragraph(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Start(
+            Tag::Paragraph
+                | Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::Superscript
+                | Tag::Subscript
+                | Tag::Link { .. }
+                | Tag::Image { .. }
+        ) | Event::Text(_)
+            | Event::Code(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_)
+    )
 }
 
 /// A subject ending like GitHub's squash merges, "Subject (#123)": the subject without that
@@ -999,5 +1064,129 @@ impl Render for ReviewTopBlock {
             })
             .children(hovered_link)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unindent::Unindent as _;
+
+    /// Each list item's text, as rendered.
+    fn list_items(source: &str) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut depth = 0;
+        for event in Parser::new_ext(source, PARSE_OPTIONS) {
+            match event {
+                Event::Start(Tag::Item) => {
+                    depth += 1;
+                    items.push(String::new());
+                }
+                Event::End(TagEnd::Item) => depth -= 1,
+                Event::Text(text) | Event::Code(text) if depth > 0 => {
+                    if let Some(item) = items.last_mut() {
+                        item.push_str(&text);
+                    }
+                }
+                Event::SoftBreak if depth > 0 => {
+                    if let Some(item) = items.last_mut() {
+                        item.push(' ');
+                    }
+                }
+                _ => {}
+            }
+        }
+        items
+    }
+
+    #[test]
+    fn test_commit_body_joins_wrapped_list_markers() {
+        let message = "
+            Subject (#1)
+
+            ## Links
+
+            -
+            https://example.com/pull/1#issuecomment-1
+            - Passing run:
+            https://example.com/runs/2
+
+            1.
+            https://example.com/a/very/long/url
+            2. Second
+        "
+        .unindent();
+        let body = commit_body(&message).expect("the message has a body");
+        assert_eq!(
+            body,
+            "
+            ## Links
+
+            - https://example.com/pull/1#issuecomment-1
+            - Passing run:
+            https://example.com/runs/2
+
+            1. https://example.com/a/very/long/url
+            2. Second"
+                .unindent()
+        );
+        assert_eq!(
+            list_items(&body),
+            [
+                "https://example.com/pull/1#issuecomment-1",
+                "Passing run: https://example.com/runs/2",
+                "https://example.com/a/very/long/url",
+                "Second",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_commit_body_keeps_other_bare_list_markers() {
+        for body in [
+            // A list item, a heading, a quoted line or a blank line after the marker: not its
+            // wrapped text.
+            "-\n- item",
+            // A setext heading's underline.
+            "Heading\n-\ntext",
+            "-\n# Heading",
+            "> -\n> quoted",
+            "-\n\nparagraph",
+            "```\n-\ncode\n```",
+            "- item\n  more of the item",
+        ] {
+            let message = format!("Subject\n\n{body}");
+            assert_eq!(commit_body(&message).as_deref(), Some(body), "{body:?}");
+        }
+
+        let nested = "- outer\n  - first\n  -\n  https://example.com/nested";
+        let message = format!("Subject\n\n{nested}");
+        let body = commit_body(&message).expect("the message has a body");
+        assert_eq!(body, "- outer\n  - first\n  - https://example.com/nested");
+        assert_eq!(
+            list_items(&body),
+            ["outer", "first", "https://example.com/nested"]
+        );
+    }
+
+    #[test]
+    fn test_pull_request_description_list_of_links() {
+        let description = SharedString::from(
+            "## Links\n\n\
+             - https://example.com/pull/1#issuecomment-1\n\
+             - Passing run: https://example.com/runs/2\n",
+        );
+        let repo = ForgeRepo {
+            host: "github.com".into(),
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        assert_eq!(
+            list_items(&github_markdown(&description, &repo)),
+            [
+                "https://example.com/pull/1#issuecomment-1",
+                "Passing run: https://example.com/runs/2",
+            ]
+        );
     }
 }
