@@ -3742,6 +3742,28 @@ pub(crate) mod tests {
             };
             check_sides(cx);
 
+            // Collapsing and expanding it move the diff in the frame that draws the change,
+            // without waiting for the next input event to draw another one.
+            let header_top = |cx: &mut VisualTestContext| {
+                cx.debug_bounds("review-file-comment-docs/guide.md")
+                    .expect("the first file's header shows")
+                    .top()
+            };
+            let expanded_header_top = header_top(cx);
+            let disclosure = cx
+                .debug_bounds("review-pull-request-disclosure")
+                .expect("the disclosure shows");
+            cx.simulate_click(disclosure.center(), gpui::Modifiers::none());
+            let collapsed_header_top = header_top(cx);
+            assert!(collapsed_header_top < expanded_header_top);
+            draw(cx);
+            assert_eq!(header_top(cx), collapsed_header_top);
+            cx.dispatch_action(crate::ToggleHeader);
+            assert_eq!(header_top(cx), expanded_header_top);
+            draw(cx);
+            assert_eq!(header_top(cx), expanded_header_top);
+            check_sides(cx);
+
             cx.simulate_keystrokes("; c");
             cx.simulate_input("overall");
             let unsaved = |cx: &mut VisualTestContext| {

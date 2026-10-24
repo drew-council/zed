@@ -243,6 +243,9 @@ struct SplitBufferHeadersElement {
     lhs_editor: Entity<Editor>,
     rhs_editor: Entity<Editor>,
     style: EditorStyle,
+    global_id: Option<GlobalElementId>,
+    /// The full-width block, laid out before the two sides prepaint.
+    early_full_width_block: Option<AnyElement>,
 }
 
 impl SplitBufferHeadersElement {
@@ -251,8 +254,17 @@ impl SplitBufferHeadersElement {
             lhs_editor,
             rhs_editor,
             style,
+            global_id: None,
+            early_full_width_block: None,
         }
     }
+}
+
+/// Where the full-width block was laid out in the last frame.
+#[derive(Clone, Copy)]
+struct FullWidthBlockFrame {
+    available_width: Pixels,
+    visible_height: Pixels,
 }
 
 struct BufferHeaderLayout {
@@ -288,10 +300,10 @@ impl Element for SplitBufferHeadersElement {
 
     fn request_layout(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = gpui::Style::default();
         style.position = gpui::Position::Absolute;
@@ -299,7 +311,9 @@ impl Element for SplitBufferHeadersElement {
         style.inset.left = DefiniteLength::Fraction(0.0).into();
         style.size.width = Length::Definite(DefiniteLength::Fraction(1.0));
         style.size.height = Length::Definite(DefiniteLength::Fraction(1.0));
-        let layout_id = window.request_layout(style, [], _cx);
+        let layout_id = window.request_layout(style, [], cx);
+        self.global_id = id.cloned();
+        self.layout_full_width_block_early(window, cx);
         (layout_id, ())
     }
 
@@ -706,7 +720,7 @@ impl SplitBufferHeadersElement {
     /// over both sides, while it is in view or holds the focus (below the view then, as the
     /// editor does with a focused block, so that the focus stays), and measured at this width.
     fn build_full_width_block(
-        &self,
+        &mut self,
         snapshot: &EditorSnapshot,
         scroll_position: gpui::Point<ScrollOffset>,
         bounds: Bounds<Pixels>,
@@ -716,7 +730,17 @@ impl SplitBufferHeadersElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
+        let early_element = self.early_full_width_block.take();
         let custom_block_id = self.rhs_editor.read(cx).full_width_block?;
+        if let Some(global_id) = &self.global_id {
+            let frame = FullWidthBlockFrame {
+                available_width,
+                visible_height: bounds.size.height,
+            };
+            window.with_element_state(global_id, |_: Option<Option<FullWidthBlockFrame>>, _| {
+                ((), Some(frame))
+            });
+        }
         let block_id = BlockId::Custom(custom_block_id);
         // The right side, prepainted already, left its focused block for the next frame,
         // unless it is this one.
@@ -741,46 +765,19 @@ impl SplitBufferHeadersElement {
         if visible_row.is_none() && !has_focus {
             return None;
         }
-        let Some(Block::Custom(custom)) = snapshot.block_for_id(block_id) else {
+        let block = snapshot.block_for_id(block_id)?;
+        let Block::Custom(custom) = &block else {
             return None;
         };
 
-        let rem_size = window.rem_size();
-        let font_id = window.text_system().resolve_font(&self.style.text.font());
-        let font_size = self.style.text.font_size.to_pixels(rem_size);
-        let em_width = window
-            .text_system()
-            .em_width(font_id, font_size)
-            .unwrap_or_default();
-        let margins = EditorMargins::default();
-        let mut element = div()
-            .size_full()
-            .child(custom.render(&mut BlockContext {
-                window,
-                app: cx,
-                anchor_x: Pixels::ZERO,
-                max_width: available_width,
-                margins: &margins,
-                em_width,
-                line_height,
-                block_id,
-                height: custom.height.unwrap_or(1),
-                selected: false,
-                editor_style: &self.style,
-                indent_guide_padding: Pixels::ZERO,
-            }))
-            .into_any_element();
-
-        // Measured like the editor measures blocks: whole rows, at least one.
-        let content_size = element.layout_as_root(
-            size(
-                AvailableSpace::Definite(available_width),
-                AvailableSpace::MinContent,
-            ),
-            window,
-            cx,
-        );
-        let height_in_rows = ((content_size.height / line_height).ceil() as u32).max(1);
+        let mut element = match early_element {
+            Some(element) => element,
+            None => {
+                self.render_full_width_block(&block, available_width, line_height, window, cx)?
+            }
+        };
+        let height_in_rows =
+            Self::measure_full_width_block(&mut element, available_width, line_height, window, cx);
         if custom.height != Some(height_in_rows) {
             self.rhs_editor.update(cx, |editor, cx| {
                 editor.resize_blocks(
@@ -789,6 +786,10 @@ impl SplitBufferHeadersElement {
                     cx,
                 )
             });
+            // Both sides are prepainted already, with the block's previous height, and a
+            // notification during a draw doesn't schedule another one: without a new frame,
+            // the rows would only move at the next input event.
+            window.request_animation_frame();
         }
 
         let origin = match visible_row {
@@ -815,6 +816,146 @@ impl SplitBufferHeadersElement {
             });
         }
         Some(element)
+    }
+
+    /// Lays out the full-width block before the two sides prepaint (this element prepaints
+    /// after them), at the last frame's width, when it is in view at the current scroll
+    /// position: a change of its height (a section collapsed, a line typed into it) then
+    /// moves this frame's rows instead of the next frame's.
+    fn layout_full_width_block_early(&mut self, window: &mut Window, cx: &mut App) {
+        let Some(global_id) = self.global_id.clone() else {
+            return;
+        };
+        let Some(custom_block_id) = self.rhs_editor.read(cx).full_width_block else {
+            return;
+        };
+        let Some(frame) = window.with_element_state(
+            &global_id,
+            |frame: Option<Option<FullWidthBlockFrame>>, _| {
+                let frame = frame.flatten();
+                (frame, frame)
+            },
+        ) else {
+            return;
+        };
+        if frame.available_width <= Pixels::ZERO {
+            return;
+        }
+
+        let rem_size = self.rem_size();
+        let text_style = TextStyleRefinement {
+            font_size: Some(self.style.text.font_size),
+            line_height: Some(self.style.text.line_height),
+            ..Default::default()
+        };
+        let element = window.with_rem_size(rem_size, |window| {
+            window.with_text_style(Some(text_style), |window| {
+                let line_height = window.line_height();
+                let snapshot = self
+                    .rhs_editor
+                    .update(cx, |editor, cx| editor.snapshot(window, cx));
+                let scroll_top = snapshot.scroll_position().y;
+                let max_row = snapshot.max_point().row();
+                let start_row = cmp::min(DisplayRow(scroll_top.floor() as u32), max_row);
+                let end_row = cmp::min(
+                    (scroll_top + f64::from(frame.visible_height / line_height)).ceil() as u32,
+                    max_row.next_row().0,
+                );
+                let block_id = BlockId::Custom(custom_block_id);
+                snapshot
+                    .blocks_in_range(start_row..DisplayRow(end_row))
+                    .find(|(_, block)| block.id() == block_id)?;
+                let block = snapshot.block_for_id(block_id)?;
+                let Block::Custom(custom) = &block else {
+                    return None;
+                };
+                let mut element = self.render_full_width_block(
+                    &block,
+                    frame.available_width,
+                    line_height,
+                    window,
+                    cx,
+                )?;
+                let height_in_rows = Self::measure_full_width_block(
+                    &mut element,
+                    frame.available_width,
+                    line_height,
+                    window,
+                    cx,
+                );
+                if custom.height != Some(height_in_rows) {
+                    self.rhs_editor.update(cx, |editor, cx| {
+                        editor.resize_blocks(
+                            HashMap::from_iter([(custom_block_id, height_in_rows)]),
+                            None,
+                            cx,
+                        )
+                    });
+                }
+                Some(element)
+            })
+        });
+        self.early_full_width_block = element;
+    }
+
+    fn render_full_width_block(
+        &self,
+        block: &Block,
+        available_width: Pixels,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let Block::Custom(custom) = block else {
+            return None;
+        };
+        let rem_size = window.rem_size();
+        let font_id = window.text_system().resolve_font(&self.style.text.font());
+        let font_size = self.style.text.font_size.to_pixels(rem_size);
+        let em_width = window
+            .text_system()
+            .em_width(font_id, font_size)
+            .unwrap_or_default();
+        let margins = EditorMargins::default();
+        Some(
+            div()
+                .size_full()
+                .child(custom.render(&mut BlockContext {
+                    window,
+                    app: cx,
+                    anchor_x: Pixels::ZERO,
+                    max_width: available_width,
+                    margins: &margins,
+                    em_width,
+                    line_height,
+                    block_id: block.id(),
+                    height: custom.height.unwrap_or(1),
+                    selected: false,
+                    editor_style: &self.style,
+                    indent_guide_padding: Pixels::ZERO,
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The block's height in rows, measured like the editor measures blocks: whole rows, at
+    /// least one.
+    fn measure_full_width_block(
+        element: &mut AnyElement,
+        available_width: Pixels,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> u32 {
+        let content_size = element.layout_as_root(
+            size(
+                AvailableSpace::Definite(available_width),
+                AvailableSpace::MinContent,
+            ),
+            window,
+            cx,
+        );
+        ((content_size.height / line_height).ceil() as u32).max(1)
     }
 
     fn prepaint_header(

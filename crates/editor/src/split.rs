@@ -6657,6 +6657,110 @@ mod tests {
         assert!(widths.lock()[0] > px(1800.));
     }
 
+    /// The split view measures the full-width block after both sides are prepainted, so it
+    /// lays the block out ahead of them: a frame that changes the block's height (a section
+    /// collapsed) lays both sides' rows out with the new height, not only the next frame,
+    /// which nothing may schedule.
+    #[gpui::test]
+    async fn test_full_width_block_resizes_rows_in_the_same_frame(cx: &mut gpui::TestAppContext) {
+        use crate::display_map::DisplayRow;
+        use gpui::Styled as _;
+        use parking_lot::Mutex;
+        use rope::Point;
+
+        let (editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+        let base_text = (0..80)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let (buffer, diff) = buffer_with_diff(&base_text, &format!("added\n{base_text}"), &mut cx);
+        editor.update(cx, |editor, cx| {
+            editor.update_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer.clone(),
+                vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                0,
+                diff.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let content_rows = Arc::new(Mutex::new(3.));
+        let renders = Arc::new(Mutex::new(0));
+        let rhs_editor = editor.read_with(cx, |editor, _| editor.rhs_editor.clone());
+        rhs_editor.update(cx, |rhs_editor, cx| {
+            let content_rows = content_rows.clone();
+            let renders = renders.clone();
+            let block_id = rhs_editor.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Above(multi_buffer::Anchor::Min),
+                    height: Some(1),
+                    style: BlockStyle::Sticky,
+                    render: Arc::new(move |cx| {
+                        *renders.lock() += 1;
+                        div()
+                            .w_full()
+                            .h(cx.line_height * *content_rows.lock())
+                            .into_any()
+                    }),
+                    priority: 0,
+                }],
+                None,
+                cx,
+            )[0];
+            rhs_editor.set_full_width_block(Some(block_id), cx);
+        });
+        let lhs_editor =
+            editor.read_with(cx, |editor, _| editor.lhs.as_ref().unwrap().editor.clone());
+        let workspace = cx.update(|window, cx| {
+            window
+                .root::<MultiWorkspace>()
+                .flatten()
+                .unwrap()
+                .read(cx)
+                .workspace()
+                .clone()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+        });
+        cx.simulate_resize(gpui::size(px(2000.), px(500.)));
+        let draw = |cx: &mut VisualTestContext| {
+            *renders.lock() = 0;
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        };
+        // The height of the first block in the rows each side laid out in the last frame.
+        let drawn_heights = |cx: &mut VisualTestContext| {
+            [&rhs_editor, &lhs_editor].map(|side| {
+                side.read_with(cx, |side, _| {
+                    let position_map = side.last_position_map.clone().unwrap();
+                    let (row, block) = position_map
+                        .snapshot
+                        .blocks_in_range(DisplayRow(0)..DisplayRow(1))
+                        .next()
+                        .unwrap();
+                    assert_eq!(row, DisplayRow(0));
+                    block.height()
+                })
+            })
+        };
+
+        cx.run_until_parked();
+        draw(&mut cx);
+        draw(&mut cx);
+        assert_eq!(drawn_heights(&mut cx), [3, 3]);
+
+        for rows in [10., 2., 5.] {
+            *content_rows.lock() = rows;
+            draw(&mut cx);
+            assert_eq!(drawn_heights(&mut cx), [rows as u32; 2]);
+            assert_eq!(*renders.lock(), 1, "rendered once per frame");
+        }
+    }
+
     #[gpui::test]
     async fn test_act_as_type(cx: &mut gpui::TestAppContext) {
         let (splittable_editor, cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
