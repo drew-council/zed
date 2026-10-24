@@ -6,9 +6,9 @@ use crate::{
     checkout::{self, CheckoutStep, canonical_source, plan_checkout, run_checkout},
     comments::{CommentId, CommentTarget, Side},
     forge::{
-        self, CommentableLines, DiffSide, Forge, ForgeRepoRef, GitHubError, PullRequestDetails,
-        RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewEvent, ReviewSubmission,
-        SubmitAttempt, SubmittedReview, ThreadAnchor,
+        self, CommentableLines, DiffSide, Forge, ForgeRepoRef, GitHubError, LinesRefusal,
+        PullRequestDetails, RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewEvent,
+        ReviewSubmission, SubmitAttempt, SubmittedReview, ThreadAnchor,
     },
     github::{self, GitHubRemote},
     session::{ReviewKey, ReviewOutcome, ReviewSession},
@@ -1250,7 +1250,7 @@ fn comment_side(side: DiffSide) -> Side {
     }
 }
 
-fn diff_side(side: Side) -> DiffSide {
+pub(crate) fn diff_side(side: Side) -> DiffSide {
     match side {
         Side::Old => DiffSide::Left,
         Side::New => DiffSide::Right,
@@ -1258,7 +1258,7 @@ fn diff_side(side: Side) -> DiffSide {
 }
 
 /// Whether GitHub takes a comment on `target`, by its diff: lines (old ones on the left side)
-/// inside its hunks, a range whose start comes before its end there, files of the pull request.
+/// inside one of its hunks ([`check_lines`]), files of the pull request.
 pub(crate) fn check_comment_target(
     commentable: &CommentableLines,
     target: &CommentTarget,
@@ -1288,11 +1288,29 @@ pub(crate) fn check_comment_target(
     }
     let (side, lines) = lines;
     let side = diff_side(side);
-    if commentable.allows_range(path, (side, *lines.start()), (side, *lines.end())) {
-        Ok(())
-    } else {
-        Err("GitHub only accepts comments within its diff hunks".into())
-    }
+    commentable
+        .check_range(path, (side, *lines.start()), (side, *lines.end()))
+        .map_err(|refusal| {
+            match refusal {
+                LinesRefusal::Outside => "GitHub only accepts comments within its diff hunks",
+                LinesRefusal::StartOutside => {
+                    "The selection starts outside GitHub's diff hunks, and GitHub only accepts \
+                     comments within them"
+                }
+                LinesRefusal::EndOutside => {
+                    "The selection ends outside GitHub's diff hunks, and GitHub only accepts \
+                     comments within them"
+                }
+                LinesRefusal::AcrossHunks => {
+                    "The selection spans two of GitHub's diff hunks: a comment's lines must be \
+                     in one hunk"
+                }
+                LinesRefusal::Reversed => {
+                    "The selection's start comes after its end in GitHub's diff"
+                }
+            }
+            .into()
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2081,9 +2099,35 @@ pub(crate) mod tests {
             outside
         );
         assert_eq!(check(&lines("src/engine.rs", Side::Old, 193..=193)), Ok(()));
-        // Ranges may span hunks, but not start after their end.
-        assert_eq!(check(&lines("src/engine.rs", Side::New, 2..=13)), Ok(()));
-        assert_eq!(check(&lines("src/engine.rs", Side::New, 2..=10)), outside);
+        // A range stays in one of GitHub's hunks (`+1,7` and `+12,7` here), which may hold
+        // unchanged lines only.
+        assert_eq!(check(&lines("src/engine.rs", Side::New, 2..=7)), Ok(()));
+        assert_eq!(check(&lines("src/engine.rs", Side::New, 5..=7)), Ok(()));
+        assert_eq!(
+            check(&lines("src/engine.rs", Side::New, 2..=13)),
+            Err(
+                "The selection spans two of GitHub's diff hunks: a comment's lines must be in one \
+                 hunk"
+                    .into()
+            )
+        );
+        assert_eq!(
+            check(&lines("src/engine.rs", Side::New, 2..=10)),
+            Err(
+                "The selection ends outside GitHub's diff hunks, and GitHub only accepts \
+                 comments within them"
+                    .into()
+            )
+        );
+        assert_eq!(
+            check(&lines("src/engine.rs", Side::New, 9..=13)),
+            Err(
+                "The selection starts outside GitHub's diff hunks, and GitHub only accepts \
+                 comments within them"
+                    .into()
+            )
+        );
+        assert_eq!(check(&lines("src/engine.rs", Side::New, 8..=11)), outside);
         // The renamed file's old lines, under its old path.
         assert_eq!(check(&lines("src/format.rs", Side::Old, 18..=18)), Ok(()));
         // Files.
@@ -2121,9 +2165,9 @@ pub(crate) mod tests {
                 },
             },
             test_support::{
-                C1, active_review, commit_data, cursor_line, dispatch, dot_git, init_vim_test,
-                insert_commit_ref, lhs_editor, move_to_row_with_text, open_workspace,
-                path_at_cursor, rhs_editor, row_text, splittable,
+                C1, active_review, commit_data, cursor_line, cursor_point, dispatch, dot_git,
+                init_vim_test, insert_commit_ref, lhs_editor, move_to_row_with_text,
+                open_workspace, path_at_cursor, rhs_editor, row_text, splittable,
             },
             top_block::TopBlockContent,
             view::PanelCommentKey,
@@ -2757,6 +2801,71 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(markdown.contains("src/engine.rs:59"));
             assert!(!markdown.contains("Splitting on"));
+        }
+
+        /// A selection is checked as a whole: one across two of GitHub's hunks is refused (its
+        /// "+" disabled with the reason, `c` with a toast), one of unchanged lines inside a hunk
+        /// takes the comment, as GitHub does.
+        #[gpui::test]
+        async fn test_range_comments_follow_the_comment_gate(cx: &mut TestAppContext) {
+            let (_fs, workspace, review, _requests, cx) =
+                open_pull_request_review(DiffViewStyle::Unified, Default::default(), cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let refused_plus = |row: u32, cx: &mut VisualTestContext| {
+                draw(cx);
+                let row = display_row(&rhs, row, cx);
+                cx.debug_bounds(format!("review-gutter-comment-refused-rhs-{row}").leak())
+                    .is_some()
+            };
+            let comment_count = |cx: &mut VisualTestContext| {
+                review.read_with(cx, |review, cx| {
+                    review.session().read(cx).comments().iter().count()
+                })
+            };
+            notification_count(&workspace, cx);
+
+            // R59 is in GitHub's hunk `+48,19`, R134 in `+130,20`.
+            move_to_row_with_text(&rhs, "ENGINE 59", cx);
+            cx.simulate_keystrokes("shift-v");
+            for _ in 0..30 {
+                if cursor_line(&rhs, cx) == "ENGINE 134" {
+                    break;
+                }
+                cx.simulate_keystrokes("j");
+            }
+            assert_eq!(cursor_line(&rhs, cx), "ENGINE 134");
+            let end = cursor_point(&rhs, cx).row;
+            assert!(refused_plus(end, cx), "the selection's \"+\" is disabled");
+            let blocks = review.read_with(cx, |review, _| review.comments().clone());
+            assert_eq!(
+                cx.update(|_, cx| {
+                    let target =
+                        blocks.update(cx, |blocks, cx| blocks.line_comment_target(&rhs, cx));
+                    blocks.read(cx).refusal(&target.unwrap(), cx)
+                })
+                .as_deref(),
+                Some(
+                    "The selection spans two of GitHub's diff hunks: a comment's lines must be \
+                     in one hunk"
+                )
+            );
+            cx.simulate_keystrokes("c");
+            cx.run_until_parked();
+            assert!(!has_open_comment_editor(&review, cx));
+            assert_eq!(comment_count(cx), 0);
+            assert_eq!(notification_count(&workspace, cx), 1);
+
+            // Unchanged lines inside one hunk.
+            move_to_row_with_text(&rhs, "engine 57", cx);
+            cx.simulate_keystrokes("shift-v j");
+            assert!(!refused_plus(cursor_point(&rhs, cx).row, cx));
+            cx.simulate_keystrokes("c");
+            cx.run_until_parked();
+            assert!(has_open_comment_editor(&review, cx));
+            cx.simulate_input("context");
+            cx.simulate_keystrokes("ctrl-enter");
+            assert_eq!(comment_count(cx), 1);
+            assert_eq!(notification_count(&workspace, cx), 0);
         }
 
         /// The gutter's "+" follows GitHub's comment gate: on a row it refuses, it's disabled,

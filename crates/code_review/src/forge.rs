@@ -289,7 +289,74 @@ pub struct HunkRows {
     pub len: u32,
 }
 
+/// How many unchanged lines `git diff` (and GitHub) shows around each change.
+pub const DIFF_CONTEXT_LINES: u32 = 3;
+
 impl Hunk {
+    /// The hunks `git diff` shows for `changes` (each change's old and new lines, in order) in
+    /// files of `old_len` and `new_len` lines: each change with `context` unchanged lines around
+    /// it, merged when their context lines would touch.
+    pub fn with_context(
+        changes: &[(Range<u32>, Range<u32>)],
+        context: u32,
+        old_len: u32,
+        new_len: u32,
+    ) -> Vec<Hunk> {
+        changes
+            .chunk_by(|previous, next| {
+                next.1.start.saturating_sub(previous.1.end) <= context.saturating_mul(2)
+            })
+            .filter_map(|changes| {
+                let (first, last) = (changes.first()?, changes.last()?);
+                let before = context
+                    .min(first.0.start.saturating_sub(1))
+                    .min(first.1.start.saturating_sub(1));
+                let after = context
+                    .min((old_len + 1).saturating_sub(last.0.end))
+                    .min((new_len + 1).saturating_sub(last.1.end));
+                let old = first.0.start - before..last.0.end + after;
+                let new = first.1.start - before..last.1.end + after;
+                let mut rows = Vec::new();
+                let mut push = |kind, old_start, new_start, len| {
+                    if len > 0 {
+                        rows.push(HunkRows {
+                            kind,
+                            old_start,
+                            new_start,
+                            len,
+                        });
+                    }
+                };
+                push(HunkRowKind::Context, old.start, new.start, before);
+                for (index, (old_lines, new_lines)) in changes.iter().enumerate() {
+                    push(
+                        HunkRowKind::Deleted,
+                        old_lines.start,
+                        new_lines.start,
+                        old_lines.end.saturating_sub(old_lines.start),
+                    );
+                    push(
+                        HunkRowKind::Added,
+                        old_lines.end,
+                        new_lines.start,
+                        new_lines.end.saturating_sub(new_lines.start),
+                    );
+                    let unchanged = match changes.get(index + 1) {
+                        Some((next_old, _)) => next_old.start.saturating_sub(old_lines.end),
+                        None => after,
+                    };
+                    push(
+                        HunkRowKind::Context,
+                        old_lines.end,
+                        new_lines.end,
+                        unchanged,
+                    );
+                }
+                Some(Hunk { old, new, rows })
+            })
+            .collect()
+    }
+
     fn contains(&self, side: DiffSide, line: u32) -> bool {
         match side {
             DiffSide::Left => self.old.contains(&line),
@@ -335,24 +402,62 @@ pub struct ChangedFile {
 }
 
 impl ChangedFile {
-    /// Where the row is in the diff: its hunk, then its index in the hunk. `None` outside the
-    /// hunks.
     fn diff_position(&self, side: DiffSide, line: u32) -> Option<(usize, u32)> {
-        let hunks = self.hunks.as_ref()?;
-        hunks.iter().enumerate().find_map(|(hunk_index, hunk)| {
-            if !hunk.contains(side, line) {
-                return None;
+        diff_position(self.hunks.as_ref()?, side, line)
+    }
+}
+
+/// Where the row is in the diff: its hunk, then its index in the hunk. `None` outside the hunks.
+fn diff_position(hunks: &[Hunk], side: DiffSide, line: u32) -> Option<(usize, u32)> {
+    hunks.iter().enumerate().find_map(|(hunk_index, hunk)| {
+        if !hunk.contains(side, line) {
+            return None;
+        }
+        // Without the hunk's rows (a patch cut short), deleted rows come before added ones,
+        // which is right for a hunk with one change.
+        let row = hunk.row_index(side, line).unwrap_or(match side {
+            DiffSide::Left => line - hunk.old.start,
+            DiffSide::Right => {
+                (line - hunk.new.start).saturating_add(hunk.old.end - hunk.old.start)
             }
-            // Without the hunk's rows (a patch cut short), deleted rows come before added
-            // ones, which is right for a hunk with one change.
-            let row = hunk.row_index(side, line).unwrap_or(match side {
-                DiffSide::Left => line - hunk.old.start,
-                DiffSide::Right => {
-                    (line - hunk.new.start).saturating_add(hunk.old.end - hunk.old.start)
-                }
-            });
-            Some((hunk_index, row))
-        })
+        });
+        Some((hunk_index, row))
+    })
+}
+
+/// Why lines of a diff can't get a comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinesRefusal {
+    /// The line (or both ends of the range) is outside the diff's hunks.
+    Outside,
+    StartOutside,
+    EndOutside,
+    /// The range's ends are in different hunks, so it spans unchanged lines the diff hides.
+    AcrossHunks,
+    /// The range's start comes after its end in the diff.
+    Reversed,
+}
+
+/// Whether lines from `start` to `end` can get a comment in a diff of `hunks`: both ends inside
+/// the same hunk, the start not after the end. GitHub's API takes a range across hunks too (LV
+/// §5.2), but such a range covers unchanged lines the diff doesn't show, so reviews refuse it.
+pub fn check_lines(
+    hunks: &[Hunk],
+    start: (DiffSide, u32),
+    end: (DiffSide, u32),
+) -> Result<(), LinesRefusal> {
+    match (
+        diff_position(hunks, start.0, start.1),
+        diff_position(hunks, end.0, end.1),
+    ) {
+        (None, None) => Err(LinesRefusal::Outside),
+        (None, Some(_)) => Err(LinesRefusal::StartOutside),
+        (Some(_), None) => Err(LinesRefusal::EndOutside),
+        (Some(start), Some(end)) if start > end => Err(LinesRefusal::Reversed),
+        (Some((start_hunk, _)), Some((end_hunk, _))) if start_hunk != end_hunk => {
+            Err(LinesRefusal::AcrossHunks)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -428,6 +533,21 @@ impl CommentableLines {
             (Some(start), Some(end)) => start <= end,
             _ => false,
         }
+    }
+
+    /// Whether a new comment can span from `start` to `end` ([`check_lines`]). Stricter than
+    /// [`Self::allows_range`], which places existing threads.
+    pub fn check_range(
+        &self,
+        path: &str,
+        start: (DiffSide, u32),
+        end: (DiffSide, u32),
+    ) -> Result<(), LinesRefusal> {
+        let hunks = self
+            .file(path)
+            .and_then(|file| file.hunks.as_deref())
+            .unwrap_or_default();
+        check_lines(hunks, start, end)
     }
 
     /// The path a comment on `path` is submitted with: a renamed file's new path. Comments on the
@@ -619,4 +739,104 @@ pub fn show_error_toast(
 /// Hides the toast of [`show_error_toast`], once what failed has worked.
 pub fn dismiss_error_toast(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
     workspace.dismiss_toast(&NotificationId::unique::<ForgeErrorToast>(), cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(kind: HunkRowKind, old_start: u32, new_start: u32, len: u32) -> HunkRows {
+        HunkRows {
+            kind,
+            old_start,
+            new_start,
+            len,
+        }
+    }
+
+    #[test]
+    fn test_hunks_with_context() {
+        use HunkRowKind::{Added, Context, Deleted};
+
+        // 40 lines; line 2 replaced, one line inserted before old line 35, old line 38 deleted.
+        let changes = [(2..3, 2..3), (35..35, 35..36), (38..39, 39..39)];
+        assert_eq!(
+            Hunk::with_context(&changes, 3, 40, 40),
+            [
+                Hunk {
+                    old: 1..6,
+                    new: 1..6,
+                    rows: vec![
+                        rows(Context, 1, 1, 1),
+                        rows(Deleted, 2, 2, 1),
+                        rows(Added, 3, 2, 1),
+                        rows(Context, 3, 3, 3),
+                    ],
+                },
+                // Three unchanged lines between two changes: one hunk, as in `git diff`.
+                Hunk {
+                    old: 32..41,
+                    new: 32..41,
+                    rows: vec![
+                        rows(Context, 32, 32, 3),
+                        rows(Added, 35, 35, 1),
+                        rows(Context, 35, 36, 3),
+                        rows(Deleted, 38, 39, 1),
+                        rows(Context, 39, 39, 2),
+                    ],
+                },
+            ]
+        );
+        // Seven unchanged lines between changes keep them apart; six don't.
+        assert_eq!(
+            Hunk::with_context(&[(5..6, 5..6), (13..14, 13..14)], 3, 20, 20).len(),
+            2
+        );
+        assert_eq!(
+            Hunk::with_context(&[(5..6, 5..6), (12..13, 12..13)], 3, 20, 20).len(),
+            1
+        );
+        // A new file: everything is one hunk without context.
+        assert_eq!(
+            Hunk::with_context(&[(1..1, 1..4)], 3, 0, 3),
+            [Hunk {
+                old: 1..1,
+                new: 1..4,
+                rows: vec![rows(Added, 1, 1, 3)],
+            }]
+        );
+        assert!(Hunk::with_context(&[], 3, 10, 10).is_empty());
+    }
+
+    #[test]
+    fn test_check_lines() {
+        use DiffSide::{Left, Right};
+
+        // Lines 2 and 35 of 40 changed: hunks over lines 1–5 and 32–38 on both sides.
+        let hunks = Hunk::with_context(&[(2..3, 2..3), (35..36, 35..36)], 3, 40, 40);
+        let check = |start, end| check_lines(&hunks, start, end);
+        assert_eq!(check((Right, 2), (Right, 2)), Ok(()));
+        // Unchanged lines inside a hunk take comments, as on GitHub.
+        assert_eq!(check((Right, 3), (Right, 5)), Ok(()));
+        assert_eq!(check((Left, 1), (Left, 5)), Ok(()));
+        assert_eq!(check((Right, 6), (Right, 6)), Err(LinesRefusal::Outside));
+        assert_eq!(check((Right, 8), (Right, 12)), Err(LinesRefusal::Outside));
+        assert_eq!(check((Right, 4), (Right, 8)), Err(LinesRefusal::EndOutside));
+        assert_eq!(
+            check((Right, 30), (Right, 33)),
+            Err(LinesRefusal::StartOutside)
+        );
+        assert_eq!(
+            check((Right, 3), (Right, 33)),
+            Err(LinesRefusal::AcrossHunks)
+        );
+        assert_eq!(check((Right, 5), (Right, 3)), Err(LinesRefusal::Reversed));
+        // An old line comes before the new line that replaced it, not after.
+        assert_eq!(check((Left, 2), (Right, 2)), Ok(()));
+        assert_eq!(check((Right, 2), (Left, 2)), Err(LinesRefusal::Reversed));
+        assert_eq!(
+            check_lines(&[], (Right, 1), (Right, 1)),
+            Err(LinesRefusal::Outside)
+        );
+    }
 }

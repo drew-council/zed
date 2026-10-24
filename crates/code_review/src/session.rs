@@ -3,6 +3,7 @@ use crate::{
         Comment, CommentEvent, CommentId, CommentState, CommentStore, CommentTarget, CommentType,
         NewComment,
     },
+    forge::{DIFF_CONTEXT_LINES, Hunk},
     persistence::{CodeReviewDb, StoredReview},
 };
 use anyhow::Context as _;
@@ -733,6 +734,41 @@ pub(crate) fn file_digest(diff: &BufferDiffSnapshot, buffer: &BufferSnapshot) ->
         content_hash: content_hash.0,
         hunks,
     }
+}
+
+/// The hunks of a file's diff as `git diff` shows them: each change with its unchanged lines
+/// around it. Lines are 1-based, old ones in the diff's base.
+pub(crate) fn diff_hunks(diff: &BufferDiffSnapshot, buffer: &BufferSnapshot) -> Vec<Hunk> {
+    let base_text = diff.base_text();
+    let changes = diff
+        .hunks_intersecting_range(Anchor::min_max_range_for_buffer(buffer.remote_id()), buffer)
+        .map(|hunk| {
+            let old_start = base_text.offset_to_point(hunk.diff_base_byte_range.start);
+            let old_end = base_text.offset_to_point(hunk.diff_base_byte_range.end);
+            let old_count = line_count(old_start.row, old_end.row, old_end.column);
+            let new_count = line_count(
+                hunk.range.start.row,
+                hunk.range.end.row,
+                hunk.range.end.column,
+            );
+            let old_start = old_start.row + 1;
+            let new_start = hunk.range.start.row + 1;
+            (
+                old_start..old_start + old_count,
+                new_start..new_start + new_count,
+            )
+        })
+        .collect::<Vec<_>>();
+    let lines_of = |text: &BufferSnapshot| {
+        let end = text.max_point();
+        line_count(0, end.row, end.column)
+    };
+    Hunk::with_context(
+        &changes,
+        DIFF_CONTEXT_LINES,
+        lines_of(base_text),
+        lines_of(buffer),
+    )
 }
 
 /// The lines a range of rows covers; a range ending in column 0 doesn't cover that row.

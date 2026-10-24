@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     diff::{ReviewDiff, file_header_row, file_start_autoscroll, review_path_key},
+    forge::LinesRefusal,
     line_cursor::selected_rows,
     session::{ReviewSession, ReviewSessionEvent},
 };
@@ -76,8 +77,9 @@ pub(crate) struct CommentBlocks {
     /// the cursor stays on it.
     selected: Option<ItemKey>,
     targeted: Option<ItemKey>,
-    /// Refuses comments the review can't take (a pull request review: lines outside GitHub's
-    /// diff, or lines this tab's checkout numbers differently).
+    /// Refuses comments a pull request review can't take (lines outside GitHub's diff, or lines
+    /// this tab's checkout numbers differently). Without one, the review's own diff decides
+    /// ([`Self::check`]).
     gate: Option<CommentGate>,
     focus_guard: Option<Subscription>,
     /// The block showing the review's overview at the top of the right side, with the
@@ -355,6 +357,44 @@ impl CommentBlocks {
 
     pub(crate) fn set_gate(&mut self, gate: Option<CommentGate>) {
         self.gate = gate;
+    }
+
+    /// Whether the review takes a comment on `target`: a pull request's by its gate (GitHub's
+    /// rules), a local review's when its lines are in one of the diff's hunks.
+    pub(crate) fn check(&self, target: &CommentTarget, cx: &App) -> Result<(), SharedString> {
+        if let Some(gate) = &self.gate {
+            return gate(target, cx);
+        }
+        let CommentTarget::Lines { path, side, lines } = target else {
+            return Ok(());
+        };
+        self.diff
+            .read(cx)
+            .check_lines(path, *side, lines, cx)
+            .map_err(|refusal| {
+                match refusal {
+                    LinesRefusal::Outside => {
+                        "Comments go on lines of the diff's hunks: changed lines and the 3 lines \
+                         around them"
+                    }
+                    LinesRefusal::StartOutside => {
+                        "The selection starts outside the diff's hunks: comments go on changed \
+                         lines and the 3 lines around them"
+                    }
+                    LinesRefusal::EndOutside => {
+                        "The selection ends outside the diff's hunks: comments go on changed \
+                         lines and the 3 lines around them"
+                    }
+                    LinesRefusal::AcrossHunks => {
+                        "The selection spans two hunks of the diff: a comment's lines must be in \
+                         one hunk"
+                    }
+                    LinesRefusal::Reversed => {
+                        "The selection's start comes after its end in the diff"
+                    }
+                }
+                .into()
+            })
     }
 
     fn handle_session_event(
@@ -1289,9 +1329,7 @@ impl CommentBlocks {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(gate) = &self.gate
-            && let Err(reason) = gate(&new_comment.target, cx)
-        {
+        if let Err(reason) = self.check(&new_comment.target, cx) {
             self.show_toast(reason, cx);
             return;
         }
@@ -2673,8 +2711,7 @@ fn facing_row(from: &Entity<Editor>, row: u32, to: &Entity<Editor>, cx: &mut App
 }
 
 /// The lines `c` comments on (or visual `y` copies), on the side of the diff `editor` shows:
-/// `rows` (multibuffer rows), or the selection's. A selection over the removed and added lines
-/// of a unified diff takes the added ones.
+/// `rows` (multibuffer rows), or the selection's ([`lines_in_rows`]).
 fn selected_lines(
     editor: &mut Editor,
     rows: Option<RangeInclusive<u32>>,
@@ -2704,6 +2741,17 @@ fn selected_lines(
         return Some(SelectedLines::FoldedFile(head_anchor.buffer_id));
     }
     let rows = rows.unwrap_or_else(|| selected_rows(editor, &display_snapshot));
+    lines_in_rows(snapshot, rows, is_lhs)
+}
+
+/// The lines of one file that `rows` (multibuffer rows of a side of the diff) cover: those of
+/// the file at the last row. A selection over the removed and added lines of a unified diff
+/// takes the added ones.
+fn lines_in_rows(
+    snapshot: &MultiBufferSnapshot,
+    rows: RangeInclusive<u32>,
+    is_lhs: bool,
+) -> Option<SelectedLines> {
     let row_infos = snapshot
         .row_infos(MultiBufferRow(*rows.start()))
         .take(rows.clone().count())
@@ -4837,6 +4885,112 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         draw(cx);
         let bounds = plus_button(is_lhs, row, false, cx).expect("the cursor row has a \"+\"");
         (bounds, row)
+    }
+
+    /// A local review takes line comments inside the hunks `git diff` shows (changed lines and
+    /// the 3 lines around them), like tuicr: a range of unchanged lines outside them, or across
+    /// two hunks, is refused with a toast, and the "+" at such a selection is disabled.
+    #[gpui::test]
+    async fn test_line_comments_stay_in_the_diffs_hunks(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let blocks = blocks(&review, cx);
+        let check = |target: CommentTarget, cx: &mut VisualTestContext| {
+            blocks.read_with(cx, |blocks, cx| blocks.check(&target, cx))
+        };
+        let toasts = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let ids = workspace.notification_ids();
+                for id in &ids {
+                    workspace.dismiss_notification(id, cx);
+                }
+                ids.len()
+            })
+        };
+        let across: Result<(), SharedString> = Err(
+            "The selection spans two hunks of the diff: a comment's lines must be in one hunk"
+                .into(),
+        );
+
+        // a.rs: lines 2 and 35 of 40 changed, so its hunks are lines 1–5 and 32–38.
+        assert_eq!(check(lines("a.rs", 1..=5), cx), Ok(()));
+        assert_eq!(check(lines("a.rs", 4..=5), cx), Ok(()));
+        assert_eq!(check(old_lines("a.rs", 1..=5), cx), Ok(()));
+        assert_eq!(check(lines("a.rs", 32..=38), cx), Ok(()));
+        assert_eq!(
+            check(lines("a.rs", 10..=12), cx),
+            Err(
+                "Comments go on lines of the diff's hunks: changed lines and the 3 lines around \
+                 them"
+                    .into()
+            )
+        );
+        assert_eq!(
+            check(lines("a.rs", 4..=7), cx),
+            Err(
+                "The selection ends outside the diff's hunks: comments go on changed lines and \
+                 the 3 lines around them"
+                    .into()
+            )
+        );
+        assert_eq!(
+            check(lines("a.rs", 30..=33), cx),
+            Err(
+                "The selection starts outside the diff's hunks: comments go on changed lines and \
+                 the 3 lines around them"
+                    .into()
+            )
+        );
+        assert_eq!(check(lines("a.rs", 3..=33), cx), across);
+        assert_eq!(check(lines("added.txt", 1..=2), cx), Ok(()));
+        assert_eq!(check(old_lines("deleted.txt", 1..=2), cx), Ok(()));
+        assert_eq!(
+            check(
+                CommentTarget::File {
+                    path: RepoPath::new("a.rs").unwrap()
+                },
+                cx
+            ),
+            Ok(())
+        );
+
+        // A visual selection from the first hunk into the second.
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("shift-v");
+        for _ in 0..20 {
+            if cursor_line(&rhs, cx) == "line 34" {
+                break;
+            }
+            cx.simulate_keystrokes("j");
+        }
+        assert_eq!(cursor_line(&rhs, cx), "line 34");
+        let end = display_row(&rhs, cursor_point(&rhs, cx).row, cx);
+        draw(cx);
+        assert!(plus_button(false, end, true, cx).is_some());
+        assert!(plus_button(false, end, false, cx).is_none());
+        cx.simulate_keystrokes("c");
+        cx.run_until_parked();
+        assert!(open_editor(&review, cx).is_none());
+        assert!(comment_ids(&review, cx).is_empty());
+        assert_eq!(toasts(cx), 1);
+
+        // Unchanged lines inside a hunk take the comment.
+        move_to_row_with_text(&rhs, "line 33", cx);
+        cx.simulate_keystrokes("shift-v j");
+        let end = display_row(&rhs, cursor_point(&rhs, cx).row, cx);
+        draw(cx);
+        assert!(plus_button(false, end, false, cx).is_some());
+        cx.simulate_keystrokes("c");
+        cx.run_until_parked();
+        assert!(open_editor(&review, cx).is_some());
+        cx.simulate_input("context");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!(
+            comments(&review, cx),
+            [(lines("a.rs", 33..=34), "context".to_string(), None)]
+        );
+        assert_eq!(toasts(cx), 0);
     }
 
     /// A click on a line number moves the line cursor there instead of opening the file (a

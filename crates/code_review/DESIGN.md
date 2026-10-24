@@ -685,9 +685,10 @@ state dir):**
   range on that side (context rows on both); no `patch` → no lines (file comments only).
   `allows_range` = both ends allowed and the start not after the end **in the patch's row order**
   (a hunk with several changes interleaves deletions and additions, so "deletions first" isn't
-  enough); ranges may span hunks. Paths: a renamed file is found by its old path too;
-  `current_path` gives the new path for submit. `contains_file` is true for files of the PR, and for
-  any file when the list is `truncated` (they might be in the PR; lines stay refused).
+  enough); ranges may span hunks (new comments may not: bugs 2 item 1). Paths: a renamed file is
+  found by its old path too; `current_path` gives the new path for submit. `contains_file` is true
+  for files of the PR, and for any file when the list is `truncated` (they might be in the PR;
+  lines stay refused).
 - **Errors** (`GitHubError::hint`, LV §5.6 wording verbatim): 401 → Auth (token revoked); 403/429
   with `x-ratelimit-remaining: 0`, `retry-after` or a "rate limit" message → `RateLimited { reset }`
   ("Try again in N minutes"); 403 with `X-GitHub-SSO` → `Sso { url }`; other 403 → `Forbidden`; 404
@@ -2039,6 +2040,13 @@ open. Upstream edits: the settings block only (§3.10).
   (author:drew-council OR label:nonexistent)` narrows to #16 and #1, the panel's empty-state button
   and the header's "+" menu open it; confirming starts the usual checkout (the harness's git fetch
   asked for credentials and was cancelled).
+
+**Bugs 2, item 1 (comments stay in the diff's hunks)** — every line or range comment, from any
+path, must have both ends in one hunk (`forge::check_lines`, checked by `CommentBlocks::check`; the
+"+" on a selection checks the whole selection). **Decisions**: a new range across hunks is refused
+although GitHub's API takes it (LV L8; existing threads still may); local reviews use the hunks
+`git diff` would show (3 context lines, `Hunk::with_context`), like tuicr, so expanded context rows
+are refused there too. Refusals are toasts or disabled entries with the reason.
 
 **Known issues / notes for the next slices:**
 

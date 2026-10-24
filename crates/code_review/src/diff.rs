@@ -1,8 +1,11 @@
 use crate::{
     ReviewView,
+    comments::Side,
     commits::{CommitDiffList, check_branch_base},
+    forge::{LinesRefusal, check_lines},
+    pull_request::diff_side,
     reviewed::{ReviewHunkRenderer, render_file_checkbox},
-    session::{FileDigest, file_digest},
+    session::{FileDigest, diff_hunks, file_digest},
     target::{BranchBase, ReviewTarget},
 };
 use anyhow::Result;
@@ -32,7 +35,7 @@ use project::{
     },
 };
 use settings::Settings as _;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::RangeInclusive, sync::Arc};
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
@@ -798,6 +801,24 @@ impl ReviewDiff {
         self.buffer_subscriptions
             .values()
             .find(|entry| &entry.path_key == path_key)
+    }
+
+    /// Whether a comment can go on `lines` of a file's `side` in this diff: inside one of the
+    /// hunks `git diff` would show ([`diff_hunks`]), as in tuicr, which only takes comments on
+    /// the diff's lines. A file the diff doesn't have isn't refused.
+    pub(crate) fn check_lines(
+        &self,
+        path: &RepoPath,
+        side: Side,
+        lines: &RangeInclusive<u32>,
+        cx: &App,
+    ) -> Result<(), LinesRefusal> {
+        let Some((buffer, diff)) = self.file_diff(&review_path_key(path)) else {
+            return Ok(());
+        };
+        let hunks = diff_hunks(&diff.read(cx).snapshot(cx), &buffer.read(cx).snapshot());
+        let side = diff_side(side);
+        check_lines(&hunks, (side, *lines.start()), (side, *lines.end()))
     }
 
     /// Whether the file list is still being computed or loaded.

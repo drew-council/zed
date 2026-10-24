@@ -1,4 +1,4 @@
-use super::{CommentBlocks, CommentTarget, Side};
+use super::{CommentBlocks, CommentTarget, SelectedLines, Side, lines_in_rows};
 use crate::{AddComment, line_cursor::selected_rows};
 use buffer_diff::DiffHunkStatusKind;
 use editor::{
@@ -173,14 +173,46 @@ impl CommentBlocks {
         if !gutter_row.hovered && !at_selection {
             return None;
         }
-        let target = self.row_target(is_lhs, gutter_row.info, cx)?;
+        let selected_rows = selection.and_then(|selection| {
+            (selection.rows.start() < selection.rows.end() && selection.rows.contains(&row))
+                .then_some(selection.rows)
+        });
+        let in_selection = selected_rows.is_some();
+        // A click there comments on the selection, so the selection's lines decide.
+        let target = match selected_rows {
+            Some(rows) => self.rows_target(editor.read(cx), is_lhs, rows, cx),
+            None => self.row_target(is_lhs, gutter_row.info, cx),
+        }?;
         Some(GutterButton {
             row: gutter_row.row,
             is_lhs,
             refusal: self.refusal(&target, cx),
-            in_selection: selection.is_some_and(|selection| {
-                selection.rows.start() < selection.rows.end() && selection.rows.contains(&row)
-            }),
+            in_selection,
+        })
+    }
+
+    /// The lines `rows` (multibuffer rows of a side of the diff) show, as `c` takes them.
+    fn rows_target(
+        &self,
+        editor: &Editor,
+        is_lhs: bool,
+        rows: RangeInclusive<u32>,
+        cx: &App,
+    ) -> Option<CommentTarget> {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let SelectedLines::Lines {
+            side,
+            buffer_id,
+            rows,
+        } = lines_in_rows(&snapshot, rows, is_lhs)?
+        else {
+            return None;
+        };
+        let (path, _) = self.file_of_side_buffer(side, buffer_id, cx)?;
+        Some(CommentTarget::Lines {
+            path,
+            side,
+            lines: rows.start() + 1..=rows.end() + 1,
         })
     }
 
@@ -206,8 +238,7 @@ impl CommentBlocks {
 
     /// Why the review can't take a comment on `target`, if it can't.
     pub(crate) fn refusal(&self, target: &CommentTarget, cx: &App) -> Option<SharedString> {
-        let gate = self.gate.as_ref()?;
-        gate(target, cx).err()
+        self.check(target, cx).err()
     }
 
     /// A "+" was pressed: the cursor goes to its row (unless the row is in the selection, which
