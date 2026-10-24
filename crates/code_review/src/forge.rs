@@ -85,13 +85,6 @@ pub struct RepositoryContext {
     pub origin_is_ssh: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PullRequestListFilter {
-    Open,
-    /// Open pull requests that request the viewer's review.
-    ReviewRequested,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct PullRequestSummary {
     pub number: u64,
@@ -100,10 +93,14 @@ pub struct PullRequestSummary {
     pub author: Actor,
     pub head_ref: SharedString,
     pub base_ref: SharedString,
+    pub status: PullRequestStatus,
     pub is_draft: bool,
+    pub review_decision: Option<ReviewDecision>,
     /// Whether the head branch is in another repository (a fork).
     pub is_cross_repository: bool,
     pub updated_at: OffsetDateTime,
+    /// The viewer's latest review that approved or requested changes, if any.
+    pub viewer_review: Option<ReviewDecision>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -519,11 +516,11 @@ pub struct SubmitAttempt {
 pub trait Forge: Send + Sync + 'static {
     fn context(&self) -> &RepositoryContext;
 
-    /// At most 50 open pull requests of [`RepositoryContext::canonical`], most recently updated
-    /// first.
-    fn list_pull_requests(
+    /// At most 50 pull requests of [`RepositoryContext::canonical`] that a search in the forge's
+    /// syntax finds, most recently updated first unless the search sorts them.
+    fn search_pull_requests(
         &self,
-        filter: PullRequestListFilter,
+        search: String,
     ) -> BoxFuture<'static, Result<Vec<PullRequestSummary>>>;
 
     fn pull_request(&self, number: u64) -> BoxFuture<'static, Result<PullRequestDetails>>;

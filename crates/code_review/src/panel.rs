@@ -2,8 +2,8 @@ use crate::{
     ClearExcludeFilter, ClearFilters, ClearIncludeFilter, CollapseSelectedEntry, CopyBranchName,
     CopyPullRequestUrl, EditExcludeFilter, EditIncludeFilter, ExpandSelectedEntry, FocusPanel,
     OpenPullRequestInBrowser, ReloadPullRequest, ReviewUncommitted, ReviewView, SearchPaths,
-    SelectNextMatch, SelectPreviousMatch, ToggleBotReviews, ToggleFileReviewed, ToggleFocus,
-    ToggleHideReviewed, ToggleOutdatedThreads, TogglePanel, ToggleResolvedThreads,
+    SelectNextMatch, SelectPreviousMatch, StartReview, ToggleBotReviews, ToggleFileReviewed,
+    ToggleFocus, ToggleHideReviewed, ToggleOutdatedThreads, TogglePanel, ToggleResolvedThreads,
     ToggleSelectedDirectory, ToggleShowGenerated, ToggleShowVendored,
     comments::{CommentId, ItemKey},
     view::{
@@ -1494,6 +1494,14 @@ impl ReviewPanel {
                     .gap_1()
                     .child(div().flex_1().min_w_0().child(Label::new(title).truncate()))
                     .child(
+                        IconButton::new("review-panel-start-review", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Start Review…"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(StartReview.boxed_clone(), cx)
+                            }),
+                    )
+                    .child(
                         PopoverMenu::new("review-panel-menu")
                             .trigger_with_tooltip(
                                 IconButton::new("review-panel-menu-button", IconName::Ellipsis)
@@ -1536,6 +1544,11 @@ impl ReviewPanel {
                 .child(
                     Button::new("review-panel-start", "Review Uncommitted Changes").on_click(
                         |_, window, cx| window.dispatch_action(ReviewUncommitted.boxed_clone(), cx),
+                    ),
+                )
+                .child(
+                    Button::new("review-panel-start-review", "Start Review…").on_click(
+                        |_, window, cx| window.dispatch_action(StartReview.boxed_clone(), cx),
                     ),
                 )
                 .into_any_element(),

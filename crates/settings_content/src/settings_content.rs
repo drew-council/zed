@@ -261,6 +261,9 @@ pub struct SettingsContent {
 
     pub journal: Option<JournalSettingsContent>,
 
+    /// Settings for code reviews (`code_review::` actions).
+    pub code_review: Option<CodeReviewSettingsContent>,
+
     /// A map of log scopes to the desired log level.
     /// Useful for filtering out noisy logs or enabling more verbose logging.
     ///
@@ -409,7 +412,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
-        journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
+        journal, code_review, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
         instrumentation,
@@ -1195,6 +1198,23 @@ pub struct JournalSettingsContent {
     ///
     /// Default: hour12
     pub hour_format: Option<HourFormat>,
+}
+
+/// Settings for code reviews.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct CodeReviewSettingsContent {
+    /// The GitHub search the Start Review picker lists pull requests by, in GitHub's search syntax
+    /// (`AND`, `OR` and parentheses work); the picker can edit it (`ctrl-r`). It is limited to the
+    /// repository's open pull requests (unless it names a state, like `is:merged`) and sorted by
+    /// last update unless it has a `sort:` qualifier.
+    ///
+    /// Default: "review-requested:@me"
+    pub pull_request_search: Option<String>,
+    /// Whether the Start Review picker leaves out the pull requests you approved.
+    ///
+    /// Default: true
+    pub hide_approved_pull_requests: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]

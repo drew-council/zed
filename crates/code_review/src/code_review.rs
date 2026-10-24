@@ -24,7 +24,7 @@ mod view;
 use gpui::{Action, App, KeyBinding, actions};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use settings::{KeybindSource, KeymapFile, KeymapFileLoadResult};
+use settings::{KeybindSource, KeymapFile, KeymapFileLoadResult, RegisterSetting, Settings};
 use workspace::Workspace;
 
 pub use diff::ReviewDiff;
@@ -45,11 +45,11 @@ actions!(
         /// repository.
         ReviewUncommitted,
         /// Chooses what to review: the uncommitted changes, the current branch against its base,
-        /// recent commits (select several for a range), or a pull request.
+        /// a pull request, or recent commits (select several for a range).
         StartReview,
-        /// In the Start Review picker: lists the open pull requests, or those requesting your
-        /// review.
-        TogglePullRequestFilter,
+        /// In the Start Review picker: edits the GitHub search that lists the pull requests
+        /// (starting as the `code_review.pull_request_search` setting), or applies the edit.
+        EditPullRequestSearch,
         /// Changes the base the current branch review compares against.
         ChangeBase,
         /// Shows or hides the commit messages at the top of a commit review, or the description
@@ -205,6 +205,26 @@ pub struct ReviewCommits {
 pub struct OpenPullRequest {
     #[serde(default)]
     pub reference: Option<String>,
+}
+
+#[derive(Clone, Debug, RegisterSetting)]
+pub struct CodeReviewSettings {
+    /// The search the Start Review picker lists pull requests by, in GitHub's search syntax.
+    pub pull_request_search: String,
+    /// Whether the Start Review picker leaves out the pull requests the viewer approved.
+    pub hide_approved_pull_requests: bool,
+}
+
+impl Settings for CodeReviewSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        // `assets/settings/default.json` has every value; the fallbacks only guard against it
+        // missing one.
+        let code_review = content.code_review.clone().unwrap_or_default();
+        Self {
+            pull_request_search: code_review.pull_request_search.unwrap_or_default(),
+            hide_approved_pull_requests: code_review.hide_approved_pull_requests.unwrap_or(true),
+        }
+    }
 }
 
 // Embedded here instead of read through `settings::SettingsAssets`: rust-embed doesn't notice new

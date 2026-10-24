@@ -30,7 +30,9 @@ scrolling with the diff as one document (see "UX-1 slice A"), slice B, comments 
 GitHub-style "+" in the gutter, the comment editor's footer, file header buttons (see "UX-1 slice
 B"), and slice C, the review toolbar in the pane, the review's right-click menu, hover controls in
 the panel and line numbers that select rows (see "UX-1 slice C"), with a live pass over the whole
-batch.
+batch. Then the Review Pull Request picker, a GitHub search of the repository's pull requests
+prefilled from the first `code_review` settings, reachable from the panel's "+" (see "Review Pull
+Request picker").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -90,7 +92,7 @@ What exists:
 |---|---|
 | branch `code-review` | `v1.25.0-pre` + fork commits; all feature work goes here |
 | `crates/code_review/DESIGN.md` | This document |
-| `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
+| `crates/code_review/src/code_review.rs` | `init` (registers actions per workspace), `CodeReviewSettings` (the `code_review` settings), all `code_review::` actions (incl. `ReviewBranch`/`ReviewCommits` with fields), keymap loading helpers, test helpers (`init_test`; `test_support`: `init_vim_test`, the review fixture, editor helpers, fake-repo commit/branch helpers like `record_commit`) |
 | `crates/code_review/src/target.rs` | `ReviewTarget::{Uncommitted, Branch { base: BranchBase }, Commits(CommitRange), PullRequest(PullRequestTarget)}`, `BranchBase` (the only way to build a branch base: syntax check), `is_same_review`, `review_key`, empty-state label, `parse_commit_spec` (`rev` / `A..B`), `PullRequestReference` + `parse_pull_request_reference`, `validate_branch_name` (forge branch names); M8: `TargetSpec` + `parse_target_spec` (the CLI's TARGET grammar) |
 | `crates/code_review/src/commits.rs` | `CommitDiffList` (a commit range's files: live over project buffers, or historic snapshot buffers), `GitBlob`/`build_buffer` copied from `CommitView`, git helpers over `Repository::send_job` (`first_parent_chain`, `resolve_commit_spec`, `check_branch_base`, `resolve_commits`) |
 | `crates/code_review/src/diff.rs` | `ReviewDiff`: copy of `git_ui`'s `DiffMultibuffer`, driven by a `DiffSource` (`DiffBufferList` for uncommitted/branch, `CommitDiffList` for commits); `ReviewAddon` (header statuses against the review base + the reviewed checkbox: every header control goes here); loading/error state; `set_branch_base`; file order, `path_at_cursor`, `move_to_path` (polish B: `file_start_autoscroll`), single-file mode; per-file `FileDigest`s, the filter-hidden set (`set_hidden`), `ReviewDiffEvent` |
@@ -116,7 +118,8 @@ What exists:
 | `crates/code_review/src/toolbar.rs` | UX-1 C: `ReviewToolbar` (`ToolbarItemView` added to every pane by `register`, from `init`, after Zed's own items): counts (`summary_text`), single-file info, previous/next file/hunk/comment, Review Comment, single-file toggle, Copy as Markdown, Submit/Finish Review; toolbar GPUI tests |
 | `crates/code_review/src/context_menu.rs` | UX-1 C: the review's right-click menu in both sides of the diff (`install` → `Editor::set_custom_context_menu`; entries filled right after the click: `menu_items` → `MenuItem`/`MenuEntry`, disabled entries with their reason); menu GPUI tests |
 | `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: the review's overview, a block above the diff's first file that scrolls with it (UX-1 slice A; `block_properties`, `is_empty`) — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
-| `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action |
+| `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action; `render_pull_request_row` (shared with the Review Pull Request picker) |
+| `crates/code_review/src/pull_request_picker.rs` | `PullRequestPickerModal` / `PullRequestPickerDelegate`: the Review Pull Request picker (`code_review::SearchPullRequests`): its query is a GitHub search of the repository's pull requests, prefilled from `code_review.pull_request_search`, debounced; approved-by-you hidden per `code_review.hide_approved_pull_requests`; a number/URL opens that pull request; "Review in Worktree" |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll; configures each side (UX-1 B: breakpoint/bookmark gutter hover off) |
 | `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the panel's and toolbar's read API (`panel_files`, `summary`, `single_file_position`, `draft_comment_count`, `shown_thread_count`), `submit_review`/`copy_review_as_markdown`; GPUI tests |
 | `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); UX-1 C: hover controls (a file row's reviewed checkbox, a comment row's edit/delete); GPUI tests |
@@ -1992,6 +1995,51 @@ editors). No upstream edits.
   footer's type menu, deleted from the panel. PR C reset afterwards: #15 closed, **#16** opened.
   Logs: only the usual noise.
 
+**Review Pull Request picker (the user's request after UX-1)** — "some kind of top-level UI for
+opening a new review", listing pull requests the way `~/nixconf/home/scripts/src/reviewprs.nu` does
+(a GitHub search per readability team, without the user's own, drafts or dependabot, minus the ones
+the user approved), single selection, the filter a user setting that can be edited while the UI is
+open. Upstream edits: the settings block only (§3.10).
+
+- **Settings** (the first `code_review` block, `CodeReviewSettings` in `code_review.rs`):
+  `pull_request_search` (default `"is:open review-requested:@me"`) and
+  `hide_approved_pull_requests` (default `true`).
+- **Picker** (`pull_request_picker.rs`, action `code_review::SearchPullRequests`): the query box is
+  the GitHub search, prefilled from the setting; each edit searches again after 300 ms. Old results
+  stay until new ones arrive (Enter opens what is shown); the footer says "Searching…", how many
+  approved pull requests are hidden, or the repository. A query that parses as a pull request
+  reference (`#123`, `owner/repo#123`, URL) shows "Open pull request …" and doesn't search. Enter
+  opens in place, the secondary confirm in a new worktree (the Start Review picker's flows).
+- **Search** (`GitHubClient::search_pull_requests`, `Forge::search_pull_requests`): `repo:{canonical}
+  is:pr ({search})` plus `sort:updated-desc` unless the search has a `sort:` term, sent as
+  `SearchPullRequests` with `type: ISSUE_ADVANCED`: verified live (2026-10-24) that only advanced
+  search understands `OR`/parentheses (`ISSUE` returns 0 for `(a OR b)`), so one setting covers the
+  user's three teams; the parentheses keep a top-level `OR` inside the repository. A malformed
+  search returns 0 results, not an error. The old review-requested list still uses `ISSUE`. Not
+  checked: GitHub Enterprise Server versions without `ISSUE_ADVANCED`.
+- **Approved by you**: the summary fragment fetches `latestOpinionatedReviews(first: 100)` and
+  `PullRequestSummary::viewer_review` is the viewer's (`RepositoryContext::viewer`) Approved /
+  Changes requested. Not `viewerLatestReview`: a comment after an approval would replace it. Both
+  pickers' rows show it as a chip (`picker::render_pull_request_row`, now shared).
+- **Entry points**: the review panel's header has a "+" (New Review: Start Review…, Review Pull
+  Request…), and its empty state has Review Pull Request… and Start Review… under Review Uncommitted
+  Changes. No default key binding. `OpenPullRequest` without a reference still opens the Start Review
+  picker at its pull requests.
+- The user's setting for `sheerhealth/sheer` (one string, global, not per repository):
+  `is:open -author:@me draft:false -author:app/dependabot (team-review-requested:SheerHealth/go-readability
+  OR team-review-requested:SheerHealth/api-readability OR team-review-requested:SheerHealth/build-readability)`
+  (17 results live, against the script's three searches of 12, 11 and 1).
+- Tests: 2 new (224 + 1 ignored): `github::test_search_pull_requests` (the query built around the
+  search, `sort:` kept, an empty search, `viewer_review` from another user's and the viewer's
+  reviews) and `pull_request_picker::test_review_pull_request_picker` (prefilled from the setting,
+  approved hidden with the footer count, debounced re-search keeping the old rows, a status row
+  doesn't confirm, `#1` opens without searching). Clippy (`-p code_review`) clean.
+- Live check (harness, sandbox clone, `GH_TOKEN` via `ZH_EXTRA_ENV`, setting `"is:open"`): the
+  palette action opens the picker prefilled, PR #4 shows its "Changes requested" chip, typing `
+  (author:drew-council OR label:nonexistent)` narrows to #16 and #1, the panel's empty-state button
+  and the header's "+" menu open it; confirming starts the usual checkout (the harness's git fetch
+  asked for credentials and was cancelled).
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -2076,8 +2124,8 @@ editors). No upstream edits.
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 222 tests + 1 ignored live
-  GitHub test (after UX-1 slice C; 214 after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 224 tests + 1 ignored live
+  GitHub test (after the Review Pull Request picker; 222 after UX-1 slice C; 214 after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
   A; 166 after M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
@@ -2276,7 +2324,8 @@ over `git rev-parse HEAD`).
   overwrites `RELEASE_CHANNEL` with `nightly`, so the install uses the fork's
   `.override { releaseChannel = "stable"; }` (M9, §3.10, `crates/code_review/INSTALL.md`).
 - Settings: no `code_review` settings block until the first setting needs to persist; then add it
-  (requires editing `crates/settings_content`, accepted).
+  (requires editing `crates/settings_content`, accepted). Added with the Review Pull Request picker
+  (`code_review.pull_request_search`, `code_review.hide_approved_pull_requests`).
 
 ### 2.2 Review targets
 
@@ -2675,7 +2724,7 @@ change, so mismatched CLI/app versions don't break).
 | `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 113-line new file, +38 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. Tests +141 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`) |
 | `assets/keymaps/code_review*.json` | new files |
 | `nix/build.nix` | `releaseChannel ? "nightly"` argument (M9, +30/−7): a `channel` table (stable/preview/nightly), an assert that only Linux builds other channels than nightly, and the channel in `version`, `preBuild`'s `RELEASE_CHANNEL` and the Linux icons and desktop entry. The default derivation is unchanged (same `.drv`); `crates/code_review/INSTALL.md` uses `.override { releaseChannel = "stable"; }` |
-| (later) `crates/settings_content` + `assets/settings/default.json` | settings block |
+| `crates/settings_content/src/settings_content.rs`, `crates/settings/src/vscode_import.rs`, `assets/settings/default.json` | Review Pull Request picker: `SettingsContent::code_review` (`CodeReviewSettingsContent`: `pull_request_search`, `hide_approved_pull_requests`) in the struct and its `flattened_deserialize!` list (+21/−1), `code_review: None` in the VS Code import (+1), the defaults (+11). Editing `settings_content` rebuilds most of Zed |
 
 Measured cost of touching core crates: editing `editor` rebuilds in ~4.6 min at `-j4` vs ~38 s for a
 leaf crate (§8.1). Avoid core edits beyond this list.

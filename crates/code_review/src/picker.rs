@@ -1,8 +1,8 @@
 use crate::{
-    OpenPullRequest, StartReview, TogglePullRequestFilter,
+    CodeReviewSettings, EditPullRequestSearch, OpenPullRequest, StartReview,
     commits::{RECENT_COMMITS_LIMIT, first_parent_chain},
     forge::{
-        self, Forge, ForgeRepo, GitHubError, PullRequestListFilter, PullRequestSummary,
+        self, Forge, ForgeRepo, GitHubError, PullRequestStatus, PullRequestSummary, ReviewDecision,
         resolve_forge,
     },
     pull_request::{OpenPullRequestOptions, open_pull_request_and_notify},
@@ -15,12 +15,13 @@ use anyhow::Context as _;
 use fuzzy::StringMatchCandidate;
 use git::repository::CommitData;
 use gpui::{
-    Action as _, AnyElement, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    Action as _, AnyElement, DismissEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     Subscription, Task, WeakEntity,
 };
 use picker::{Picker, PickerDelegate};
 use project::{Project, git_store::Repository};
-use std::sync::Arc;
+use settings::Settings as _;
+use std::{sync::Arc, time::Duration};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
     Chip, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, Tooltip,
@@ -76,10 +77,13 @@ pub(crate) enum StartReviewFocus {
     PullRequests,
 }
 
-/// The Start Review picker: uncommitted changes, the current branch against its base, and recent
-/// commits, where multi-selection picks a range; then the pull requests of the repository's
-/// GitHub remote (open ones, or those requesting the user's review), and any pull request by
-/// number or URL.
+/// How long editing the pull request search waits for typing to pause before searching.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// The Start Review picker: uncommitted changes and the current branch against its base; then the
+/// pull requests of the repository's GitHub remote that a GitHub search finds (the
+/// `code_review.pull_request_search` setting, editable in the picker), and any pull request by
+/// number or URL; then recent commits, where multi-selection picks a range.
 pub struct StartReviewModal {
     picker: Entity<Picker<StartReviewDelegate>>,
     _load_tasks: Vec<Task<()>>,
@@ -113,7 +117,17 @@ impl StartReviewModal {
     ) -> Self {
         let default_branch = repo.update(cx, |repo, _| repo.default_branch(true));
         let recent_commits = first_parent_chain(&repo, None, None, RECENT_COMMITS_LIMIT, cx);
-        let delegate = StartReviewDelegate::new(workspace, project, repo, focus, cx.focus_handle());
+        let settings = CodeReviewSettings::get_global(cx);
+        let search = settings.pull_request_search.clone();
+        let delegate = StartReviewDelegate::new(
+            workspace,
+            project,
+            repo,
+            focus,
+            search.clone(),
+            settings.hide_approved_pull_requests,
+            cx.focus_handle(),
+        );
         let picker = cx.new(|cx| {
             Picker::list(delegate, window, cx)
                 .initial_width(rems(34.))
@@ -121,7 +135,9 @@ impl StartReviewModal {
         });
         picker.update(cx, |picker, cx| {
             picker.delegate.focus_handle = picker.focus_handle(cx);
-            picker.delegate.load_pull_requests(window, cx);
+            picker
+                .delegate
+                .load_pull_requests(search, false, window, cx);
         });
         let picker_subscription =
             cx.subscribe(&picker, |_, _, _: &DismissEvent, cx| cx.emit(DismissEvent));
@@ -180,6 +196,18 @@ impl StartReviewModal {
     }
 }
 
+impl StartReviewModal {
+    fn finish_editing_search(&mut self, apply: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.picker.read(cx).delegate.is_editing_search() {
+            return;
+        }
+        cx.stop_propagation();
+        self.picker.update(cx, |picker, cx| {
+            StartReviewDelegate::finish_editing_search(picker, apply, window, cx)
+        });
+    }
+}
+
 impl ModalView for StartReviewModal {}
 
 impl EventEmitter<DismissEvent> for StartReviewModal {}
@@ -195,15 +223,26 @@ impl Render for StartReviewModal {
         v_flex()
             .key_context("StartReview")
             .w(rems(34.))
-            .on_action(
-                cx.listener(|this, _: &TogglePullRequestFilter, window, cx| {
-                    this.picker.update(cx, |picker, cx| {
-                        picker.delegate.toggle_pull_request_filter(window, cx);
-                        // Shows the loading state right away.
-                        picker.refresh(window, cx);
-                    })
-                }),
-            )
+            .on_action(cx.listener(|this, _: &EditPullRequestSearch, window, cx| {
+                this.picker.update(cx, |picker, cx| {
+                    if picker.delegate.is_editing_search() {
+                        StartReviewDelegate::finish_editing_search(picker, true, window, cx);
+                    } else {
+                        StartReviewDelegate::start_editing_search(picker, window, cx);
+                    }
+                })
+            }))
+            // While the query edits the search, Enter applies it and Escape reverts it instead of
+            // opening a row or closing the picker.
+            .capture_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.finish_editing_search(true, window, cx)
+            }))
+            .capture_action(cx.listener(|this, _: &menu::SecondaryConfirm, window, cx| {
+                this.finish_editing_search(true, window, cx)
+            }))
+            .capture_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                this.finish_editing_search(false, window, cx)
+            }))
             .child(self.picker.clone())
     }
 }
@@ -222,9 +261,11 @@ pub(crate) enum RecentCommits {
     Failed(SharedString),
 }
 
+#[derive(Clone)]
 pub(crate) enum PullRequestList {
     Loading,
-    /// Most recently updated first.
+    /// Most recently updated first, unless the search sorts them; without the ones the viewer
+    /// approved when those are hidden.
     Loaded(Vec<PullRequestSummary>),
     Failed(SharedString),
     /// The repository has no GitHub remote: the picker has no pull request section.
@@ -235,6 +276,7 @@ pub(crate) enum PullRequestList {
 pub(crate) enum Section {
     Local,
     PullRequests,
+    Commits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,6 +373,14 @@ impl CommitSelection {
     }
 }
 
+/// What editing the search replaced, to put back when the edit is cancelled.
+struct SearchEdit {
+    query: String,
+    search: String,
+    pull_requests: PullRequestList,
+    approved_hidden: usize,
+}
+
 pub struct StartReviewDelegate {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -338,12 +388,20 @@ pub struct StartReviewDelegate {
     default_base: BaseState,
     commits: RecentCommits,
     selection: CommitSelection,
-    /// Resolved on the first load and reused when the filter changes; dropped after an error, so
+    /// Resolved on the first load and reused when the search changes; dropped after an error, so
     /// that the next load resolves it again (with a new token, say).
     forge: Option<Arc<dyn Forge>>,
-    pull_request_filter: PullRequestListFilter,
+    /// The GitHub search the pull requests are listed by.
+    search: String,
+    /// The search `pull_requests` holds (or is loading) the results of.
+    searched: Option<String>,
+    searching: bool,
+    hide_approved: bool,
     pull_requests: PullRequestList,
+    approved_hidden: usize,
     load_pull_requests_task: Task<()>,
+    /// Set while the query edits the search.
+    editing_search: Option<SearchEdit>,
     entries: Vec<Entry>,
     selected_index: usize,
     query: String,
@@ -361,6 +419,8 @@ impl StartReviewDelegate {
         project: Entity<Project>,
         repo: Entity<Repository>,
         focus: StartReviewFocus,
+        search: String,
+        hide_approved: bool,
         focus_handle: FocusHandle,
     ) -> Self {
         Self {
@@ -371,9 +431,14 @@ impl StartReviewDelegate {
             commits: RecentCommits::Loading,
             selection: CommitSelection::default(),
             forge: None,
-            pull_request_filter: PullRequestListFilter::Open,
+            search,
+            searched: None,
+            searching: false,
+            hide_approved,
             pull_requests: PullRequestList::Loading,
+            approved_hidden: 0,
             load_pull_requests_task: Task::ready(()),
+            editing_search: None,
             entries: Vec::new(),
             selected_index: 0,
             query: String::new(),
@@ -416,23 +481,42 @@ impl StartReviewDelegate {
         self.forge.as_ref().map(|forge| &forge.context().canonical)
     }
 
-    /// (Re)loads the pull requests for the current filter.
-    fn load_pull_requests(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    pub(crate) fn is_editing_search(&self) -> bool {
+        self.editing_search.is_some()
+    }
+
+    /// Searches the pull requests. `debounce` (while the search is being typed) waits for typing
+    /// to pause and keeps the current results until the new ones arrive.
+    fn load_pull_requests(
+        &mut self,
+        search: String,
+        debounce: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        self.searched = Some(search.clone());
         if matches!(self.pull_requests, PullRequestList::Unsupported) {
             return;
         }
+        if !debounce {
+            self.pull_requests = PullRequestList::Loading;
+            self.approved_hidden = 0;
+        }
+        self.searching = true;
         let forge = match &self.forge {
             Some(forge) => Task::ready(Ok(forge.clone())),
             None => resolve_forge(&self.repo, None, &self.project, cx),
         };
-        let filter = self.pull_request_filter;
-        self.pull_requests = PullRequestList::Loading;
+        let hide_approved = self.hide_approved;
         self.load_pull_requests_task = cx.spawn_in(window, async move |picker, cx| {
+            if debounce {
+                cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            }
             let result = async {
                 let forge = forge.await?;
                 let pull_requests = cx
                     .background_executor()
-                    .spawn(forge.list_pull_requests(filter))
+                    .spawn(forge.search_pull_requests(search))
                     .await;
                 anyhow::Ok((forge, pull_requests?))
             }
@@ -440,21 +524,26 @@ impl StartReviewDelegate {
             picker
                 .update_in(cx, |picker, window, cx| {
                     let delegate = &mut picker.delegate;
-                    // The filter changed meanwhile: that load's result counts.
-                    if delegate.pull_request_filter != filter {
-                        return;
-                    }
+                    delegate.searching = false;
                     match result {
-                        Ok((forge, pull_requests)) => {
+                        Ok((forge, mut pull_requests)) => {
                             delegate.forge = Some(forge);
+                            let found = pull_requests.len();
+                            if hide_approved {
+                                pull_requests.retain(|pull_request| {
+                                    pull_request.viewer_review != Some(ReviewDecision::Approved)
+                                });
+                            }
+                            delegate.approved_hidden = found - pull_requests.len();
                             delegate.pull_requests = PullRequestList::Loaded(pull_requests);
                         }
                         Err(error) => {
                             delegate.forge = None;
+                            delegate.approved_hidden = 0;
                             delegate.pull_requests = match forge::github_error(&error) {
                                 Some(GitHubError::Unsupported) => PullRequestList::Unsupported,
                                 _ => {
-                                    log::error!("listing pull requests: {error:#}");
+                                    log::error!("searching pull requests: {error:#}");
                                     PullRequestList::Failed(forge::error_message(&error))
                                 }
                             };
@@ -466,31 +555,103 @@ impl StartReviewDelegate {
         });
     }
 
-    /// Switches between the open pull requests and those requesting the user's review.
-    pub(crate) fn toggle_pull_request_filter(
-        &mut self,
+    /// Turns the query into the pull request search, showing its results as it is typed.
+    fn start_editing_search(
+        picker: &mut Picker<Self>,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        if matches!(self.pull_requests, PullRequestList::Unsupported) {
+        if picker.delegate.is_editing_search()
+            || matches!(picker.delegate.pull_requests, PullRequestList::Unsupported)
+        {
             return;
         }
-        self.pull_request_filter = match self.pull_request_filter {
-            PullRequestListFilter::Open => PullRequestListFilter::ReviewRequested,
-            PullRequestListFilter::ReviewRequested => PullRequestListFilter::Open,
-        };
-        self.load_pull_requests(window, cx);
+        let query = picker.query(cx);
+        let delegate = &mut picker.delegate;
+        delegate.selection.clear();
+        delegate.editing_search = Some(SearchEdit {
+            query,
+            search: delegate.search.clone(),
+            pull_requests: delegate.pull_requests.clone(),
+            approved_hidden: delegate.approved_hidden,
+        });
+        let search = delegate.search.clone();
+        picker.set_query(&search, window, cx);
+        picker.refresh_placeholder(window, cx);
+        picker.refresh(window, cx);
     }
 
-    fn pull_request_section_title(&self) -> SharedString {
-        let title = match self.pull_request_filter {
-            PullRequestListFilter::Open => "Pull Requests",
-            PullRequestListFilter::ReviewRequested => "Review Requests",
+    /// Back to the query: `apply` keeps the edited search, otherwise the previous one returns
+    /// with its results.
+    pub(crate) fn finish_editing_search(
+        picker: &mut Picker<Self>,
+        apply: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(edit) = picker.delegate.editing_search.take() else {
+            return;
         };
-        match self.pull_request_repo() {
-            Some(repo) => format!("{title} · {repo}").into(),
-            None => title.into(),
+        if apply {
+            let search = picker.query(cx);
+            let delegate = &mut picker.delegate;
+            // Applying the same search again retries it after an error.
+            if delegate.searching
+                || delegate.searched.as_deref() != Some(search.as_str())
+                || matches!(delegate.pull_requests, PullRequestList::Failed(_))
+            {
+                delegate.load_pull_requests(search.clone(), false, window, cx);
+            }
+            delegate.search = search;
+            delegate.select_first_pull_request = true;
+        } else {
+            let delegate = &mut picker.delegate;
+            match edit.pull_requests {
+                PullRequestList::Loading => {
+                    delegate.load_pull_requests(edit.search.clone(), false, window, cx)
+                }
+                pull_requests => {
+                    delegate.load_pull_requests_task = Task::ready(());
+                    delegate.searching = false;
+                    delegate.searched = Some(edit.search.clone());
+                    delegate.pull_requests = pull_requests;
+                    delegate.approved_hidden = edit.approved_hidden;
+                }
+            }
+            delegate.search = edit.search;
         }
+        picker.set_query(&edit.query, window, cx);
+        picker.refresh_placeholder(window, cx);
+        picker.refresh(window, cx);
+    }
+
+    pub(crate) fn pull_request_section_title(&self) -> SharedString {
+        match self.pull_request_repo() {
+            Some(repo) => format!("Pull Requests · {repo}").into(),
+            None => "Pull Requests".into(),
+        }
+    }
+
+    /// The pull request section's status rows: loading, an error, nothing found, and how many
+    /// approved pull requests are hidden.
+    fn pull_request_statuses(&self, include_hidden: bool) -> Vec<SharedString> {
+        let mut statuses = Vec::new();
+        match &self.pull_requests {
+            PullRequestList::Unsupported => {}
+            PullRequestList::Loading => statuses.push("Loading pull requests…".into()),
+            PullRequestList::Failed(error) => statuses.push(error.clone()),
+            PullRequestList::Loaded(pull_requests) if pull_requests.is_empty() => {
+                statuses.push("No pull requests match the search".into())
+            }
+            PullRequestList::Loaded(_) => {}
+        }
+        match self.approved_hidden {
+            _ if !include_hidden => {}
+            0 => {}
+            1 => statuses.push("1 pull request you approved is hidden".into()),
+            count => statuses.push(format!("{count} pull requests you approved are hidden").into()),
+        }
+        statuses
     }
 
     fn pull_request_candidate(pull_request: &PullRequestSummary) -> String {
@@ -573,6 +734,7 @@ impl StartReviewDelegate {
 
         let mut local_entries = Vec::new();
         let mut pull_request_entries = Vec::new();
+        let mut commit_entries = Vec::new();
         for (candidate, positions) in matches {
             match candidate {
                 UNCOMMITTED_CANDIDATE => local_entries.push(Entry::Uncommitted { positions }),
@@ -582,20 +744,20 @@ impl StartReviewDelegate {
                         index: candidate - FIRST_PULL_REQUEST_CANDIDATE,
                         positions,
                     }),
-                candidate => local_entries.push(Entry::Commit {
+                candidate => commit_entries.push(Entry::Commit {
                     index: candidate - FIRST_COMMIT_CANDIDATE,
                     positions,
                 }),
             }
         }
-        let status = match &self.commits {
+        let commit_status = match &self.commits {
             RecentCommits::Loading => Some("Loading commits…".into()),
             RecentCommits::Failed(error) => Some(error.clone()),
             RecentCommits::Loaded(commits) if commits.is_empty() => Some("No commits".into()),
             RecentCommits::Loaded(_) => None,
         };
         let mut entries = Vec::new();
-        if !local_entries.is_empty() || status.is_some() {
+        if !local_entries.is_empty() {
             entries.push(Entry::Header(Section::Local));
             for entry in local_entries {
                 let is_branch = matches!(entry, Entry::Branch { .. });
@@ -604,7 +766,6 @@ impl StartReviewDelegate {
                     entries.push(Entry::Status(error.clone()));
                 }
             }
-            entries.extend(status.map(Entry::Status));
         }
 
         // A query that names a pull request selects it: Enter opens it.
@@ -612,20 +773,7 @@ impl StartReviewDelegate {
         let listed_reference = reference
             .as_ref()
             .and_then(|reference| self.listed_pull_request(reference));
-        let pull_request_status = match &self.pull_requests {
-            PullRequestList::Unsupported => None,
-            PullRequestList::Loading => Some("Loading pull requests…".into()),
-            PullRequestList::Failed(error) => Some(error.clone()),
-            PullRequestList::Loaded(pull_requests) if pull_requests.is_empty() => {
-                Some(match self.pull_request_filter {
-                    PullRequestListFilter::Open => "No open pull requests".into(),
-                    PullRequestListFilter::ReviewRequested => {
-                        "No pull requests request your review".into()
-                    }
-                })
-            }
-            PullRequestList::Loaded(_) => None,
-        };
+        let pull_request_statuses = self.pull_request_statuses(self.query.is_empty());
         // The named pull request comes first, above rows that only fuzzy-match the query (`1`
         // matches #17's title, say). A URL doesn't fuzzy-match its pull request's row at all.
         if let Some(number) = listed_reference
@@ -652,13 +800,18 @@ impl StartReviewDelegate {
                 .map(Entry::OpenReference);
             if open_reference.is_some()
                 || !pull_request_entries.is_empty()
-                || pull_request_status.is_some()
+                || !pull_request_statuses.is_empty()
             {
                 entries.push(Entry::Header(Section::PullRequests));
                 entries.extend(open_reference);
                 entries.extend(pull_request_entries);
-                entries.extend(pull_request_status.map(Entry::Status));
+                entries.extend(pull_request_statuses.into_iter().map(Entry::Status));
             }
+        }
+        if !commit_entries.is_empty() || commit_status.is_some() {
+            entries.push(Entry::Header(Section::Commits));
+            entries.extend(commit_entries);
+            entries.extend(commit_status.map(Entry::Status));
         }
         self.entries = entries;
 
@@ -698,6 +851,24 @@ impl StartReviewDelegate {
                     .position(|entry| entry.key(pull_requests).is_some())
             })
             .unwrap_or(0);
+    }
+
+    /// While the search is edited: only the pull request section, nothing selectable.
+    fn set_search_entries(&mut self) {
+        let mut entries = vec![Entry::Header(Section::PullRequests)];
+        entries.extend(
+            (0..self.loaded_pull_requests().len()).map(|index| Entry::PullRequest {
+                index,
+                positions: Vec::new(),
+            }),
+        );
+        entries.extend(
+            self.pull_request_statuses(true)
+                .into_iter()
+                .map(Entry::Status),
+        );
+        self.entries = entries;
+        self.selected_index = 0;
     }
 
     fn commit_range(&self, newest: usize, oldest: usize) -> Option<CommitRange> {
@@ -769,94 +940,13 @@ impl StartReviewDelegate {
         selected: bool,
     ) -> Option<AnyElement> {
         let pull_request = self.loaded_pull_requests().get(index)?;
-        let number = format!("#{}", pull_request.number);
-        let title_start = number.len() + 1;
-        let title_end = title_start + pull_request.title.len();
-        let positions_in = |start: usize, end: usize| {
-            positions
-                .iter()
-                .filter(|position| (start..end).contains(*position))
-                .map(|position| position - start)
-                .collect::<Vec<_>>()
-        };
-        let number_positions = positions_in(0, number.len());
-        let title_positions = positions_in(title_start, title_end);
-        let time = time_format::format_localized_timestamp(
-            pull_request.updated_at,
-            OffsetDateTime::now_utc(),
+        Some(render_pull_request_row(
+            ("start-review-pull-request", entry_index).into(),
+            pull_request,
+            positions,
+            selected,
             self.timezone,
-            time_format::TimestampFormat::Relative,
-        );
-        Some(
-            ListItem::new(("start-review-pull-request", entry_index))
-                .inset(true)
-                .spacing(ListItemSpacing::Sparse)
-                .toggle_state(selected)
-                .child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .gap_2()
-                                .justify_between()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .min_w_0()
-                                        .child(
-                                            HighlightedLabel::new(number, number_positions)
-                                                .color(Color::Muted)
-                                                .flex_none(),
-                                        )
-                                        .child(
-                                            HighlightedLabel::new(
-                                                pull_request.title.clone(),
-                                                title_positions,
-                                            )
-                                            .truncate(),
-                                        )
-                                        .when(pull_request.is_draft, |row| {
-                                            row.child(
-                                                Chip::new("Draft")
-                                                    .label_size(LabelSize::XSmall)
-                                                    .label_color(Color::Muted),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .flex_none()
-                                        .child(
-                                            Label::new(pull_request.author.login.clone())
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        )
-                                        .child(
-                                            Label::new(time)
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            Label::new(if pull_request.is_cross_repository {
-                                format!(
-                                    "{} → {} · fork",
-                                    pull_request.head_ref, pull_request.base_ref
-                                )
-                            } else {
-                                format!("{} → {}", pull_request.head_ref, pull_request.base_ref)
-                            })
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate(),
-                        ),
-                )
-                .into_any_element(),
-        )
+        ))
     }
 
     fn render_commit(
@@ -945,7 +1035,11 @@ impl PickerDelegate for StartReviewDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Review changes, the branch, commits, or a pull request (#123, URL)…".into()
+        if self.is_editing_search() {
+            "GitHub search for pull requests (is:open author:octocat)…".into()
+        } else {
+            "Review changes, the branch, a pull request (#123, URL), or commits…".into()
+        }
     }
 
     fn match_count(&self) -> usize {
@@ -971,7 +1065,7 @@ impl PickerDelegate for StartReviewDelegate {
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> bool {
-        self.entry_key(index).is_some()
+        !self.is_editing_search() && self.entry_key(index).is_some()
     }
 
     fn update_matches(
@@ -980,6 +1074,13 @@ impl PickerDelegate for StartReviewDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
+        if self.is_editing_search() {
+            if self.searched.as_deref() != Some(query.as_str()) {
+                self.load_pull_requests(query, true, window, cx);
+            }
+            self.set_search_entries();
+            return Task::ready(());
+        }
         let candidates = self.candidates();
         if query.is_empty() {
             let matches = candidates
@@ -1013,6 +1114,10 @@ impl PickerDelegate for StartReviewDelegate {
     }
 
     fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        // `StartReviewModal` applies the edited search instead.
+        if self.is_editing_search() {
+            return;
+        }
         let Some(key) = self.entry_key(self.selected_index) else {
             return;
         };
@@ -1124,6 +1229,12 @@ impl PickerDelegate for StartReviewDelegate {
                     .child(ListSubHeader::new(self.pull_request_section_title()).inset(true))
                     .into_any_element(),
             ),
+            Entry::Header(Section::Commits) => Some(
+                div()
+                    .pt_1()
+                    .child(ListSubHeader::new("Recent Commits").inset(true))
+                    .into_any_element(),
+            ),
             Entry::PullRequest { index, positions } => {
                 self.render_pull_request(entry_index, *index, positions, selected)
             }
@@ -1180,34 +1291,60 @@ impl PickerDelegate for StartReviewDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
         let focus_handle = &self.focus_handle;
-        let selected = self.entry_key(self.selected_index);
-        let selected_count = self.selection.len();
-        let has_pull_requests = !matches!(self.pull_requests, PullRequestList::Unsupported);
         let key_binding = |action: &dyn gpui::Action, cx: &App| {
             KeyBinding::for_action_in(action, focus_handle, cx).size(rems_from_px(12_f32))
         };
+        let footer = h_flex()
+            .w_full()
+            .p_1p5()
+            .gap_1()
+            .justify_between()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant);
+        if self.is_editing_search() {
+            return Some(
+                footer
+                    .child(
+                        Label::new(if self.searching { "Searching…" } else { "" })
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("start-review-cancel-search", "Cancel")
+                                    .key_binding(key_binding(&menu::Cancel, cx))
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(menu::Cancel.boxed_clone(), cx)
+                                    }),
+                            )
+                            .child(
+                                Button::new("start-review-apply-search", "Search")
+                                    .key_binding(key_binding(&menu::Confirm, cx))
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(menu::Confirm.boxed_clone(), cx)
+                                    }),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let selected = self.entry_key(self.selected_index);
+        let selected_count = self.selection.len();
+        let has_pull_requests = !matches!(self.pull_requests, PullRequestList::Unsupported);
+        let search = SharedString::from(format!("Search: {}", self.search));
         Some(
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .gap_1()
-                .justify_between()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
+            footer
                 .map(|footer| {
                     if selected_count == 0 && has_pull_requests {
                         footer.child(
-                            Button::new(
-                                "start-review-pull-request-filter",
-                                match self.pull_request_filter {
-                                    PullRequestListFilter::Open => "Review Requests",
-                                    PullRequestListFilter::ReviewRequested => "Open Pull Requests",
-                                },
-                            )
-                            .key_binding(key_binding(&TogglePullRequestFilter, cx))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(TogglePullRequestFilter.boxed_clone(), cx)
-                            }),
+                            Button::new("start-review-edit-search", "Edit Search")
+                                .key_binding(key_binding(&EditPullRequestSearch, cx))
+                                .tooltip(Tooltip::text(search))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(EditPullRequestSearch.boxed_clone(), cx)
+                                }),
                         )
                     } else {
                         footer.child(
@@ -1271,6 +1408,133 @@ impl PickerDelegate for StartReviewDelegate {
                 .into_any_element(),
         )
     }
+}
+
+/// A pull request's row: number, title, author and last update, then its branches and its state,
+/// review decision and the viewer's own verdict. `positions` are the matched characters of
+/// `#number title`.
+pub(crate) fn render_pull_request_row(
+    id: ElementId,
+    pull_request: &PullRequestSummary,
+    positions: &[usize],
+    selected: bool,
+    timezone: UtcOffset,
+) -> AnyElement {
+    let number = format!("#{}", pull_request.number);
+    let title_start = number.len() + 1;
+    let title_end = title_start + pull_request.title.len();
+    let positions_in = |start: usize, end: usize| {
+        positions
+            .iter()
+            .filter(|position| (start..end).contains(*position))
+            .map(|position| position - start)
+            .collect::<Vec<_>>()
+    };
+    let number_positions = positions_in(0, number.len());
+    let title_positions = positions_in(title_start, title_end);
+    let time = time_format::format_localized_timestamp(
+        pull_request.updated_at,
+        OffsetDateTime::now_utc(),
+        timezone,
+        time_format::TimestampFormat::Relative,
+    );
+    let state = match pull_request.status {
+        PullRequestStatus::Merged => ("Merged", Color::Accent),
+        PullRequestStatus::Closed => ("Closed", Color::Error),
+        PullRequestStatus::Open if pull_request.is_draft => ("Draft", Color::Muted),
+        PullRequestStatus::Open => ("Open", Color::Success),
+    };
+    let decision = pull_request.review_decision.map(|decision| match decision {
+        ReviewDecision::Approved => ("Approved", Color::Success),
+        ReviewDecision::ChangesRequested => ("Changes requested", Color::Error),
+        ReviewDecision::ReviewRequired => ("Review required", Color::Warning),
+    });
+    let viewer_review = pull_request.viewer_review.map(|review| match review {
+        ReviewDecision::Approved => ("You approved", Color::Success),
+        ReviewDecision::ChangesRequested => ("You requested changes", Color::Error),
+        ReviewDecision::ReviewRequired => ("Review required", Color::Muted),
+    });
+    let chip = |(label, color): (&'static str, Color)| {
+        Chip::new(label)
+            .label_size(LabelSize::XSmall)
+            .label_color(color)
+    };
+    ListItem::new(id)
+        .inset(true)
+        .spacing(ListItemSpacing::Sparse)
+        .toggle_state(selected)
+        .child(
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .justify_between()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .min_w_0()
+                                .child(
+                                    HighlightedLabel::new(number, number_positions)
+                                        .color(Color::Muted)
+                                        .flex_none(),
+                                )
+                                .child(
+                                    HighlightedLabel::new(
+                                        pull_request.title.clone(),
+                                        title_positions,
+                                    )
+                                    .truncate(),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .flex_none()
+                                .child(
+                                    Label::new(pull_request.author.login.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .justify_between()
+                        .child(
+                            div().min_w_0().child(
+                                Label::new(if pull_request.is_cross_repository {
+                                    format!(
+                                        "{} → {} · fork",
+                                        pull_request.head_ref, pull_request.base_ref
+                                    )
+                                } else {
+                                    format!("{} → {}", pull_request.head_ref, pull_request.base_ref)
+                                })
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                            ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .flex_none()
+                                .child(chip(state))
+                                .when_some(decision, |chips, decision| chips.child(chip(decision)))
+                                .when_some(viewer_review, |chips, review| {
+                                    chips.child(chip(review))
+                                }),
+                        ),
+                ),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1353,10 +1617,15 @@ mod tests {
                 None,
                 Some(EntryKey::Uncommitted),
                 Some(EntryKey::Branch),
+                None,
                 Some(EntryKey::Commit(0)),
                 Some(EntryKey::Commit(1)),
                 Some(EntryKey::Commit(2)),
             ]
+        );
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.delegate.entries()[3].clone()),
+            Entry::Header(Section::Commits)
         );
         assert_eq!(
             picker.read_with(cx, |picker, _| picker.delegate.entries()[0].clone()),
@@ -1379,8 +1648,8 @@ mod tests {
 
         // Selecting the newest and the oldest commit selects the range between them.
         picker.update_in(cx, |picker, window, cx| {
-            picker.delegate.toggle_item_selected(3, window, cx);
-            picker.delegate.toggle_item_selected(5, window, cx);
+            picker.delegate.toggle_item_selected(4, window, cx);
+            picker.delegate.toggle_item_selected(6, window, cx);
             // Rows other than commits can't be selected.
             picker.delegate.toggle_item_selected(1, window, cx);
         });
@@ -1433,7 +1702,12 @@ mod tests {
         fail_lists: Arc<std::sync::atomic::AtomicBool>,
         base_oid: Arc<std::sync::Mutex<Option<String>>>,
         cx: &mut TestAppContext,
-    ) -> (Arc<FakeFs>, Entity<Workspace>, &mut VisualTestContext) {
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Workspace>,
+        crate::github::test_support::SentRequests,
+        &mut VisualTestContext,
+    ) {
         use crate::github::{
             set_fake_token_source,
             test_support::{
@@ -1462,15 +1736,25 @@ mod tests {
             dot_git(),
             [(commit_data(PR1_HEAD_OID, None, "Outdate is_truthy"), false)],
         );
-        let (http, _) = fake_github(move |request| match request.operation() {
+        let (http, requests) = fake_github(move |request| match request.operation() {
             Some("RepositoryContext") => repository_context_reply(request),
-            Some("OpenPullRequests" | "SearchPullRequests")
-                if fail_lists.load(Ordering::SeqCst) =>
-            {
+            Some("SearchPullRequests") if fail_lists.load(Ordering::SeqCst) => {
                 Reply::status(401, r#"{"message":"Bad credentials"}"#)
             }
-            Some("OpenPullRequests") => Reply::json(OPEN_PULL_REQUESTS),
-            Some("SearchPullRequests") => Reply::json(r#"{"data":{"search":{"nodes":[{}]}}}"#),
+            // The open pull requests, #2 approved by the viewer; nothing for "is:closed".
+            Some("SearchPullRequests") => {
+                let query = request.variables()["query"].as_str().unwrap_or_default();
+                let mut nodes = serde_json::from_str::<serde_json::Value>(OPEN_PULL_REQUESTS)
+                    .unwrap()["data"]["repository"]["pullRequests"]["nodes"]
+                    .clone();
+                nodes[3]["latestOpinionatedReviews"] = json!({ "nodes": [
+                    { "state": "APPROVED", "author": { "login": "drew-council" } },
+                ] });
+                if query.contains("is:closed") {
+                    nodes = json!([]);
+                }
+                Reply::json(json!({ "data": { "search": { "nodes": nodes } } }).to_string())
+            }
             Some("PullRequestDetails") => match base_oid.lock().unwrap().as_deref() {
                 Some(base_oid) => Reply::json(PR1_DETAILS.replace(PR1_BASE_OID, base_oid)),
                 None => Reply::json(PR1_DETAILS),
@@ -1482,7 +1766,43 @@ mod tests {
             set_fake_token_source(cx, |_| Some("token".into()));
         });
         let (workspace, cx) = open_workspace(fs.clone(), cx).await;
-        (fs, workspace, cx)
+        (fs, workspace, requests, cx)
+    }
+
+    /// The searches sent to GitHub, without the repository and sort the client adds.
+    fn searches(
+        requests: &crate::github::test_support::SentRequests,
+        cx: &mut VisualTestContext,
+    ) -> Vec<String> {
+        cx.run_until_parked();
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.operation() == Some("SearchPullRequests"))
+            .filter_map(|request| {
+                let query = request.variables()["query"].as_str()?;
+                let query = query.strip_prefix("repo:drew-council/code-review-sandbox is:pr ")?;
+                Some(query.strip_suffix(" sort:updated-desc")?.to_string())
+            })
+            .collect()
+    }
+
+    fn statuses(
+        picker: &Entity<Picker<StartReviewDelegate>>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<String> {
+        picker.read_with(cx, |picker, _| {
+            picker
+                .delegate
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Status(status) => Some(status.to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
     }
 
     fn pull_request_keys(numbers: &[u64]) -> Vec<Option<EntryKey>> {
@@ -1495,53 +1815,113 @@ mod tests {
     #[gpui::test]
     async fn test_pull_request_section(cx: &mut TestAppContext) {
         let base_oid = Arc::new(std::sync::Mutex::new(None));
-        let (fs, workspace, cx) =
+        let (fs, workspace, requests, cx) =
             pull_request_fixture(Default::default(), base_oid.clone(), cx).await;
 
+        // Local first, then the pull requests the setting's search finds (without the one the
+        // viewer approved), then the commits.
         dispatch(StartReview, cx);
         let picker = start_review_picker(&workspace, cx);
-        let keys = entry_keys(&picker, cx);
-        let pull_requests_header = keys.len() - 5;
         assert_eq!(
-            keys[pull_requests_header..],
-            [None]
-                .into_iter()
-                .chain(pull_request_keys(&[4, 1, 3, 2]))
-                .collect::<Vec<_>>()
+            entry_keys(&picker, cx),
+            [
+                None,
+                Some(EntryKey::Uncommitted),
+                Some(EntryKey::Branch),
+                None
+            ]
+            .into_iter()
+            .chain(pull_request_keys(&[4, 1, 3]))
+            .chain([None, None, Some(EntryKey::Commit(0))])
+            .collect::<Vec<_>>()
         );
         picker.read_with(cx, |picker, _| {
-            assert_eq!(
-                picker.delegate.entries()[pull_requests_header],
-                Entry::Header(Section::PullRequests)
-            );
+            let entries = picker.delegate.entries();
+            assert_eq!(entries[3], Entry::Header(Section::PullRequests));
+            assert_eq!(entries[8], Entry::Header(Section::Commits));
             assert_eq!(
                 picker.delegate.pull_request_section_title(),
                 "Pull Requests · drew-council/code-review-sandbox"
             );
         });
-        assert_eq!(selected_key(&picker, cx), Some(EntryKey::Uncommitted));
-
-        // Review requests, and back.
-        dispatch(TogglePullRequestFilter, cx);
-        let keys = entry_keys(&picker, cx);
-        assert_eq!(keys[keys.len() - 2..], [None, None]);
-        picker.read_with(cx, |picker, _| {
-            assert_eq!(
-                picker.delegate.entries().last(),
-                Some(&Entry::Status(
-                    "No pull requests request your review".into()
-                ))
-            );
-            assert_eq!(
-                picker.delegate.pull_request_section_title(),
-                "Review Requests · drew-council/code-review-sandbox"
-            );
-        });
-        dispatch(TogglePullRequestFilter, cx);
         assert_eq!(
-            entry_keys(&picker, cx)[pull_requests_header + 1..],
-            pull_request_keys(&[4, 1, 3, 2])
+            statuses(&picker, cx),
+            ["1 pull request you approved is hidden"]
         );
+        assert_eq!(selected_key(&picker, cx), Some(EntryKey::Uncommitted));
+        assert_eq!(searches(&requests, cx), ["is:open (review-requested:@me)"]);
+
+        // Editing the search: the query holds it, only the pull requests show (nothing
+        // selectable), and its results follow the typing once it pauses.
+        let query =
+            |cx: &mut VisualTestContext| picker.read_with(cx, |picker, cx| picker.query(cx));
+        picker.update_in(cx, |picker, window, cx| picker.set_query("bra", window, cx));
+        cx.run_until_parked();
+        dispatch(EditPullRequestSearch, cx);
+        assert_eq!(query(cx), "review-requested:@me");
+        let editing_keys = entry_keys(&picker, cx);
+        assert_eq!(
+            editing_keys,
+            [None]
+                .into_iter()
+                .chain(pull_request_keys(&[4, 1, 3]))
+                .chain([None])
+                .collect::<Vec<_>>()
+        );
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("is:closed", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            statuses(&picker, cx),
+            ["1 pull request you approved is hidden"]
+        );
+        cx.executor().advance_clock(SEARCH_DEBOUNCE);
+        cx.run_until_parked();
+        assert_eq!(statuses(&picker, cx), ["No pull requests match the search"]);
+
+        // Escape puts the search, its results and the query back, without closing the picker.
+        dispatch(menu::Cancel, cx);
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<StartReviewModal>(cx).is_some());
+        });
+        assert_eq!(query(cx), "bra");
+        picker.update_in(cx, |picker, window, cx| picker.set_query("", window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            entry_keys(&picker, cx)[4..7],
+            pull_request_keys(&[4, 1, 3])[..]
+        );
+        assert_eq!(
+            searches(&requests, cx),
+            ["is:open (review-requested:@me)", "(is:closed)"]
+        );
+
+        // Enter keeps the edited search and opens nothing.
+        dispatch(EditPullRequestSearch, cx);
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("is:closed", window, cx)
+        });
+        cx.executor().advance_clock(SEARCH_DEBOUNCE);
+        cx.run_until_parked();
+        dispatch(menu::Confirm, cx);
+        assert_eq!(query(cx), "");
+        assert_eq!(review_count(&workspace, cx), 0);
+        assert_eq!(statuses(&picker, cx), ["No pull requests match the search"]);
+
+        // Applied before the typing pauses, the search runs at once, and its first pull request
+        // is selected.
+        dispatch(EditPullRequestSearch, cx);
+        assert_eq!(query(cx), "is:closed");
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("is:open", window, cx)
+        });
+        dispatch(menu::Confirm, cx);
+        assert_eq!(
+            searches(&requests, cx)[2..],
+            ["(is:closed)".to_string(), "(is:open)".to_string()]
+        );
+        assert_eq!(selected_key(&picker, cx), Some(EntryKey::PullRequest(4)));
 
         // A number selects the pull request; one that isn't listed gets its own row.
         picker.update_in(cx, |picker, window, cx| picker.set_query("#1", window, cx));
@@ -1656,26 +2036,25 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let fail_lists = Arc::new(AtomicBool::new(true));
-        let (_fs, workspace, cx) =
+        let (_fs, workspace, _requests, cx) =
             pull_request_fixture(fail_lists.clone(), Default::default(), cx).await;
         dispatch(StartReview, cx);
         let picker = start_review_picker(&workspace, cx);
-        picker.read_with(cx, |picker, _| {
-            assert_eq!(
-                picker.delegate.entries().last(),
-                Some(&Entry::Status(
-                    "GitHub rejected the GitHub CLI's token for github.com. Run \
-                     \"gh auth login --hostname github.com\"."
-                        .into()
-                ))
-            );
-        });
-        // Toggling tries again (resolving the forge again after the 401).
+        assert_eq!(
+            statuses(&picker, cx),
+            [
+                "GitHub rejected the GitHub CLI's token for github.com. Run \
+              \"gh auth login --hostname github.com\"."
+            ]
+        );
+        // Applying the search again tries again (resolving the forge again after the 401).
         fail_lists.store(false, Ordering::SeqCst);
-        dispatch(TogglePullRequestFilter, cx);
-        dispatch(TogglePullRequestFilter, cx);
-        let keys = entry_keys(&picker, cx);
-        assert_eq!(keys[keys.len() - 4..], pull_request_keys(&[4, 1, 3, 2]));
+        dispatch(EditPullRequestSearch, cx);
+        dispatch(EditPullRequestSearch, cx);
+        assert_eq!(
+            entry_keys(&picker, cx)[4..7],
+            pull_request_keys(&[4, 1, 3])[..]
+        );
     }
 
     /// A remote whose host merely has "github" in its name: the picker says GitHub isn't
@@ -1720,9 +2099,8 @@ mod tests {
         picker.read_with(cx, |picker, _| {
             let entries = picker.delegate.entries();
             assert!(entries.contains(&Entry::Header(Section::PullRequests)));
-            assert_eq!(
-                entries.last(),
-                Some(&Entry::Status(
+            assert!(
+                entries.contains(&Entry::Status(
                     "GitHub isn't configured for github.attacker.dev. If it is a GitHub \
                      Enterprise Server, add it to \"git_hosting_providers\" in your settings \
                      (provider \"github\") or run \"gh auth login --hostname \
@@ -1732,7 +2110,8 @@ mod tests {
             );
         });
         // Not even when asked again, or for a pull request by number.
-        dispatch(TogglePullRequestFilter, cx);
+        dispatch(EditPullRequestSearch, cx);
+        dispatch(menu::Confirm, cx);
         dispatch(
             OpenPullRequest {
                 reference: Some("1".into()),

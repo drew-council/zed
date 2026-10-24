@@ -6,7 +6,7 @@
     "context": "StartReview > Picker > Editor",
     "bindings": {
       "tab": "picker::MultiSelectNext",
-      "ctrl-r": "code_review::TogglePullRequestFilter",
+      "ctrl-r": "code_review::EditPullRequestSearch",
     },
   },
   {

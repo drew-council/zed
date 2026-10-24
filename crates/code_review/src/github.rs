@@ -4,9 +4,9 @@
 use crate::forge::{
     Actor, ChangedFile, ChangedFileStatus, CommentableLines, DiffSide, Forge, ForgeRepo,
     ForgeRepoRef, HeadStatus, Hunk, HunkRowKind, HunkRows, PendingReview, PullRequestDetails,
-    PullRequestListFilter, PullRequestStatus, PullRequestSummary, RemoteComment,
-    RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewDecision, ReviewEvent,
-    ReviewLineComment, ReviewState, ReviewSubmission, SubmitAttempt, SubmittedReview, ThreadAnchor,
+    PullRequestStatus, PullRequestSummary, RemoteComment, RemoteReviewSummary, RemoteThread,
+    RepositoryContext, ReviewDecision, ReviewEvent, ReviewLineComment, ReviewState,
+    ReviewSubmission, SubmitAttempt, SubmittedReview, ThreadAnchor,
 };
 use anyhow::anyhow;
 use collections::HashMap;
@@ -1063,12 +1063,6 @@ struct ParentNode {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpenPullRequestsField {
-    pull_requests: Connection<PullRequestSummaryNode>,
-}
-
-#[derive(Deserialize)]
 struct SearchData {
     search: SearchField,
 }
@@ -1084,6 +1078,10 @@ struct PullRequestSummaryNode {
     number: u64,
     title: String,
     url: String,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    review_decision: Option<String>,
     is_draft: bool,
     is_cross_repository: bool,
     head_ref_name: String,
@@ -1091,6 +1089,18 @@ struct PullRequestSummaryNode {
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
     author: Option<ActorNode>,
+    latest_opinionated_reviews: Option<OpinionatedReviewsField>,
+}
+
+#[derive(Deserialize)]
+struct OpinionatedReviewsField {
+    nodes: Vec<Option<OpinionatedReviewNode>>,
+}
+
+#[derive(Deserialize)]
+struct OpinionatedReviewNode {
+    state: String,
+    author: Option<LoginNode>,
 }
 
 #[derive(Deserialize)]
@@ -1249,6 +1259,15 @@ fn parse_pull_request_status(state: &str) -> Result<PullRequestStatus, GitHubErr
     }
 }
 
+fn parse_review_decision(decision: Option<&str>) -> Option<ReviewDecision> {
+    match decision? {
+        "APPROVED" => Some(ReviewDecision::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    }
+}
+
 fn parse_side(side: Option<&str>) -> Option<DiffSide> {
     match side? {
         "LEFT" => Some(DiffSide::Left),
@@ -1285,7 +1304,23 @@ fn repo_from_name_with_owner(
     })
 }
 
-fn summary(node: PullRequestSummaryNode) -> PullRequestSummary {
+fn summary(node: PullRequestSummaryNode, viewer: &str) -> PullRequestSummary {
+    let viewer_review = node
+        .latest_opinionated_reviews
+        .into_iter()
+        .flat_map(|reviews| reviews.nodes)
+        .flatten()
+        .find(|review| {
+            review
+                .author
+                .as_ref()
+                .is_some_and(|author| author.login == viewer)
+        })
+        .and_then(|review| match review.state.as_str() {
+            "APPROVED" => Some(ReviewDecision::Approved),
+            "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+            _ => None,
+        });
     PullRequestSummary {
         number: node.number,
         title: node.title.into(),
@@ -1293,10 +1328,50 @@ fn summary(node: PullRequestSummaryNode) -> PullRequestSummary {
         author: actor(node.author),
         head_ref: node.head_ref_name.into(),
         base_ref: node.base_ref_name.into(),
+        // A state this code doesn't know yet mustn't drop the pull request from the list.
+        status: node
+            .state
+            .as_deref()
+            .and_then(|state| parse_pull_request_status(state).ok())
+            .unwrap_or(PullRequestStatus::Open),
         is_draft: node.is_draft,
+        review_decision: parse_review_decision(node.review_decision.as_deref()),
         is_cross_repository: node.is_cross_repository,
         updated_at: node.updated_at,
+        viewer_review,
     }
+}
+
+/// The user's `search` goes in parentheses, so that an `OR` at its top level can't reach beyond
+/// the repository's pull requests. Only open pull requests are found unless the search names a
+/// state (`is:closed`, `is:merged`, `state:…`).
+fn pull_request_search_query(repo: &ForgeRepo, search: &str) -> String {
+    let search = search.trim();
+    let names_state = search.split_whitespace().any(|term| {
+        let term = term
+            .trim_start_matches(['(', '-'])
+            .trim_end_matches(')')
+            .to_ascii_lowercase();
+        term.starts_with("state:")
+            || matches!(
+                term.as_str(),
+                "is:open" | "is:closed" | "is:merged" | "is:unmerged"
+            )
+    });
+    let mut query = format!("repo:{repo} is:pr");
+    if !names_state {
+        query.push_str(" is:open");
+    }
+    if !search.is_empty() {
+        query.push_str(&format!(" ({search})"));
+    }
+    if !search
+        .split_whitespace()
+        .any(|term| term.trim_start_matches(['(', '-']).starts_with("sort:"))
+    {
+        query.push_str(" sort:updated-desc");
+    }
+    query
 }
 
 /// A thread as the review shows it, or `None` for a thread of the viewer's pending review.
@@ -1709,52 +1784,35 @@ impl GitHubClient {
         })
     }
 
-    async fn list_pull_requests(
+    /// Advanced search (`ISSUE_ADVANCED`), unlike `ISSUE`, understands `AND`, `OR` and
+    /// parentheses.
+    async fn search_pull_requests(
         &self,
         repo: &ForgeRepo,
-        filter: PullRequestListFilter,
+        viewer: &str,
+        search: &str,
     ) -> Result<Vec<PullRequestSummary>, GitHubError> {
         let what = SharedString::from(repo.to_string());
-        let nodes = match filter {
-            // Not `search`: its index lags behind new pull requests.
-            PullRequestListFilter::Open => {
-                let data: RepositoryData<OpenPullRequestsField> = self
-                    .graphql(
-                        "OpenPullRequests",
-                        json!({ "owner": repo.owner, "name": repo.name }),
-                        &what,
-                    )
-                    .await?;
-                data.repository
-                    .ok_or_else(|| GitHubError::NotFound { what: what.clone() })?
-                    .pull_requests
-                    .nodes
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-            }
-            PullRequestListFilter::ReviewRequested => {
-                let query =
-                    format!("repo:{repo} is:pr is:open review-requested:@me sort:updated-desc");
-                let data: SearchData = self
-                    .graphql("SearchPullRequests", json!({ "query": query }), &what)
-                    .await?;
-                data.search
-                    .nodes
-                    .into_iter()
-                    .flatten()
-                    // Hits that aren't pull requests come back as `{}`.
-                    .filter(|node| node.as_object().is_none_or(|node| !node.is_empty()))
-                    .map(serde_json::from_value::<PullRequestSummaryNode>)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        transport(
-                            anyhow::Error::from(error).context("parsing GitHub's search results"),
-                        )
-                    })?
-            }
-        };
-        Ok(nodes.into_iter().map(summary).collect())
+        let query = pull_request_search_query(repo, search);
+        let data: SearchData = self
+            .graphql("SearchPullRequests", json!({ "query": query }), &what)
+            .await?;
+        let nodes = data
+            .search
+            .nodes
+            .into_iter()
+            .flatten()
+            // Hits that aren't pull requests come back as `{}`.
+            .filter(|node| node.as_object().is_none_or(|node| !node.is_empty()))
+            .map(serde_json::from_value::<PullRequestSummaryNode>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                transport(anyhow::Error::from(error).context("parsing GitHub's search results"))
+            })?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| summary(node, viewer))
+            .collect())
     }
 
     async fn pull_request(
@@ -1792,12 +1850,7 @@ impl GitHubClient {
                 .map(|head| repo_from_name_with_owner(&self.host, &head.name_with_owner))
                 .transpose()?,
             is_cross_repository: node.is_cross_repository,
-            review_decision: match node.review_decision.as_deref() {
-                Some("APPROVED") => Some(ReviewDecision::Approved),
-                Some("CHANGES_REQUESTED") => Some(ReviewDecision::ChangesRequested),
-                Some("REVIEW_REQUIRED") => Some(ReviewDecision::ReviewRequired),
-                _ => None,
-            },
+            review_decision: parse_review_decision(node.review_decision.as_deref()),
             viewer_is_author: node.viewer_did_author,
             pending_review: pending_review(node.pending_reviews),
         })
@@ -2552,13 +2605,14 @@ impl Forge for GitHubForge {
         &self.context
     }
 
-    fn list_pull_requests(
+    fn search_pull_requests(
         &self,
-        filter: PullRequestListFilter,
+        search: String,
     ) -> BoxFuture<'static, anyhow::Result<Vec<PullRequestSummary>>> {
         let client = self.client.clone();
         let repo = self.context.canonical.clone();
-        async move { Ok(client.list_pull_requests(&repo, filter).await?) }.boxed()
+        let viewer = self.context.viewer.clone();
+        async move { Ok(client.search_pull_requests(&repo, &viewer, &search).await?) }.boxed()
     }
 
     fn pull_request(&self, number: u64) -> BoxFuture<'static, anyhow::Result<PullRequestDetails>> {
@@ -3542,39 +3596,44 @@ mod tests {
     }
 
     #[test]
-    fn test_list_pull_requests() {
-        let (http, requests) = fake_github(|request| match request.operation() {
-            Some("OpenPullRequests") => Reply::json(OPEN_PULL_REQUESTS),
+    fn test_pull_request_summaries() {
+        let (http, _) = fake_github(|request| match request.operation() {
             Some("SearchPullRequests") => {
-                let pull_request =
-                    fixture(OPEN_PULL_REQUESTS)["data"]["repository"]["pullRequests"]["nodes"][1]
+                let mut nodes =
+                    fixture(OPEN_PULL_REQUESTS)["data"]["repository"]["pullRequests"]["nodes"]
                         .clone();
-                Reply::json(
-                    json!({ "data": { "search": { "nodes": [{}, pull_request, null] } } })
-                        .to_string(),
-                )
+                nodes[0]["state"] = json!("MERGED");
+                nodes[0]["reviewDecision"] = json!("CHANGES_REQUESTED");
+                nodes[2]["state"] = json!("SOMETHING_NEW");
+                // Hits that aren't pull requests come back as `{}`.
+                if let Some(nodes) = nodes.as_array_mut() {
+                    nodes.push(json!({}));
+                    nodes.push(Value::Null);
+                }
+                Reply::json(json!({ "data": { "search": { "nodes": nodes } } }).to_string())
             }
             _ => Reply::status(500, "{}"),
         });
         let client = client(http);
 
-        let open =
-            block_on(client.list_pull_requests(&sandbox(), PullRequestListFilter::Open)).unwrap();
+        let found =
+            block_on(client.search_pull_requests(&sandbox(), "drew-council", "is:open")).unwrap();
         assert_eq!(
-            open.iter()
+            found
+                .iter()
                 .map(|pull_request| pull_request.number)
                 .collect::<Vec<_>>(),
             [4, 1, 3, 2]
         );
         assert_eq!(
-            open[0].author,
+            found[0].author,
             Actor {
                 login: "github-actions".into(),
                 is_bot: true,
             }
         );
-        assert_eq!(open[0].head_ref, "bot/api-probe");
-        let pr_a = &open[1];
+        assert_eq!(found[0].head_ref, "bot/api-probe");
+        let pr_a = &found[1];
         assert_eq!(
             pr_a.title,
             "Add template filters and retire the legacy renderer"
@@ -3586,26 +3645,105 @@ mod tests {
         assert_eq!(pr_a.head_ref, "feature/template-filters");
         assert_eq!(pr_a.base_ref, "main");
         assert!(!pr_a.author.is_bot && !pr_a.is_draft && !pr_a.is_cross_repository);
-
-        let requested =
-            block_on(client.list_pull_requests(&sandbox(), PullRequestListFilter::ReviewRequested))
-                .unwrap();
+        assert_eq!(pr_a.viewer_review, None);
         assert_eq!(
-            requested
+            found
                 .iter()
-                .map(|pull_request| pull_request.number)
+                .map(|pull_request| (pull_request.status, pull_request.review_decision))
                 .collect::<Vec<_>>(),
-            [1]
+            [
+                (
+                    PullRequestStatus::Merged,
+                    Some(ReviewDecision::ChangesRequested)
+                ),
+                (PullRequestStatus::Open, None),
+                (PullRequestStatus::Open, None),
+                (PullRequestStatus::Open, None),
+            ]
         );
+    }
+
+    #[test]
+    fn test_search_pull_requests() {
+        let (http, requests) = fake_github(|request| match request.operation() {
+            Some("SearchPullRequests") => {
+                let nodes =
+                    &fixture(OPEN_PULL_REQUESTS)["data"]["repository"]["pullRequests"]["nodes"];
+                let mut approved = nodes[0].clone();
+                approved["latestOpinionatedReviews"] = json!({ "nodes": [
+                    { "state": "CHANGES_REQUESTED", "author": { "login": "someone-else" } },
+                    { "state": "APPROVED", "author": { "login": "drew-council" } },
+                ] });
+                let mut changes_requested = nodes[1].clone();
+                changes_requested["latestOpinionatedReviews"] = json!({ "nodes": [
+                    { "state": "CHANGES_REQUESTED", "author": { "login": "drew-council" } },
+                ] });
+                let mut approved_by_others = nodes[2].clone();
+                approved_by_others["latestOpinionatedReviews"] = json!({ "nodes": [
+                    { "state": "APPROVED", "author": { "login": "someone-else" } },
+                    null,
+                ] });
+                Reply::json(
+                    json!({ "data": { "search": { "nodes": [
+                        approved,
+                        changes_requested,
+                        approved_by_others,
+                        {},
+                    ] } } })
+                    .to_string(),
+                )
+            }
+            _ => Reply::status(500, "{}"),
+        });
+        let client = client(http);
+
+        let found = block_on(client.search_pull_requests(
+            &sandbox(),
+            "drew-council",
+            " is:open (author:a OR author:b) ",
+        ))
+        .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|pull_request| (pull_request.number, pull_request.viewer_review))
+                .collect::<Vec<_>>(),
+            [
+                (4, Some(ReviewDecision::Approved)),
+                (1, Some(ReviewDecision::ChangesRequested)),
+                (3, None),
+            ]
+        );
+        block_on(client.search_pull_requests(
+            &sandbox(),
+            "drew-council",
+            "is:closed sort:created-asc",
+        ))
+        .unwrap();
+        block_on(client.search_pull_requests(&sandbox(), "drew-council", "  ")).unwrap();
+        block_on(client.search_pull_requests(&sandbox(), "drew-council", "-STATE:closed")).unwrap();
 
         let requests = requests.lock().unwrap();
+        let queries = requests
+            .iter()
+            .map(|request| request.variables().clone())
+            .collect::<Vec<_>>();
         assert_eq!(
-            requests[0].variables(),
-            &json!({ "owner": "drew-council", "name": "code-review-sandbox" })
-        );
-        assert_eq!(
-            requests[1].variables(),
-            &json!({ "query": "repo:drew-council/code-review-sandbox is:pr is:open review-requested:@me sort:updated-desc" })
+            queries,
+            [
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr (is:open (author:a OR author:b)) sort:updated-desc",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr (is:closed sort:created-asc)",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr is:open sort:updated-desc",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr (-STATE:closed) sort:updated-desc",
+                }),
+            ]
         );
     }
 
@@ -5263,7 +5401,7 @@ mod tests {
         .await;
         let (http, requests) = fake_github(|request| match request.operation() {
             Some("RepositoryContext") => repository_context_reply(request),
-            Some("OpenPullRequests") => Reply::json(OPEN_PULL_REQUESTS),
+            Some("SearchPullRequests") => Reply::json(r#"{"data":{"search":{"nodes":[]}}}"#),
             _ => Reply::status(500, "{}"),
         });
         cx.update(|cx| {
@@ -5309,17 +5447,17 @@ mod tests {
             }
         );
         cx.background_executor
-            .spawn(forge.list_pull_requests(PullRequestListFilter::Open))
+            .spawn(forge.search_pull_requests("is:open".into()))
             .await
             .unwrap();
-        let list_variables = requests
+        let search_variables = requests
             .lock()
             .unwrap()
             .last()
             .map(|request| request.variables().clone());
         assert_eq!(
-            list_variables,
-            Some(json!({ "owner": "zed-industries", "name": "zed" }))
+            search_variables,
+            Some(json!({ "query": "repo:zed-industries/zed is:pr (is:open) sort:updated-desc" }))
         );
 
         // Resolved once.
@@ -5574,10 +5712,7 @@ mod tests {
         assert_eq!(forge.context().canonical, sandbox());
         assert!(!forge.context().viewer.is_empty());
 
-        let open = forge
-            .list_pull_requests(PullRequestListFilter::Open)
-            .await
-            .unwrap();
+        let open = forge.search_pull_requests("is:open".into()).await.unwrap();
         let numbers = open
             .iter()
             .map(|pull_request| pull_request.number)
@@ -5587,7 +5722,7 @@ mod tests {
             "{numbers:?}"
         );
         forge
-            .list_pull_requests(PullRequestListFilter::ReviewRequested)
+            .search_pull_requests("is:open (review-requested:@me OR author:@me)".into())
             .await
             .unwrap();
 
