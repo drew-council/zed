@@ -1092,7 +1092,7 @@ mod tests {
     }
 
     /// A pull request's squash-merge commit ("Subject (#N)") leads its tab with the pull
-    /// request's number; the tooltip keeps the sha and the whole subject.
+    /// request's number; the tooltip, the overview and the panel keep the whole subject.
     #[gpui::test]
     async fn test_squash_merge_commit_tab_leads_with_pull_request(cx: &mut TestAppContext) {
         crate::init_test(cx);
@@ -1126,6 +1126,17 @@ mod tests {
             "Review: 2222222 Read the pnpm version from package.json (#30007)\n\
              Read-only snapshot (no language server)"
         );
+        // The overview's header and the panel have a width to truncate to: the whole subject.
+        review.read_with(cx, |review, cx| {
+            assert_eq!(
+                review.top_block().read(cx).commits_title().unwrap(),
+                "#30007 Read the pnpm version from package.json"
+            );
+            assert_eq!(
+                review.title(cx),
+                "#30007 Read the pnpm version from package.json"
+            );
+        });
 
         // Not a pull request's number: the sha leads as usual.
         review_commits(C3, cx);
