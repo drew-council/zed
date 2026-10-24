@@ -385,10 +385,6 @@ impl CommentBlocks {
                         "The selection ends outside the diff's hunks: comments go on changed \
                          lines and the 3 lines around them"
                     }
-                    LinesRefusal::AcrossHunks => {
-                        "The selection spans two hunks of the diff: a comment's lines must be in \
-                         one hunk"
-                    }
                     LinesRefusal::Reversed => {
                         "The selection's start comes after its end in the diff"
                     }
@@ -4944,8 +4940,8 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
     }
 
     /// A local review takes line comments inside the hunks `git diff` shows (changed lines and
-    /// the 3 lines around them), like tuicr: a range of unchanged lines outside them, or across
-    /// two hunks, is refused with a toast, and the "+" at such a selection is disabled.
+    /// the 3 lines around them), like tuicr: a range with an end outside them is refused. A range
+    /// across two hunks is taken, as GitHub takes it.
     #[gpui::test]
     async fn test_line_comments_stay_in_the_diffs_hunks(cx: &mut TestAppContext) {
         init(cx, DiffViewStyle::Unified);
@@ -4964,10 +4960,6 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
                 ids.len()
             })
         };
-        let across: Result<(), SharedString> = Err(
-            "The selection spans two hunks of the diff: a comment's lines must be in one hunk"
-                .into(),
-        );
 
         // a.rs: lines 2 and 35 of 40 changed, so its hunks are lines 1–5 and 32–38.
         assert_eq!(check(lines("a.rs", 1..=5), cx), Ok(()));
@@ -4998,7 +4990,7 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
                     .into()
             )
         );
-        assert_eq!(check(lines("a.rs", 3..=33), cx), across);
+        assert_eq!(check(lines("a.rs", 3..=33), cx), Ok(()));
         assert_eq!(check(lines("added.txt", 1..=2), cx), Ok(()));
         assert_eq!(check(old_lines("deleted.txt", 1..=2), cx), Ok(()));
         assert_eq!(
@@ -5023,13 +5015,18 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         assert_eq!(cursor_line(&rhs, cx), "line 34");
         let end = display_row(&rhs, cursor_point(&rhs, cx).row, cx);
         draw(cx);
-        assert!(plus_button(false, end, true, cx).is_some());
-        assert!(plus_button(false, end, false, cx).is_none());
+        assert!(plus_button(false, end, false, cx).is_some());
+        assert!(plus_button(false, end, true, cx).is_none());
         cx.simulate_keystrokes("c");
         cx.run_until_parked();
-        assert!(open_editor(&review, cx).is_none());
-        assert!(comment_ids(&review, cx).is_empty());
-        assert_eq!(toasts(cx), 1);
+        assert!(open_editor(&review, cx).is_some());
+        cx.simulate_input("across");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!(
+            comments(&review, cx),
+            [(lines("a.rs", 3..=34), "across".to_string(), None)]
+        );
+        assert_eq!(toasts(cx), 0);
 
         // Unchanged lines inside a hunk take the comment.
         move_to_row_with_text(&rhs, "line 33", cx);
@@ -5044,7 +5041,10 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         cx.simulate_keystrokes("ctrl-enter");
         assert_eq!(
             comments(&review, cx),
-            [(lines("a.rs", 33..=34), "context".to_string(), None)]
+            [
+                (lines("a.rs", 3..=34), "across".to_string(), None),
+                (lines("a.rs", 33..=34), "context".to_string(), None)
+            ]
         );
         assert_eq!(toasts(cx), 0);
     }
