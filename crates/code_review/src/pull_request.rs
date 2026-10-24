@@ -352,9 +352,9 @@ impl PullRequestState {
                     .into()
             });
         };
-        let CommentTarget::Lines { path, side, lines } = target else {
+        if !matches!(target, CommentTarget::Lines { .. }) {
             return check_comment_target(commentable, target);
-        };
+        }
         if local_head != Some(self.details.head_oid) {
             return Err(format!(
                 "Check out the pull request's head {} to comment on its lines: GitHub numbers \
@@ -363,38 +363,20 @@ impl PullRequestState {
             )
             .into());
         }
-        let lines = match side {
-            Side::Old => lines.clone(),
-            Side::New => {
-                match local.working_to_head(path, lines.clone(), self.details.head_oid, cx) {
-                    LineMapping::Lines(lines) => lines,
-                    LineMapping::Changed => {
-                        return Err(
-                            "These lines have local changes, which the pull request doesn't have"
-                                .into(),
-                        );
-                    }
-                    LineMapping::Unknown => {
-                        return Err("Comparing the file with HEAD… Try again in a moment.".into());
-                    }
-                    LineMapping::Failed => {
-                        return Err(
-                        "Couldn't compare the file with HEAD, so its lines can't be numbered as \
-                         GitHub numbers them"
-                            .into(),
-                    );
-                    }
+        let target = target.map_new_lines(|path, lines| {
+            match local.working_to_head(path, lines, self.details.head_oid, cx) {
+                LineMapping::Lines(lines) => Ok(lines),
+                LineMapping::Changed => {
+                    Err("These lines have local changes, which the pull request doesn't have")
                 }
+                LineMapping::Unknown => Err("Comparing the file with HEAD… Try again in a moment."),
+                LineMapping::Failed => Err(
+                    "Couldn't compare the file with HEAD, so its lines can't be numbered as \
+                     GitHub numbers them",
+                ),
             }
-        };
-        check_comment_target(
-            commentable,
-            &CommentTarget::Lines {
-                path: path.clone(),
-                side: *side,
-                lines,
-            },
-        )
+        })?;
+        check_comment_target(commentable, &target)
     }
 
     fn load(&mut self, with_details: bool, cx: &mut Context<Self>) {
@@ -1214,32 +1196,37 @@ pub(crate) fn place_thread(
         ThreadAnchor::File => ThreadPlacement::Inline(CommentTarget::File { path }),
         ThreadAnchor::Outdated { .. } => ThreadPlacement::Moved { path },
         _ if is_moved => ThreadPlacement::Moved { path },
-        ThreadAnchor::Line { side, line } => ThreadPlacement::Inline(CommentTarget::Lines {
+        ThreadAnchor::Line { side, line } => ThreadPlacement::Inline(CommentTarget::lines(
             path,
-            side: comment_side(*side),
-            lines: *line..=*line,
-        }),
-        // A range from an old line to a new one sits below its new line, like its last row; so
-        // does one whose start GitHub's diff doesn't have before its end (a left start is
-        // numbered in the commit the thread was made on).
+            comment_side(*side),
+            *line..=*line,
+        )),
+        // A range whose start GitHub's diff doesn't have before its end (a left start is
+        // numbered in the commit the thread was made on) sits below its last line alone. So
+        // does a range from one side to the other of a renamed file, whose sides the local diff
+        // shows as two files.
         ThreadAnchor::Range {
             start_side,
             start,
             side,
             line,
-        } => ThreadPlacement::Inline(CommentTarget::Lines {
-            path,
-            side: comment_side(*side),
-            lines: if start_side == side
-                && start <= line
+        } => {
+            let is_range = (start_side != side || start <= line)
+                && (start_side == side || file.is_none_or(|file| file.previous_path.is_none()))
                 && files.is_none_or(|files| {
                     files.allows_range(&thread.path, (*start_side, *start), (*side, *line))
-                }) {
-                *start..=*line
+                });
+            ThreadPlacement::Inline(if is_range {
+                CommentTarget::Lines {
+                    path,
+                    side: comment_side(*side),
+                    lines: *start..=*line,
+                    start_side: comment_side(*start_side),
+                }
             } else {
-                *line..=*line
-            },
-        }),
+                CommentTarget::lines(path, comment_side(*side), *line..=*line)
+            })
+        }
     })
 }
 
@@ -1263,7 +1250,7 @@ pub(crate) fn check_comment_target(
     commentable: &CommentableLines,
     target: &CommentTarget,
 ) -> Result<(), SharedString> {
-    let (path, lines) = match target {
+    let (path, start, end) = match target {
         CommentTarget::Review => return Ok(()),
         CommentTarget::File { path } => {
             return if commentable.contains_file(path.as_unix_str()) {
@@ -1272,7 +1259,16 @@ pub(crate) fn check_comment_target(
                 Err("This file isn't part of the pull request on GitHub".into())
             };
         }
-        CommentTarget::Lines { path, side, lines } => (path.as_unix_str(), (*side, lines)),
+        CommentTarget::Lines {
+            path,
+            side,
+            lines,
+            start_side,
+        } => (
+            path.as_unix_str(),
+            (diff_side(*start_side), *lines.start()),
+            (diff_side(*side), *lines.end()),
+        ),
     };
     let Some(file) = commentable.file(path) else {
         return Err(if commentable.is_truncated() {
@@ -1286,10 +1282,8 @@ pub(crate) fn check_comment_target(
     if file.hunks.is_none() {
         return Err("GitHub shows no diff for this file, so it only takes a file comment".into());
     }
-    let (side, lines) = lines;
-    let side = diff_side(side);
     commentable
-        .check_range(path, (side, *lines.start()), (side, *lines.end()))
+        .check_range(path, start, end)
         .map_err(|refusal| {
             match refusal {
                 LinesRefusal::Outside => "GitHub only accepts comments within its diff hunks",
@@ -1846,19 +1840,19 @@ pub(crate) mod tests {
     }
 
     fn new_lines(path: &str, lines: std::ops::RangeInclusive<u32>) -> ThreadPlacement {
-        ThreadPlacement::Inline(CommentTarget::Lines {
-            path: RepoPath::new(path).unwrap(),
-            side: Side::New,
+        ThreadPlacement::Inline(CommentTarget::lines(
+            RepoPath::new(path).unwrap(),
+            Side::New,
             lines,
-        })
+        ))
     }
 
     fn old_lines(path: &str, lines: std::ops::RangeInclusive<u32>) -> ThreadPlacement {
-        ThreadPlacement::Inline(CommentTarget::Lines {
-            path: RepoPath::new(path).unwrap(),
-            side: Side::Old,
+        ThreadPlacement::Inline(CommentTarget::lines(
+            RepoPath::new(path).unwrap(),
+            Side::Old,
             lines,
-        })
+        ))
     }
 
     fn moved(path: &str) -> ThreadPlacement {
@@ -1994,19 +1988,50 @@ pub(crate) mod tests {
             assert_eq!(place(&renamed, shown), Some(placement), "{path} {side:?}");
         }
 
-        // A range from an old line to a new one sits below the new one; a context row's old
-        // number is an old line.
-        let mut range = single;
-        range.anchor = ThreadAnchor::Range {
-            start_side: DiffSide::Left,
-            start: 191,
-            side: DiffSide::Right,
-            line: 195,
+        // A range from an old line to a new one, or back, keeps its sides (it sits below its
+        // last line); one GitHub's diff doesn't have in that order sits below its last line
+        // alone. A context row's old number is an old line.
+        let mixed = |start_side: DiffSide, start: u32, side: DiffSide, line: u32| {
+            let mut range = single.clone();
+            range.anchor = ThreadAnchor::Range {
+                start_side,
+                start,
+                side,
+                line,
+            };
+            range
+        };
+        let mixed_lines = |start_side, lines, side| {
+            ThreadPlacement::Inline(CommentTarget::Lines {
+                path: RepoPath::new("src/engine.rs").unwrap(),
+                side,
+                lines,
+                start_side,
+            })
         };
         assert_eq!(
-            place(&range, shown),
+            place(&mixed(DiffSide::Left, 191, DiffSide::Right, 213), shown),
+            Some(mixed_lines(Side::Old, 191..=213, Side::New))
+        );
+        assert_eq!(
+            place(&mixed(DiffSide::Right, 203, DiffSide::Left, 185), shown),
+            Some(mixed_lines(
+                Side::New,
+                RangeInclusive::new(203, 185),
+                Side::Old
+            ))
+        );
+        assert_eq!(
+            place(&mixed(DiffSide::Left, 191, DiffSide::Right, 195), shown),
             Some(new_lines("src/engine.rs", 195..=195))
         );
+        let mut renamed_range = mixed(DiffSide::Left, 17, DiffSide::Right, 18);
+        renamed_range.path = "src/render.rs".into();
+        assert_eq!(
+            place(&renamed_range, shown),
+            Some(new_lines("src/render.rs", 18..=18))
+        );
+        let mut range = single;
         range.anchor = ThreadAnchor::Line {
             side: DiffSide::Left,
             line: 9,
@@ -2073,12 +2098,9 @@ pub(crate) mod tests {
         use crate::github::test_support::{PR1_FILES, PR4_FILES, changed_files_fixture};
 
         let files = changed_files_fixture(PR1_FILES);
-        let lines =
-            |path: &str, side: Side, lines: std::ops::RangeInclusive<u32>| CommentTarget::Lines {
-                path: RepoPath::new(path).unwrap(),
-                side,
-                lines,
-            };
+        let lines = |path: &str, side: Side, lines: std::ops::RangeInclusive<u32>| {
+            CommentTarget::lines(RepoPath::new(path).unwrap(), side, lines)
+        };
         let file = |path: &str| CommentTarget::File {
             path: RepoPath::new(path).unwrap(),
         };
@@ -3230,11 +3252,11 @@ pub(crate) mod tests {
             });
             assert_eq!(
                 targets,
-                [CommentTarget::Lines {
-                    path: RepoPath::new("src/engine.rs").unwrap(),
-                    side: Side::New,
-                    lines: 61..=61,
-                }]
+                [CommentTarget::lines(
+                    RepoPath::new("src/engine.rs").unwrap(),
+                    Side::New,
+                    61..=61
+                )]
             );
             for row_text in ["local 1", "filter 22 edited"] {
                 move_to_row_with_text(&rhs, row_text, cx);
@@ -3252,10 +3274,8 @@ pub(crate) mod tests {
             });
             let head: Oid = PR1_HEAD_OID.parse().unwrap();
             let other: Oid = C1.parse().unwrap();
-            let engine = |lines: std::ops::RangeInclusive<u32>| CommentTarget::Lines {
-                path: RepoPath::new("src/engine.rs").unwrap(),
-                side: Side::New,
-                lines,
+            let engine = |lines: std::ops::RangeInclusive<u32>| {
+                CommentTarget::lines(RepoPath::new("src/engine.rs").unwrap(), Side::New, lines)
             };
             let file = CommentTarget::File {
                 path: RepoPath::new("docs/guide.md").unwrap(),

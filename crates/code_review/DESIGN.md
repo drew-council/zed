@@ -532,7 +532,8 @@ state dir):**
   (context rows too: left = old numbering; M7 maps them at submit), makes `Side::Old` comments
   anchored in the file diff's base-text buffer (`BufferDiff::base_text_buffer`, which the left
   multibuffer excerpts; a new base is applied to it as edits, so anchors follow). A unified selection
-  over removed and added rows still comments on the added ones. Card labels "Old line N" / "Old lines
+  over removed and added rows still comments on the added ones (since bugs 2's follow-up: a range
+  from the old line to the new one, see §0). Card labels "Old line N" / "Old lines
   a–b" (a single new line has none).
 - **Hosting**: `CommentBlocks::hosted` records each block's side (`Host::{Rhs, Lhs}`) and editor.
   Old-side comments sit on the left side when split; unified, below their removed row (the
@@ -1848,8 +1849,8 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   button is held, the renderer sees the drag's rows and (deferred to after the frame) sets the
   side's selection to them as whole rows, so the line cursor paints the range on both sides and
   vim shows VISUAL. The release comments on the rows (`add_line_comment_on(editor, Some(rows))`,
-  the same rules as `c` on a selection: a range over removed and added rows takes the added ones,
-  removed rows alone are old lines, across files the last file's rows) and leaves the cursor on
+  the same rules as `c` on a selection: a range over removed and added rows takes the added ones
+  (since bugs 2's follow-up: spans both sides, see §0), removed rows alone are old lines, across files the last file's rows) and leaves the cursor on
   the last row; a plain click on a "+" inside a selection comments on the whole selection. The
   side is passed explicitly: a side focused directly is the split editor's focused one only on the
   next frame. Shift-click on a "+" is left to the gutter (extends the selection); otherwise the
@@ -2054,6 +2055,17 @@ checked by `CommentBlocks::check`; the "+" on a selection checks the whole selec
 L8), in local reviews too; local reviews use the hunks `git diff` would show (3 context lines,
 `Hunk::with_context`), like tuicr, so expanded context rows are refused there. Refusals are toasts
 or disabled entries with the reason.
+
+**Bugs 2, item 1 follow-up (ranges from one side to the other)** — GitHub takes a range from
+either side to either side, in diff order (LV MX), so a unified selection from removed rows to
+added ones, or back, is such a range: `CommentTarget::Lines.start_side` (stored in the comment's
+JSON only when it differs, so no migration), posted as `start_side`/`side`, shown below its last
+row (that row's side when split), labelled "Old line 6 – line 8" / `path:~6-8`. An unchanged end
+takes the other end's side (new when both are unchanged), so a selection from unchanged rows to
+removed ones is a range of old lines (it used to keep only the unchanged rows). Such a comment is
+anchored at both ends (`TabAnchors::starts`), its text being its first and last lines'; threads
+with mixed sides are placed the same way (a renamed file's still at their last line). Visual `y`
+over both sides still copies the new side's rows.
 
 **Bugs 2, item 2 (collapsing the overview in split view)** — the split view measured the
 full-width overview after both sides were prepainted, and a notification during a draw schedules no

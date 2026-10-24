@@ -108,10 +108,16 @@ pub(crate) enum CommentTarget {
     },
     Lines {
         path: RepoPath,
+        /// The side of the last line, which the comment shows below.
         side: Side,
-        /// 1-based line numbers on `side`. They follow the comment's lines while the review is
-        /// open, and are what a review opened later looks for.
+        /// 1-based line numbers, the first on `start_side`, the last on `side`. They follow the
+        /// comment's lines while the review is open, and are what a review opened later looks
+        /// for.
         lines: RangeInclusive<u32>,
+        /// The side of the first line. A range from a removed line to an added one, or back,
+        /// has its ends on different sides (GitHub's `start_side`): its two numbers count on
+        /// different sides then, so they aren't a range of either side's lines.
+        start_side: Side,
     },
 }
 
@@ -121,6 +127,89 @@ impl CommentTarget {
             Self::Review => None,
             Self::File { path } | Self::Lines { path, .. } => Some(path),
         }
+    }
+
+    /// Lines with both ends on `side`.
+    pub(crate) fn lines(path: RepoPath, side: Side, lines: RangeInclusive<u32>) -> Self {
+        Self::Lines {
+            path,
+            side,
+            lines,
+            start_side: side,
+        }
+    }
+
+    /// A range whose ends are on different sides of the diff.
+    pub(crate) fn is_mixed(&self) -> bool {
+        matches!(self, Self::Lines { side, start_side, .. } if side != start_side)
+    }
+
+    /// Whether the target spans more than one line.
+    pub(crate) fn is_range(&self) -> bool {
+        matches!(self, Self::Lines { lines, .. } if lines.start() != lines.end()) || self.is_mixed()
+    }
+
+    /// Where the target is, as the export and the review panel show it: `path:12`,
+    /// `path:12-14`, `path:~12` (old side), `path:~12-14` (from an old line to a new one),
+    /// `path`, or `None` for the whole review.
+    pub(crate) fn location(&self) -> Option<String> {
+        match self {
+            Self::Review => None,
+            Self::File { path } => Some(path.as_unix_str().to_string()),
+            Self::Lines {
+                path,
+                side,
+                lines,
+                start_side,
+            } => {
+                let path = path.as_unix_str();
+                let marker = |side: &Side| match side {
+                    Side::Old => "~",
+                    Side::New => "",
+                };
+                Some(if self.is_range() {
+                    format!(
+                        "{path}:{}{}-{}{}",
+                        marker(start_side),
+                        lines.start(),
+                        marker(side),
+                        lines.end()
+                    )
+                } else {
+                    format!("{path}:{}{}", marker(side), lines.end())
+                })
+            }
+        }
+    }
+
+    /// The target with its new lines numbered by `map` (old lines are numbered in the diff
+    /// base on every side): all of them, or the end of a mixed range that is on the new side.
+    pub(crate) fn map_new_lines<E>(
+        &self,
+        map: impl FnOnce(&RepoPath, RangeInclusive<u32>) -> Result<RangeInclusive<u32>, E>,
+    ) -> Result<Self, E> {
+        let Self::Lines {
+            path,
+            side,
+            lines,
+            start_side,
+        } = self
+        else {
+            return Ok(self.clone());
+        };
+        let (start, end) = (*lines.start(), *lines.end());
+        let lines = match (start_side, side) {
+            (Side::Old, Side::Old) => lines.clone(),
+            (Side::New, Side::New) => map(path, lines.clone())?,
+            (Side::Old, Side::New) => start..=*map(path, end..=end)?.end(),
+            (Side::New, Side::Old) => *map(path, start..=start)?.start()..=end,
+        };
+        Ok(Self::Lines {
+            path: path.clone(),
+            side: *side,
+            lines,
+            start_side: *start_side,
+        })
     }
 }
 
@@ -159,25 +248,9 @@ impl Comment {
         matches!(self.state, CommentState::Submitted { .. })
     }
 
-    /// Where the comment is, as the export and the review panel show it: `path:12`,
-    /// `path:12-14`, `path:~12` (old side), `path`, or `None` for a review comment.
+    /// Where the comment is ([`CommentTarget::location`]).
     pub(crate) fn location(&self) -> Option<String> {
-        match &self.target {
-            CommentTarget::Review => None,
-            CommentTarget::File { path } => Some(path.as_unix_str().to_string()),
-            CommentTarget::Lines { path, side, lines } => {
-                let path = path.as_unix_str();
-                let marker = match side {
-                    Side::Old => "~",
-                    Side::New => "",
-                };
-                Some(if lines.start() == lines.end() {
-                    format!("{path}:{marker}{}", lines.start())
-                } else {
-                    format!("{path}:{marker}{}-{marker}{}", lines.start(), lines.end())
-                })
-            }
-        }
+        self.target.location()
     }
 }
 
@@ -282,6 +355,9 @@ enum StoredTarget {
         side: Side,
         start: u32,
         end: u32,
+        /// Only for a range whose ends are on different sides.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_side: Option<Side>,
     },
 }
 
@@ -303,11 +379,17 @@ impl Comment {
             CommentTarget::File { path } => StoredTarget::File {
                 path: path.as_unix_str().to_string(),
             },
-            CommentTarget::Lines { path, side, lines } => StoredTarget::Lines {
+            CommentTarget::Lines {
+                path,
+                side,
+                lines,
+                start_side,
+            } => StoredTarget::Lines {
                 path: path.as_unix_str().to_string(),
                 side: *side,
                 start: *lines.start(),
                 end: *lines.end(),
+                start_side: (start_side != side).then_some(*start_side),
             },
         };
         let state = match &self.state {
@@ -340,15 +422,19 @@ impl Comment {
                 side,
                 start,
                 end,
+                start_side,
             } => {
+                let start_side = start_side.unwrap_or(side);
+                // A mixed range's ends count on different sides, so their order says nothing.
                 anyhow::ensure!(
-                    1 <= start && start <= end,
+                    1 <= start && 1 <= end && (start <= end || start_side != side),
                     "invalid line range {start}-{end}"
                 );
                 CommentTarget::Lines {
                     path: RepoPath::new(&path)?,
                     side,
                     lines: start..=end,
+                    start_side,
                 }
             }
         };
@@ -421,15 +507,24 @@ mod tests {
             },
             Comment {
                 id: CommentId(7),
-                target: CommentTarget::Lines {
-                    path: RepoPath::new("lib.rs").unwrap(),
-                    side: Side::Old,
-                    lines: 3..=5,
-                },
+                target: CommentTarget::lines(RepoPath::new("lib.rs").unwrap(), Side::Old, 3..=5),
                 comment_type: Some(CommentType::Issue),
                 body: "x".into(),
                 line_text: Some("a\nb\nc".into()),
                 state: CommentState::Outdated,
+            },
+            Comment {
+                id: CommentId(8),
+                target: CommentTarget::Lines {
+                    path: RepoPath::new("lib.rs").unwrap(),
+                    side: Side::Old,
+                    lines: RangeInclusive::new(30, 4),
+                    start_side: Side::New,
+                },
+                comment_type: None,
+                body: "mixed".into(),
+                line_text: Some("a\nb".into()),
+                state: CommentState::Draft,
             },
         ];
         for comment in comments {
@@ -449,5 +544,18 @@ mod tests {
         assert_eq!(comment.location().as_deref(), Some("a.rs:2"));
         let reversed = r#"{"target":{"kind":"lines","path":"a.rs","side":"new","start":3,"end":2},"body":"b"}"#;
         assert!(Comment::from_json(CommentId(1), reversed).is_err());
+        // A range from old line 6 to new line 8; the side is only stored when it differs.
+        let mixed = r#"{"target":{"kind":"lines","path":"a.rs","side":"new","start":6,"end":8,"start_side":"old"},"body":"b"}"#;
+        let comment = Comment::from_json(CommentId(1), mixed).unwrap();
+        assert!(comment.target.is_mixed());
+        assert_eq!(comment.location().as_deref(), Some("a.rs:~6-8"));
+        assert!(
+            comment
+                .to_json()
+                .unwrap()
+                .contains(r#""start":6,"end":8,"start_side":"old""#)
+        );
+        let one_side = Comment::from_json(CommentId(1), minimal).unwrap();
+        assert!(!one_side.to_json().unwrap().contains("start_side"));
     }
 }

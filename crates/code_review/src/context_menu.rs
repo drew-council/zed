@@ -156,8 +156,9 @@ pub(crate) fn menu_items(
             )
         });
     let path = target.as_ref().and_then(|target| target.path().cloned());
-    let line_count = match &target {
-        Some(CommentTarget::Lines { lines, .. }) => Some(lines.clone().count()),
+    // Whether there are lines here, and whether there are several.
+    let line_range = match &target {
+        Some(target @ CommentTarget::Lines { .. }) => Some(target.is_range()),
         Some(CommentTarget::File { .. } | CommentTarget::Review) | None => None,
     };
     let session = session.read(cx);
@@ -167,7 +168,7 @@ pub(crate) fn menu_items(
     let mut items = Vec::new();
     items.push(MenuItem::Entry(
         entry(
-            if line_count.is_some_and(|count| count > 1) {
+            if line_range == Some(true) {
                 "Comment on Selected Lines"
             } else {
                 "Add Comment"
@@ -280,7 +281,7 @@ pub(crate) fn menu_items(
     items.push(MenuItem::Separator);
     items.push(MenuItem::Entry(
         entry(
-            if line_count.is_some_and(|count| count > 1) {
+            if line_range == Some(true) {
                 "Copy Selected Lines"
             } else {
                 "Copy Line"
@@ -288,7 +289,7 @@ pub(crate) fn menu_items(
             Some(CopySelectedLines.boxed_clone()),
             Command::Dispatch(CopySelectedLines.boxed_clone()),
         )
-        .disabled_because(line_count.is_none().then(|| "No lines to copy here".into())),
+        .disabled_because(line_range.is_none().then(|| "No lines to copy here".into())),
     ));
     items.push(MenuItem::Entry(entry(
         "Copy Review as Markdown",

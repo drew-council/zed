@@ -373,9 +373,27 @@ fn cycle_type(blocks: &WeakEntity<CommentBlocks>, id: CommentId, forward: bool, 
 /// A comment's block sits below its last line, so a single line needs no label. The line numbers
 /// follow edits while the review is open.
 fn location_label(target: &CommentTarget) -> Option<SharedString> {
+    let line_label = |side: Side, line: u32| match side {
+        Side::New => format!("Line {line}"),
+        Side::Old => format!("Old line {line}"),
+    };
     match target {
         CommentTarget::Review => None,
         CommentTarget::File { .. } => Some("File comment".into()),
+        // As GitHub's threads say it ([`super::thread_location`]).
+        CommentTarget::Lines {
+            lines,
+            side,
+            start_side,
+            ..
+        } if start_side != side => Some(
+            format!(
+                "{} – {}",
+                line_label(*start_side, *lines.start()),
+                line_label(*side, *lines.end()).to_lowercase()
+            )
+            .into(),
+        ),
         CommentTarget::Lines { lines, side, .. } if lines.start() != lines.end() => {
             let label = match side {
                 Side::New => "Lines",
@@ -387,7 +405,7 @@ fn location_label(target: &CommentTarget) -> Option<SharedString> {
             side: Side::Old,
             lines,
             ..
-        } => Some(format!("Old line {}", lines.start()).into()),
+        } => Some(line_label(Side::Old, *lines.start()).into()),
         CommentTarget::Lines { .. } => None,
     }
 }
@@ -460,25 +478,25 @@ impl Render for CommentView {
         } else {
             colors.border_variant
         };
-        let body = match &self.editing {
-            Some(editing) => v_flex()
-                .w_full()
-                .child(
-                    div()
+        let body =
+            match &self.editing {
+                Some(editing) => {
+                    v_flex()
                         .w_full()
-                        .min_h(window.line_height())
-                        .child(EditorElement::new(&editing.editor, comment_editor_style(cx))),
-                )
-                .child(self.render_footer(editing, cx))
-                .into_any_element(),
-            None => div()
-                .w_full()
-                .child(MarkdownElement::new(
-                    self.markdown.clone(),
-                    comment_markdown_style(window, cx),
-                ))
-                .into_any_element(),
-        };
+                        .child(div().w_full().min_h(window.line_height()).child(
+                            EditorElement::new(&editing.editor, comment_editor_style(cx)),
+                        ))
+                        .child(self.render_footer(editing, cx))
+                        .into_any_element()
+                }
+                None => div()
+                    .w_full()
+                    .child(MarkdownElement::new(
+                        self.markdown.clone(),
+                        comment_markdown_style(window, cx),
+                    ))
+                    .into_any_element(),
+            };
         let blocks = self.blocks.clone();
 
         h_flex()
@@ -565,5 +583,40 @@ impl Render for CommentView {
                 self.render_buttons()
                     .map(|buttons| div().flex_none().pt_0p5().pr_1().child(buttons)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git::repository::RepoPath;
+    use std::ops::RangeInclusive;
+
+    #[test]
+    fn test_location_label() {
+        let target = |start_side, lines, side| CommentTarget::Lines {
+            path: RepoPath::new("a.rs").unwrap(),
+            side,
+            lines,
+            start_side,
+        };
+        let label = |target| location_label(&target).map(|label| label.to_string());
+        assert_eq!(label(target(Side::New, 3..=3, Side::New)), None);
+        assert_eq!(
+            label(target(Side::Old, 3..=3, Side::Old)).as_deref(),
+            Some("Old line 3")
+        );
+        assert_eq!(
+            label(target(Side::New, 3..=5, Side::New)).as_deref(),
+            Some("Lines 3–5")
+        );
+        assert_eq!(
+            label(target(Side::Old, 6..=8, Side::New)).as_deref(),
+            Some("Old line 6 – line 8")
+        );
+        assert_eq!(
+            label(target(Side::New, RangeInclusive::new(8, 6), Side::Old)).as_deref(),
+            Some("Line 8 – old line 6")
+        );
     }
 }

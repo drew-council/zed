@@ -943,11 +943,11 @@ mod tests {
             let id = session
                 .add_comment(
                     NewComment {
-                        target: CommentTarget::Lines {
-                            path: RepoPath::new("src/lib.rs").unwrap(),
-                            side: crate::comments::Side::New,
-                            lines: 3..=4,
-                        },
+                        target: CommentTarget::lines(
+                            RepoPath::new("src/lib.rs").unwrap(),
+                            crate::comments::Side::New,
+                            3..=4,
+                        ),
                         line_text: Some("line 3\nline 4".into()),
                     },
                     cx,
@@ -1010,11 +1010,11 @@ mod tests {
             let second = session.comments().get(second).unwrap();
             assert_eq!(
                 second.target,
-                CommentTarget::Lines {
-                    path: RepoPath::new("src/lib.rs").unwrap(),
-                    side: crate::comments::Side::New,
-                    lines: 10..=11,
-                }
+                CommentTarget::lines(
+                    RepoPath::new("src/lib.rs").unwrap(),
+                    crate::comments::Side::New,
+                    10..=11,
+                )
             );
             assert_eq!(second.line_text.as_deref(), Some("line 10\nline 11"));
             // Their lines are compared with their files once those are shown.

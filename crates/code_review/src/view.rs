@@ -453,27 +453,37 @@ fn remote_items(
     let mut moved = BTreeMap::<RepoPath, Vec<RemoteThreadContent>>::new();
     for thread in pull_request.threads() {
         let placement = match place_thread(thread, local_head, commentable, filters) {
-            Some(ThreadPlacement::Inline(CommentTarget::Lines {
-                path,
-                side: Side::New,
-                lines,
-            })) => match local.head_to_working(&path, lines, cx) {
-                LineMapping::Lines(lines) => Some(ThreadPlacement::Inline(CommentTarget::Lines {
-                    path,
-                    side: Side::New,
-                    lines,
-                })),
-                LineMapping::Changed => {
-                    let location = thread_location(thread, true)
-                        .map(|location| format!("{location} · changed locally").into());
-                    moved.entry(path).or_default().push(RemoteThreadContent {
-                        thread: thread.clone(),
-                        location,
-                    });
-                    continue;
+            Some(ThreadPlacement::Inline(target))
+                if matches!(
+                    target,
+                    CommentTarget::Lines { side, start_side, .. }
+                        if side == Side::New || start_side == Side::New
+                ) =>
+            {
+                match target.map_new_lines(|path, lines| {
+                    match local.head_to_working(path, lines, cx) {
+                        LineMapping::Lines(lines) => Ok(lines),
+                        mapping => Err(mapping),
+                    }
+                }) {
+                    Ok(target) => Some(ThreadPlacement::Inline(target)),
+                    Err(LineMapping::Changed) => {
+                        let Some(path) = target.path().cloned() else {
+                            continue;
+                        };
+                        let location = thread_location(thread, true)
+                            .map(|location| format!("{location} · changed locally").into());
+                        moved.entry(path).or_default().push(RemoteThreadContent {
+                            thread: thread.clone(),
+                            location,
+                        });
+                        continue;
+                    }
+                    Err(LineMapping::Unknown | LineMapping::Failed | LineMapping::Lines(_)) => {
+                        continue;
+                    }
                 }
-                LineMapping::Unknown | LineMapping::Failed => continue,
-            },
+            }
             placement => placement,
         };
         match placement {
@@ -2377,17 +2387,8 @@ impl ReviewView {
             let is_moved = matches!(key, RemoteKey::Moved(_));
             for thread in view.read(cx).threads() {
                 let location = match target {
-                    CommentTarget::Lines { path, side, lines } if !is_moved => {
-                        let marker = match side {
-                            Side::Old => "~",
-                            Side::New => "",
-                        };
-                        let path = path.as_unix_str();
-                        if lines.start() == lines.end() {
-                            format!("{path}:{marker}{}", lines.end())
-                        } else {
-                            format!("{path}:{marker}{}-{marker}{}", lines.start(), lines.end())
-                        }
+                    CommentTarget::Lines { .. } if !is_moved => {
+                        target.location().unwrap_or_default()
                     }
                     _ => target
                         .path()
