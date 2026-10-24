@@ -504,15 +504,13 @@ pub enum LinesRefusal {
     Outside,
     StartOutside,
     EndOutside,
-    /// The range's ends are in different hunks, so it spans unchanged lines the diff hides.
-    AcrossHunks,
     /// The range's start comes after its end in the diff.
     Reversed,
 }
 
 /// Whether lines from `start` to `end` can get a comment in a diff of `hunks`: both ends inside
-/// the same hunk, the start not after the end. GitHub's API takes a range across hunks too (LV
-/// §5.2), but such a range covers unchanged lines the diff doesn't show, so reviews refuse it.
+/// its hunks, the start not after the end. The ends may be in different hunks, as GitHub's API
+/// takes them (LV L8).
 pub fn check_lines(
     hunks: &[Hunk],
     start: (DiffSide, u32),
@@ -526,9 +524,6 @@ pub fn check_lines(
         (None, Some(_)) => Err(LinesRefusal::StartOutside),
         (Some(_), None) => Err(LinesRefusal::EndOutside),
         (Some(start), Some(end)) if start > end => Err(LinesRefusal::Reversed),
-        (Some((start_hunk, _)), Some((end_hunk, _))) if start_hunk != end_hunk => {
-            Err(LinesRefusal::AcrossHunks)
-        }
         _ => Ok(()),
     }
 }
@@ -592,23 +587,11 @@ impl CommentableLines {
             .is_some()
     }
 
-    /// Whether a comment can span from `start` to `end`: both ends must be commentable and the
-    /// start mustn't come after the end in the diff. A range may span hunks.
+    /// Whether a comment can span from `start` to `end` ([`check_lines`]).
     pub fn allows_range(&self, path: &str, start: (DiffSide, u32), end: (DiffSide, u32)) -> bool {
-        let Some(file) = self.file(path) else {
-            return false;
-        };
-        match (
-            file.diff_position(start.0, start.1),
-            file.diff_position(end.0, end.1),
-        ) {
-            (Some(start), Some(end)) => start <= end,
-            _ => false,
-        }
+        self.check_range(path, start, end).is_ok()
     }
 
-    /// Whether a new comment can span from `start` to `end` ([`check_lines`]). Stricter than
-    /// [`Self::allows_range`], which places existing threads.
     pub fn check_range(
         &self,
         path: &str,
@@ -1023,10 +1006,10 @@ pub(crate) mod tests {
             check((Right, 30), (Right, 33)),
             Err(LinesRefusal::StartOutside)
         );
-        assert_eq!(
-            check((Right, 3), (Right, 33)),
-            Err(LinesRefusal::AcrossHunks)
-        );
+        // A range may span hunks, as on GitHub.
+        assert_eq!(check((Right, 3), (Right, 33)), Ok(()));
+        assert_eq!(check((Left, 2), (Right, 35)), Ok(()));
+        assert_eq!(check((Right, 33), (Right, 3)), Err(LinesRefusal::Reversed));
         assert_eq!(check((Right, 5), (Right, 3)), Err(LinesRefusal::Reversed));
         // An old line comes before the new line that replaced it, not after.
         assert_eq!(check((Left, 2), (Right, 2)), Ok(()));

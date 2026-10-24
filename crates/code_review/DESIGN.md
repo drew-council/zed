@@ -709,7 +709,7 @@ state dir):**
   range on that side (context rows on both); no `patch` → no lines (file comments only).
   `allows_range` = both ends allowed and the start not after the end **in the patch's row order**
   (a hunk with several changes interleaves deletions and additions, so "deletions first" isn't
-  enough); ranges may span hunks (new comments may not: bugs 2 item 1). Paths: a renamed file is
+  enough); ranges may span hunks (LV L8), new comments too. Paths: a renamed file is
   found by its old path too; `current_path` gives the new path for submit. `contains_file` is true
   for files of the PR, and for any file when the list is `truncated` (they might be in the PR;
   lines stay refused).
@@ -2070,11 +2070,12 @@ open. Upstream edits: the settings block only (§3.10).
   asked for credentials and was cancelled).
 
 **Bugs 2, item 1 (comments stay in the diff's hunks)** — every line or range comment, from any
-path, must have both ends in one hunk (`forge::check_lines`, checked by `CommentBlocks::check`; the
-"+" on a selection checks the whole selection). **Decisions**: a new range across hunks is refused
-although GitHub's API takes it (LV L8; existing threads still may); local reviews use the hunks
-`git diff` would show (3 context lines, `Hunk::with_context`), like tuicr, so expanded context rows
-are refused there too. Refusals are toasts or disabled entries with the reason.
+path, must have both ends in the diff's hunks, the start not after the end (`forge::check_lines`,
+checked by `CommentBlocks::check`; the "+" on a selection checks the whole selection).
+**Decisions**: what GitHub's API takes is allowed (the user's rule), so a range may span hunks (LV
+L8), in local reviews too; local reviews use the hunks `git diff` would show (3 context lines,
+`Hunk::with_context`), like tuicr, so expanded context rows are refused there. Refusals are toasts
+or disabled entries with the reason.
 
 **Bugs 2, item 2 (collapsing the overview in split view)** — the split view measured the
 full-width overview after both sides were prepainted, and a notification during a draw schedules no
