@@ -299,9 +299,11 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   author, date and the markdown body (16 lines, then it scrolls; "…and more commits" past the limit).
   Commit messages can't be commented on. `ToggleHeader` has no default key.
 - **Titles**: "Review: Uncommitted changes", "Review: ‹branch› vs ‹base›", "Review: ‹sha7› ‹subject (20
-  chars)›", "Review: ‹n› commits ‹oldest7›–‹newest7›" ("‹n›+ commits up to ‹newest7›" when truncated;
-  before the commits load, the head's short sha). Snapshot tabs add "Read-only snapshot (no language
-  server)" to the tooltip. The panel shows the same title and follows changes.
+  chars)›" ("Review: #‹N› ‹subject (20 chars)›" for a squash merge's "subject (#N)"; the tooltip keeps
+  the sha and the whole subject), "Review: ‹n› commits ‹oldest7›–‹newest7›" ("‹n›+ commits up to
+  ‹newest7›" when truncated; before the commits load, the head's short sha). Snapshot tabs add
+  "Read-only snapshot (no language server)" to the tooltip. The panel shows the same title and
+  follows changes.
 - **Reuse**: same target (`ReviewTarget::is_same_review`) and same repository → activate the open tab;
   anything else opens another tab. Persistence keys for M5 (§2.6): branch = repo + current branch name
   + base; commits = repo + `base..head`.

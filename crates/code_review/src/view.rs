@@ -2619,7 +2619,11 @@ impl Item for ReviewView {
             ReviewTarget::PullRequest(target) => {
                 format!("Review: {} ({})", self.title(cx), target.repo)
             }
-            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
+            ReviewTarget::Commits(_) => match self.top_block.read(cx).commits_tooltip() {
+                Some(description) => format!("Review: {description}"),
+                None => format!("Review: {}", self.title(cx)),
+            },
+            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } => {
                 format!("Review: {}", self.title(cx))
             }
         };

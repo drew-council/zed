@@ -303,11 +303,18 @@ impl ReviewTopBlock {
         };
         let title = match (commits.as_slice(), *truncated) {
             ([], _) => range.head.display_short(),
-            ([commit], false) => format!(
-                "{} {}",
-                commit.data.sha.display_short(),
-                truncate_and_trailoff(&commit.data.subject, 20)
-            ),
+            // GitHub's squash merges end their subject with the pull request's number, which the
+            // cut subject would lose.
+            ([commit], false) => match split_pull_request_suffix(&commit.data.subject) {
+                Some((subject, number)) => {
+                    format!("#{number} {}", truncate_and_trailoff(subject, 20))
+                }
+                None => format!(
+                    "{} {}",
+                    commit.data.sha.display_short(),
+                    truncate_and_trailoff(&commit.data.subject, 20)
+                ),
+            },
             ([newest, ..], true) => format!(
                 "{}+ commits up to {}",
                 commits.len(),
@@ -321,6 +328,31 @@ impl ReviewTopBlock {
             ),
         };
         Some(title.into())
+    }
+
+    /// The tab tooltip of a commit review: a single commit's sha and whole subject, else
+    /// [`Self::commits_title`].
+    pub(crate) fn commits_tooltip(&self) -> Option<SharedString> {
+        if let TopBlockContent::Commits {
+            commits:
+                CommitsState::Loaded {
+                    commits,
+                    truncated: false,
+                },
+            ..
+        } = &self.content
+            && let [commit] = commits.as_slice()
+        {
+            return Some(
+                format!(
+                    "{} {}",
+                    commit.data.sha.display_short(),
+                    commit.data.subject
+                )
+                .into(),
+            );
+        }
+        self.commits_title()
     }
 
     fn render_branch(
@@ -904,6 +936,15 @@ fn render_commit(
 fn commit_body(message: &str) -> Option<String> {
     let body = message.split_once('\n')?.1.trim();
     (!body.is_empty()).then(|| body.to_string())
+}
+
+/// A subject ending like GitHub's squash merges, "Subject (#123)": the subject without that
+/// suffix, and the pull request's number.
+fn split_pull_request_suffix(subject: &str) -> Option<(&str, &str)> {
+    let (subject, number) = subject.strip_suffix(')')?.rsplit_once(" (#")?;
+    let subject = subject.trim_end();
+    (!subject.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((subject, number))
 }
 
 impl Render for ReviewTopBlock {
