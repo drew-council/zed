@@ -280,7 +280,8 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
   the title with the whole subject, truncated to the width on one line, plus "Read-only snapshot"),
   expanded = up to 100 commits newest first with sha, subject (wrapped), author, date and the
   markdown body (16 lines, then it scrolls; "…and more commits" past the limit). Commit messages
-  can't be commented on. `ToggleHeader` has no default key.
+  can't be commented on. `ToggleHeader` is `; t` in the review tab's vim normal mode (user decision,
+  bugs round 2; the disclosures' tooltips show it) and in the palette.
 - **Titles**: "Review: Uncommitted changes", "Review: ‹branch› vs ‹base›", "Review: ‹sha7› ‹subject (20
   chars)›" ("Review: #‹N› ‹subject (20 chars)›" for a squash merge's "subject (#N)"; the tooltip keeps
   the sha and the whole subject), "Review: ‹n› commits ‹oldest7›–‹newest7›" ("‹n›+ commits up to
@@ -1779,8 +1780,9 @@ Q4 no automatic scroll after posting). Upstream glue: one `editor` commit with c
   height is known; pending until the block exists when `; c` creates it). After leaving a review
   comment the view stays on the overview; the diff's cursor stays where it was, and the next motion
   scrolls back to it. Sticky file headers: none while the view's top is in the overview.
-- **Collapsing** (Q3): the existing disclosure / `ToggleHeader`; pull requests start expanded,
-  commit messages collapsed; collapsed keeps the header line and the warnings.
+- **Collapsing** (Q3): the existing disclosure / `ToggleHeader` (`; t` since bugs round 2); pull
+  requests start expanded, commit messages collapsed; collapsed keeps the header line and the
+  warnings.
 - Tests: 4 new `code_review` tests (206 total + 1 ignored; stable under `ITERATIONS=5`): the PR
   overview as the first block above the first header, the 21-line description taller than 8 lines,
   scrolled away with the first header sticky, `G g g` → header at the top, collapse by a click and
@@ -2479,6 +2481,7 @@ move line by line; there is no column.
 | `e` | open file at cursor line in a normal editor |
 | `y` / `Y` / visual `y` | copy review as markdown / copy comment at cursor / copy selected source lines |
 | `;f` / `;e` / `;h` / `;l` | focus mode / toggle panel / focus panel / focus diff |
+| `;t` | collapse / expand the review's overview (`ToggleHeader`) |
 | `a`, `o`, … | no-ops (would otherwise enter a useless insert mode on a read-only buffer) |
 
 - **Old-side (deleted-line) comments:** unified view → `c` on deleted rows (they are real rows);

@@ -1,4 +1,5 @@
 use crate::{
+    ToggleHeader,
     comments::{
         CommentBlocks, HoveredLink, comment_markdown_style, github_markdown, open_web_link,
         untrusted_markdown,
@@ -458,11 +459,14 @@ impl ReviewTopBlock {
                     .debug_selector(|| "review-pull-request-disclosure".into())
                     .child(
                         Disclosure::new("review-pull-request-description", self.expanded)
-                            .tooltip(Tooltip::text(if self.expanded {
-                                "Hide Description"
-                            } else {
-                                "Show Description"
-                            }))
+                            .tooltip(Tooltip::for_action_title(
+                                if self.expanded {
+                                    "Hide Description"
+                                } else {
+                                    "Show Description"
+                                },
+                                &ToggleHeader,
+                            ))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
                     ),
             )
@@ -709,11 +713,14 @@ impl ReviewTopBlock {
             .gap_1()
             .child(
                 Disclosure::new("review-commit-messages", self.expanded)
-                    .tooltip(Tooltip::text(if self.expanded {
-                        "Hide Commit Messages"
-                    } else {
-                        "Show Commit Messages"
-                    }))
+                    .tooltip(Tooltip::for_action_title(
+                        if self.expanded {
+                            "Hide Commit Messages"
+                        } else {
+                            "Show Commit Messages"
+                        },
+                        &ToggleHeader,
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
             )
             .child(Label::new(summary).size(LabelSize::Small).truncate())

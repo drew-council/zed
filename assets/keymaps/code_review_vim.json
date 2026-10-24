@@ -57,6 +57,7 @@
       "[ u": "code_review::PreviousUnreviewedFile",
       "e": "code_review::OpenFileAtCursor",
       "; f": "code_review::ToggleSingleFileMode",
+      "; t": "code_review::ToggleHeader",
       "; e": "code_review::TogglePanel",
       "; h": "code_review::FocusPanel",
       "; l": "code_review::FocusDiff",
