@@ -4506,7 +4506,7 @@ pub(crate) mod tests {
             assert!(cx.debug_bounds("review-overview").is_some());
             assert!(!has_sticky_header(cx));
 
-            // Its disclosure collapses it to the header line, which `; t`'s action expands.
+            // Its disclosure collapses it to the header line, which `; t` expands and collapses.
             scroll_to(0., cx);
             let disclosure = cx
                 .debug_bounds("review-pull-request-disclosure")
@@ -4520,7 +4520,15 @@ pub(crate) mod tests {
                 cx.debug_bounds("review-pull-request-description-text")
                     .is_none()
             );
-            cx.dispatch_action(crate::ToggleHeader);
+            cx.simulate_keystrokes("; t");
+            draw(cx);
+            cx.run_until_parked();
+            assert_eq!(first_blocks(&rhs, cx)[0].2, overview_rows);
+            cx.simulate_keystrokes("; t");
+            draw(cx);
+            cx.run_until_parked();
+            assert_eq!(first_blocks(&rhs, cx)[0].2, collapsed_rows);
+            cx.simulate_keystrokes("; t");
             draw(cx);
             cx.run_until_parked();
             assert_eq!(first_blocks(&rhs, cx)[0].2, overview_rows);

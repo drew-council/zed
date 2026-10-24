@@ -7,6 +7,7 @@
       "] u": "code_review::NextUnreviewedFile",
       "[ u": "code_review::PreviousUnreviewedFile",
       "; f": "code_review::ToggleSingleFileMode",
+      "; t": "code_review::ToggleHeader",
       "; e": "code_review::TogglePanel",
       "; h": "code_review::FocusPanel",
       "; l": "code_review::FocusDiff",
