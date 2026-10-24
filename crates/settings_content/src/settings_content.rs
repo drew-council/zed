@@ -1206,8 +1206,9 @@ pub struct JournalSettingsContent {
 pub struct CodeReviewSettingsContent {
     /// The GitHub search the Start Review picker lists pull requests by, in GitHub's search syntax
     /// (`AND`, `OR` and parentheses work); the picker can edit it (`ctrl-r`). It is limited to the
-    /// repository's open pull requests (unless it names a state, like `is:merged`) and sorted by
-    /// last update unless it has a `sort:` qualifier.
+    /// repository's open pull requests (unless it names a state, like `is:merged`), leaves out
+    /// drafts (unless it names them, like `is:draft`) and is sorted by last update unless it has a
+    /// `sort:` qualifier.
     ///
     /// Default: "review-requested:@me"
     pub pull_request_search: Option<String>,

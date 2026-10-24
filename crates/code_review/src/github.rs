@@ -1344,23 +1344,34 @@ fn summary(node: PullRequestSummaryNode, viewer: &str) -> PullRequestSummary {
 
 /// The user's `search` goes in parentheses, so that an `OR` at its top level can't reach beyond
 /// the repository's pull requests. Only open pull requests are found unless the search names a
-/// state (`is:closed`, `is:merged`, `state:…`).
+/// state (`is:closed`, `is:merged`, `state:…`), and drafts are left out unless it names them
+/// (`is:draft`, `draft:true`, `-draft:false`…).
 fn pull_request_search_query(repo: &ForgeRepo, search: &str) -> String {
     let search = search.trim();
-    let names_state = search.split_whitespace().any(|term| {
-        let term = term
-            .trim_start_matches(['(', '-'])
-            .trim_end_matches(')')
-            .to_ascii_lowercase();
+    let terms = search
+        .split_whitespace()
+        .map(|term| {
+            term.trim_start_matches(['(', '-'])
+                .trim_end_matches(')')
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let names_state = terms.iter().any(|term| {
         term.starts_with("state:")
             || matches!(
                 term.as_str(),
                 "is:open" | "is:closed" | "is:merged" | "is:unmerged"
             )
     });
+    let names_drafts = terms
+        .iter()
+        .any(|term| term.starts_with("draft:") || term == "is:draft");
     let mut query = format!("repo:{repo} is:pr");
     if !names_state {
         query.push_str(" is:open");
+    }
+    if !names_drafts {
+        query.push_str(" draft:false");
     }
     if !search.is_empty() {
         query.push_str(&format!(" ({search})"));
@@ -2928,6 +2939,9 @@ pub(crate) mod test_support {
     pub(crate) const OPEN_PULL_REQUESTS: &str =
         include_str!("../test_data/github/open-pull-requests.json");
     pub(crate) const FORK_CONTEXT: &str = include_str!("../test_data/github/fork-context.json");
+    /// The sandbox's draft pull request #17, as `SearchPullRequests` found it with `is:draft`.
+    pub(crate) const DRAFT_PULL_REQUESTS: &str =
+        include_str!("../test_data/github/draft-pull-requests.json");
 
     pub(crate) const PR1_HEAD_OID: &str = "3f22f1b3bd52ed79a655a055209707e356fa8253";
     pub(crate) const PR1_BASE_OID: &str = "deea36cf8fa38276ef75801d05773c4c35c48d45";
@@ -3722,6 +3736,16 @@ mod tests {
         .unwrap();
         block_on(client.search_pull_requests(&sandbox(), "drew-council", "  ")).unwrap();
         block_on(client.search_pull_requests(&sandbox(), "drew-council", "-STATE:closed")).unwrap();
+        // Drafts are left out unless the search names them.
+        for search in [
+            "is:draft",
+            "(review-requested:@me OR Draft:TRUE)",
+            "-draft:false",
+            "draft:false author:@me",
+            "draft review-requested:@me",
+        ] {
+            block_on(client.search_pull_requests(&sandbox(), "drew-council", search)).unwrap();
+        }
 
         let requests = requests.lock().unwrap();
         let queries = requests
@@ -3732,16 +3756,31 @@ mod tests {
             queries,
             [
                 json!({
-                    "query": "repo:drew-council/code-review-sandbox is:pr (is:open (author:a OR author:b)) sort:updated-desc",
+                    "query": "repo:drew-council/code-review-sandbox is:pr draft:false (is:open (author:a OR author:b)) sort:updated-desc",
                 }),
                 json!({
-                    "query": "repo:drew-council/code-review-sandbox is:pr (is:closed sort:created-asc)",
+                    "query": "repo:drew-council/code-review-sandbox is:pr draft:false (is:closed sort:created-asc)",
                 }),
                 json!({
-                    "query": "repo:drew-council/code-review-sandbox is:pr is:open sort:updated-desc",
+                    "query": "repo:drew-council/code-review-sandbox is:pr is:open draft:false sort:updated-desc",
                 }),
                 json!({
-                    "query": "repo:drew-council/code-review-sandbox is:pr (-STATE:closed) sort:updated-desc",
+                    "query": "repo:drew-council/code-review-sandbox is:pr draft:false (-STATE:closed) sort:updated-desc",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr is:open (is:draft) sort:updated-desc",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr is:open ((review-requested:@me OR Draft:TRUE)) sort:updated-desc",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr is:open (-draft:false) sort:updated-desc",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr is:open (draft:false author:@me) sort:updated-desc",
+                }),
+                json!({
+                    "query": "repo:drew-council/code-review-sandbox is:pr is:open draft:false (draft review-requested:@me) sort:updated-desc",
                 }),
             ]
         );
@@ -5457,7 +5496,7 @@ mod tests {
             .map(|request| request.variables().clone());
         assert_eq!(
             search_variables,
-            Some(json!({ "query": "repo:zed-industries/zed is:pr (is:open) sort:updated-desc" }))
+            Some(json!({ "query": "repo:zed-industries/zed is:pr draft:false (is:open) sort:updated-desc" }))
         );
 
         // Resolved once.
@@ -5721,6 +5760,7 @@ mod tests {
             [1, 2, 3, 4].iter().all(|number| numbers.contains(number)) && !numbers.contains(&5),
             "{numbers:?}"
         );
+        assert!(open.iter().all(|pull_request| !pull_request.is_draft));
         forge
             .search_pull_requests("is:open (review-requested:@me OR author:@me)".into())
             .await

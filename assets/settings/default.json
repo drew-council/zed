@@ -2015,8 +2015,9 @@
     // The GitHub search the Start Review picker lists pull requests by, in
     // GitHub's search syntax (`AND`, `OR` and parentheses work); the picker can
     // edit it (`ctrl-r`). It is limited to the repository's open pull requests
-    // (unless it names a state, like `is:merged`) and sorted by last update
-    // unless it has a `sort:` qualifier.
+    // (unless it names a state, like `is:merged`), leaves out drafts (unless it
+    // names them, like `is:draft`) and is sorted by last update unless it has a
+    // `sort:` qualifier.
     "pull_request_search": "review-requested:@me",
     // Whether the Start Review picker leaves out the pull requests you approved.
     "hide_approved_pull_requests": true,
