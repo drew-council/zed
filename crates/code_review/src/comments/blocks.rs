@@ -1422,9 +1422,24 @@ impl CommentBlocks {
             .downgrade();
         let vim_save = vim_save_action_type(self.workspace.clone(), cx);
         let blocks = cx.weak_entity();
+        // Created with its text, so that undo can't empty it.
+        let buffer = cx.new(|cx| {
+            let buffer = Buffer::local(body, cx);
+            // Fenced code blocks only get their language's highlighting through the registry.
+            buffer.set_language_registry(self.language_registry.clone());
+            buffer
+        });
+        cx.spawn({
+            let buffer = buffer.clone();
+            let language_registry = self.language_registry.clone();
+            async move |_, cx| {
+                let markdown = language_registry.language_for_name("Markdown").await?;
+                buffer.update(cx, |buffer, cx| buffer.set_language(Some(markdown), cx));
+                anyhow::Ok(())
+            }
+        })
+        .detach_and_log_err(cx);
         let editor = cx.new(|cx| {
-            // Created with its text, so that undo can't empty it.
-            let buffer = cx.new(|cx| Buffer::local(body, cx));
             let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
             let mut editor = Editor::new(
                 EditorMode::AutoHeight {
@@ -2829,6 +2844,7 @@ mod tests {
     use fs::Fs as _;
     use git::repository::RepoPath;
     use gpui::{Action as _, TestAppContext, VisualTestContext};
+    use language::{Language, LanguageConfig};
     use settings::DiffViewStyle;
     use std::path::Path;
     use util::path;
@@ -3013,6 +3029,46 @@ mod tests {
         cx.simulate_keystrokes("j");
         assert_eq!(cursor_line(&rhs, cx), "line 4");
         assert_eq!(cursor_point(&rhs, cx).row, row + 1);
+    }
+
+    /// Comment editors are Markdown buffers with the registry, which fenced code blocks need for
+    /// their own language's highlighting.
+    #[gpui::test]
+    async fn test_comment_editor_is_markdown(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let language_registry = review.read_with(cx, |review, cx| review.language_registry(cx));
+        language_registry.add(Arc::new(Language::new(
+            LanguageConfig {
+                name: "Markdown".into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        let rhs = rhs_editor(&review, cx);
+
+        move_to_row_with_text(&rhs, "line 3", cx);
+        cx.simulate_keystrokes("c");
+        cx.run_until_parked();
+        let editor = open_editor(&review, cx).unwrap();
+        let buffer = editor
+            .read_with(cx, |editor, cx| editor.buffer().read(cx).as_singleton())
+            .unwrap();
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(
+                buffer.language().map(|language| language.name()),
+                Some("Markdown".into())
+            );
+            assert!(
+                buffer
+                    .language_registry()
+                    .is_some_and(|registry| Arc::ptr_eq(&registry, &language_registry))
+            );
+        });
+        // Still a vim editor that types into the comment.
+        assert_eq!(vim_mode(&editor, cx).as_deref(), Some("insert"));
+        cx.simulate_input("```go");
+        assert_eq!(text(&editor, cx), "```go");
     }
 
     #[gpui::test]
