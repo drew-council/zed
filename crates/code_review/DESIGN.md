@@ -130,7 +130,7 @@ What exists:
 | `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, `LocalState` (`read_local_state`/`local_state`: HEAD, base present, local branches + upstreams, read from git), the pure `plan_checkout`, `head_remote`, `RestrictedMode` + `ensure_trusted`, `run_checkout` (Zed's fetch and branch switch, plus our own git jobs: `fast_forward` with the branch check, `ensure_fast_forward`, detach; `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
 | `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
 | `crates/code_review/src/github/stacks.graphql` | Stacks: the stacked pull request operations, sent after `queries.graphql` (`STACK_QUERIES`) so that a GitHub without stacks fails only them |
-| `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
+| `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the draft #17 found by `is:draft`, the `drew-council/zed` fork context, a NOT_FOUND) |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header controls (UX-1 B: "Comment" button, checkbox labelled "Reviewed"), `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
@@ -2085,6 +2085,15 @@ empty item plus a paragraph outside the list. **Decision**: commit message bodie
 marker's next line back (`top_block::join_bare_list_markers`, driven by pulldown-cmark's events, so
 quotes, code, headings and real items are untouched); pull request descriptions are left as GitHub
 renders them.
+
+**Bugs 2, item 5 (drafts left out of the pull requests)** — the query built around
+`code_review.pull_request_search` (`github::pull_request_search_query`) adds `draft:false` unless the
+search names drafts (`is:draft`, `draft:…`, negated too), as it adds `is:open` unless it names a
+state, so every search leaves drafts out and searches that already say `draft:false` (the user's
+own) are unchanged. A stack is still listed when one of its other pull requests matches, and shows
+its drafts. **Decision**: no setting; drafts show when the search names them (`ctrl-r`:
+`is:draft`, or `(is:draft OR draft:false)` for all). The sandbox's empty list with the default
+search is intended: nothing there requests the viewer's review (`review-requested:@me`).
 
 **Stacked pull requests (the user's request after the picker)** — "the code review panel … has no
 notion of what PRs are together in a GitHub stack … display in a separate section all PRs that

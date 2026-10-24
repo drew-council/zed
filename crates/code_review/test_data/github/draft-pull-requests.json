@@ -1,0 +1,26 @@
+{
+  "data": {
+    "search": {
+      "nodes": [
+        {
+          "number": 17,
+          "title": "Draft: work-in-progress probe notes",
+          "url": "https://github.com/drew-council/code-review-sandbox/pull/17",
+          "state": "OPEN",
+          "isDraft": true,
+          "isCrossRepository": false,
+          "headRefName": "draft/probe-notes",
+          "baseRefName": "main",
+          "updatedAt": "2026-10-24T19:32:08Z",
+          "author": {
+            "__typename": "User",
+            "login": "drew-council"
+          },
+          "latestOpinionatedReviews": {
+            "nodes": []
+          }
+        }
+      ]
+    }
+  }
+}

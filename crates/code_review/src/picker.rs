@@ -2197,8 +2197,8 @@ mod tests {
         use crate::github::{
             set_fake_token_source,
             test_support::{
-                OPEN_PULL_REQUESTS, PR1_DETAILS, Reply, fake_github, repository_context_reply,
-                stack_node, stacked_pull_request,
+                DRAFT_PULL_REQUESTS, OPEN_PULL_REQUESTS, PR1_DETAILS, Reply, fake_github,
+                repository_context_reply, stack_node, stacked_pull_request,
             },
         };
         use std::sync::atomic::Ordering;
@@ -2228,7 +2228,8 @@ mod tests {
             Some("SearchPullRequests") if fail_lists.load(Ordering::SeqCst) => {
                 Reply::status(401, r#"{"message":"Bad credentials"}"#)
             }
-            // The open pull requests, #2 approved by the viewer; nothing for "is:closed".
+            // The open pull requests, #2 approved by the viewer, and the draft #17 unless the
+            // search has "draft:false"; only #17 for "is:draft"; nothing for "is:closed".
             Some("SearchPullRequests") => {
                 let query = request.variables()["query"].as_str().unwrap_or_default();
                 let mut nodes = serde_json::from_str::<serde_json::Value>(OPEN_PULL_REQUESTS)
@@ -2237,6 +2238,16 @@ mod tests {
                 nodes[3]["latestOpinionatedReviews"] = json!({ "nodes": [
                     { "state": "APPROVED", "author": { "login": "drew-council" } },
                 ] });
+                let drafts = serde_json::from_str::<serde_json::Value>(DRAFT_PULL_REQUESTS)
+                    .unwrap()["data"]["search"]["nodes"]
+                    .clone();
+                if query.contains("is:draft") {
+                    nodes = drafts;
+                } else if !query.contains("draft:false")
+                    && let (Some(nodes), Some(drafts)) = (nodes.as_array_mut(), drafts.as_array())
+                {
+                    nodes.extend(drafts.iter().cloned());
+                }
                 if query.contains("is:closed") {
                     nodes = json!([]);
                 }
@@ -2373,7 +2384,7 @@ mod tests {
             ["1 pull request you approved is hidden"]
         );
         assert_eq!(selected_key(&picker, cx), Some(EntryKey::Uncommitted));
-        assert_eq!(searches(&requests, cx), ["is:open (review-requested:@me)"]);
+        assert_eq!(searches(&requests, cx), ["is:open draft:false (review-requested:@me)"]);
 
         // Editing the search: the query holds it, only the pull requests show (nothing
         // selectable), and its results follow the typing once it pauses.
@@ -2418,7 +2429,7 @@ mod tests {
         );
         assert_eq!(
             searches(&requests, cx),
-            ["is:open (review-requested:@me)", "(is:closed)"]
+            ["is:open draft:false (review-requested:@me)", "draft:false (is:closed)"]
         );
 
         // Enter keeps the edited search and opens nothing.
@@ -2443,7 +2454,7 @@ mod tests {
         dispatch(menu::Confirm, cx);
         assert_eq!(
             searches(&requests, cx)[2..],
-            ["(is:closed)".to_string(), "(is:open)".to_string()]
+            ["draft:false (is:closed)".to_string(), "draft:false (is:open)".to_string()]
         );
         assert_eq!(selected_key(&picker, cx), Some(EntryKey::PullRequest(4)));
 
@@ -2575,6 +2586,38 @@ mod tests {
             bounds.size.width >= gpui::px(1600. * 0.69),
             "{:?}",
             bounds.size
+        );
+    }
+
+    /// Drafts are left out of the pull requests unless the search asks for them.
+    #[gpui::test]
+    async fn test_pull_request_section_drafts(cx: &mut TestAppContext) {
+        let (_, workspace, requests, cx) =
+            pull_request_fixture(Default::default(), Default::default(), false, cx).await;
+        let listed = |picker: &Entity<Picker<StartReviewDelegate>>, cx: &mut VisualTestContext| {
+            picker.read_with(cx, |picker, _| {
+                picker
+                    .delegate
+                    .loaded_pull_requests()
+                    .iter()
+                    .map(|pull_request| (pull_request.number, pull_request.is_draft))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        dispatch(StartReview, cx);
+        let picker = start_review_picker(&workspace, cx);
+        cx.run_until_parked();
+        assert_eq!(listed(&picker, cx), [(4, false), (1, false), (3, false)]);
+
+        dispatch(EditPullRequestSearch, cx);
+        picker.update_in(cx, |picker, window, cx| picker.set_query("is:draft", window, cx));
+        dispatch(menu::Confirm, cx);
+        assert_eq!(listed(&picker, cx), [(17, true)]);
+        assert_eq!(selected_key(&picker, cx), Some(EntryKey::PullRequest(17)));
+        assert_eq!(
+            searches(&requests, cx),
+            ["is:open draft:false (review-requested:@me)", "is:open (is:draft)"]
         );
     }
 
