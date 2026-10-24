@@ -123,11 +123,7 @@ mod tests {
     }
 
     fn lines(path: &str, side: Side, start: u32, end: u32) -> CommentTarget {
-        CommentTarget::Lines {
-            path: RepoPath::new(path).unwrap(),
-            side,
-            lines: start..=end,
-        }
+        CommentTarget::lines(RepoPath::new(path).unwrap(), side, start..=end)
     }
 
     fn file(path: &str) -> CommentTarget {
@@ -183,6 +179,17 @@ mod tests {
             outdated,
             submitted,
             comment(8, CommentTarget::Review, None, ""),
+            comment(
+                9,
+                CommentTarget::Lines {
+                    path: RepoPath::new("src/a.rs").unwrap(),
+                    side: Side::New,
+                    lines: 9..=10,
+                    start_side: Side::Old,
+                },
+                None,
+                "removed and added",
+            ),
         ];
         let expected = "\
 I reviewed your code and have the following comments. Please address them.
@@ -196,11 +203,12 @@ Comment types: ISSUE (problems to fix), NOTE (observations)
 1. **[ISSUE]** `Review Comment (scope: staged + unstaged changes)` - Overall
 2. `src/a.rs:~7` - removed line
 3. `src/a.rs:~7-~9` - old range
-4. `src/a.rs:42` - first
+4. `src/a.rs:~9-10` - removed and added
+5. `src/a.rs:42` - first
    second
-5. `src/b.rs` - file comment
-6. **[NOTE]** `src/b.rs:3` (outdated) - moved?
-7. **[ISSUE]** `src/b.rs:10-12` - range
+6. `src/b.rs` - file comment
+7. **[NOTE]** `src/b.rs:3` (outdated) - moved?
+8. **[ISSUE]** `src/b.rs:10-12` - range
    second line
 ";
         assert_eq!(

@@ -155,11 +155,163 @@ enum Host {
 /// the same thing in another project (another window) has other buffers.
 #[derive(Default)]
 struct TabAnchors {
+    /// Each line comment's lines; for a range from one side of the diff to the other, its last
+    /// line.
+    ends: AnchorSet,
+    /// The first line of each range from one side of the diff to the other, in the buffer of
+    /// the other side.
+    starts: AnchorSet,
+}
+
+#[derive(Default)]
+struct AnchorSet {
     lines: HashMap<CommentId, LineAnchor>,
     /// Comments whose lines were deleted, or whose buffer was replaced. They are anchored on
     /// their line numbers again, and flagged outdated unless those lines still have their text
     /// (an outdated one is no longer outdated when they do).
     lost: HashSet<CommentId>,
+}
+
+impl TabAnchors {
+    fn remove(&mut self, id: CommentId) {
+        for set in [&mut self.ends, &mut self.starts] {
+            set.lines.remove(&id);
+            set.lost.remove(&id);
+        }
+    }
+}
+
+/// Lines of a comment to anchor in one buffer: all of them, or one end of a range from one
+/// side of the diff to the other.
+struct PartToAnchor<'a> {
+    id: CommentId,
+    lines: RangeInclusive<u32>,
+    /// Their text when the comment was made or last followed them.
+    line_text: Option<&'a str>,
+    is_outdated: bool,
+    is_submitted: bool,
+    needs_check: bool,
+    buffer: Entity<Buffer>,
+}
+
+#[derive(Default)]
+struct PartUpdate {
+    /// Whether the lines are outdated, when they were checked.
+    checked: Option<bool>,
+    /// Their anchor's lines or text changed.
+    moved: bool,
+}
+
+impl PartToAnchor<'_> {
+    /// Anchors the lines in `set` unless they are (comparing them with their text when the
+    /// comment needs a check), notices whether they were deleted, and records where they are
+    /// now in their anchor.
+    fn update(self, set: &mut AnchorSet, buffer: &BufferSnapshot) -> PartUpdate {
+        let Self {
+            id,
+            lines,
+            line_text,
+            is_outdated,
+            is_submitted,
+            needs_check,
+            buffer: buffer_entity,
+        } = self;
+        let mut update = PartUpdate::default();
+        // As it will be once this update's checks are applied.
+        let mut is_outdated = is_outdated;
+        let mut deleted_from = None;
+
+        if let Some(anchor) = set.lines.get(&id) {
+            let start = &anchor.range.start;
+            let end = &anchor.range.end;
+            // The buffer was replaced: the file left the review and came back, or its diff base
+            // or snapshot was rebuilt.
+            let replaced = !buffer.can_resolve(start) || !buffer.can_resolve(end);
+            // Deleting the lines collapses both ends onto the deletion (text inserted there
+            // later, as a stash pop does, goes after them). An empty line has nothing to delete.
+            let deleted = !replaced
+                && !anchor.text.is_empty()
+                && start.to_offset(buffer) >= end.to_offset(buffer);
+            if deleted {
+                // Lines deleted again while outdated: the first place is the one that had the
+                // comment's text.
+                deleted_from = Some(
+                    anchor
+                        .deleted_from
+                        .clone()
+                        .unwrap_or_else(|| anchor.range.clone()),
+                );
+            }
+            if replaced || deleted {
+                set.lines.remove(&id);
+                set.lost.insert(id);
+            }
+        }
+
+        if !set.lines.contains_key(&id) {
+            let max_row = buffer.max_point().row;
+            let last_row = lines.end().saturating_sub(1);
+            let start_row = lines.start().saturating_sub(1).min(max_row);
+            let end_row = last_row.min(max_row).max(start_row);
+            let (range, text) = line_anchor_and_text(buffer, start_row..=end_row);
+            let outdated =
+                last_row > max_row || line_text.is_some_and(|line_text| line_text != text);
+            let was_lost = set.lost.remove(&id);
+            // Other tabs anchor a checked comment on its lines without comparing, but an
+            // outdated one whose lines have its text again (changed back while no tab showed
+            // them) is current again.
+            if needs_check || was_lost || (is_outdated && !outdated) {
+                update.checked = Some(outdated);
+                is_outdated = outdated && !is_submitted;
+            }
+            // As stored, so that a position that had to be clamped is recorded below.
+            set.lines.insert(
+                id,
+                LineAnchor {
+                    range,
+                    lines,
+                    text: line_text.unwrap_or_default().to_string(),
+                    deleted_from: deleted_from.filter(|_| is_outdated),
+                    _buffer: buffer_entity,
+                },
+            );
+        }
+
+        let Some(anchor) = set.lines.get_mut(&id) else {
+            return update;
+        };
+        if !is_outdated {
+            anchor.deleted_from = None;
+        } else if let Some((range, line_text)) = anchor.deleted_from.as_ref().zip(line_text) {
+            if !buffer.can_resolve(&range.start) || !buffer.can_resolve(&range.end) {
+                anchor.deleted_from = None;
+            } else if let Some(restored) = restored_lines(buffer, range, line_text) {
+                anchor.range = restored;
+                anchor.deleted_from = None;
+                update.checked = Some(false);
+                is_outdated = false;
+            }
+        }
+        // Typing on an empty commented line moves the range's start past its end; the block
+        // stays below the end.
+        let end_row = anchor.range.end.to_point(buffer).row;
+        let start_row = anchor.range.start.to_point(buffer).row.min(end_row);
+        let (_, text) = line_anchor_and_text(buffer, start_row..=end_row);
+        let lines = start_row + 1..=end_row + 1;
+        if anchor.lines != lines || anchor.text != text {
+            // This tab's lines got the text the outdated comment was about back. Only a change
+            // seen in this tab counts: another window whose buffer never lost the text doesn't
+            // overrule the tab that saw it go.
+            if is_outdated && anchor.text != text && line_text == Some(text.as_str()) {
+                anchor.deleted_from = None;
+                update.checked = Some(false);
+            }
+            anchor.lines = lines;
+            anchor.text = text;
+            update.moved = true;
+        }
+        update
+    }
 }
 
 /// A line comment's lines in this tab's buffer of their side: the file's buffer, or its diff
@@ -214,11 +366,30 @@ enum SelectedLines {
     /// The cursor is on a reviewed file's folded header (`BufferId` is that side's buffer).
     FoldedFile(BufferId),
     Lines {
-        side: Side,
-        buffer_id: BufferId,
-        /// Rows in the side's buffer.
-        rows: RangeInclusive<u32>,
+        start: SelectedLine,
+        end: SelectedLine,
+        /// For a range from one side of the diff to the other: the rows of the new side's
+        /// buffer that it covers.
+        new_rows: Option<RangeInclusive<u32>>,
     },
+}
+
+/// The first or last line of a selection, on its side of the diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectedLine {
+    side: Side,
+    /// The side's buffer: the file's, or its diff base's.
+    buffer_id: BufferId,
+    /// The row in that buffer.
+    row: u32,
+}
+
+struct LinesTarget {
+    target: CommentTarget,
+    /// The buffer of the last line's side.
+    buffer: Entity<Buffer>,
+    /// The buffer of the first line's side, when it is the other side.
+    start_buffer: Option<Entity<Buffer>>,
 }
 
 /// The cursor's row on each side of the diff (a side's row is `None` when the cursor faces a
@@ -375,12 +546,23 @@ impl CommentBlocks {
         if let Some(gate) = &self.gate {
             return gate(target, cx);
         }
-        let CommentTarget::Lines { path, side, lines } = target else {
+        let CommentTarget::Lines {
+            path,
+            side,
+            lines,
+            start_side,
+        } = target
+        else {
             return Ok(());
         };
         self.diff
             .read(cx)
-            .check_lines(path, *side, lines, cx)
+            .check_lines(
+                path,
+                (*start_side, *lines.start()),
+                (*side, *lines.end()),
+                cx,
+            )
             .map_err(|refusal| {
                 match refusal {
                     LinesRefusal::Outside => {
@@ -439,8 +621,7 @@ impl CommentBlocks {
             ReviewSessionEvent::Comment(CommentEvent::Moved(ids)) => self.update_views(ids, cx),
             ReviewSessionEvent::Comment(CommentEvent::Removed(id)) => {
                 self.remove_view(*id, window, cx);
-                self.anchors.lines.remove(id);
-                self.anchors.lost.remove(id);
+                self.anchors.remove(*id);
                 self.reconcile(window, cx);
             }
             ReviewSessionEvent::FilesChanged(_)
@@ -759,6 +940,7 @@ impl CommentBlocks {
                 .filter_map(|comment| {
                     let anchor = self
                         .anchors
+                        .ends
                         .lines
                         .get(&comment.id)
                         .map(|anchor| &anchor.range);
@@ -876,7 +1058,9 @@ impl CommentBlocks {
 
     /// Anchors the line comments whose file is shown and that have no anchor in this tab yet
     /// (the lines of comments loaded from the database are compared with the file then),
-    /// notices lines that were deleted, and records where the comments' lines are now.
+    /// notices lines that were deleted, and records where the comments' lines are now. A range
+    /// from one side of the diff to the other is anchored at both ends, each in its side's
+    /// buffer, and its text is its first line's and its last line's.
     fn update_anchors(&mut self, cx: &mut Context<Self>) {
         let mut checked = Vec::new();
         let mut moves = Vec::new();
@@ -885,130 +1069,126 @@ impl CommentBlocks {
             let session = self.session.read(cx);
             let comments = session.comments();
             let anchors = &mut self.anchors;
-            anchors.lines.retain(|id, _| comments.get(*id).is_some());
-            anchors.lost.retain(|id| comments.get(*id).is_some());
+            for set in [&mut anchors.ends, &mut anchors.starts] {
+                set.lines.retain(|id, _| comments.get(*id).is_some());
+                set.lost.retain(|id| comments.get(*id).is_some());
+            }
             let mut snapshots = HashMap::<EntityId, BufferSnapshot>::default();
             for comment in comments.iter() {
                 let id = comment.id;
-                let CommentTarget::Lines { path, side, lines } = &comment.target else {
+                let CommentTarget::Lines {
+                    path,
+                    side,
+                    lines,
+                    start_side,
+                } = &comment.target
+                else {
                     continue;
                 };
-                let Some(buffer_entity) = side_buffer(diff, path, *side, cx) else {
+                let is_mixed = start_side != side;
+                let Some(end_buffer) = side_buffer(diff, path, *side, cx) else {
                     continue;
                 };
-                let buffer = snapshots
-                    .entry(buffer_entity.entity_id())
-                    .or_insert_with(|| buffer_entity.read(cx).snapshot());
-                // As it will be once this update's checks are applied.
-                let mut is_outdated = comment.is_outdated();
-                let mut deleted_from = None;
-
-                if let Some(anchor) = anchors.lines.get(&id) {
-                    let start = &anchor.range.start;
-                    let end = &anchor.range.end;
-                    // The buffer was replaced: the file left the review and came back, or its
-                    // diff base or snapshot was rebuilt.
-                    let replaced = !buffer.can_resolve(start) || !buffer.can_resolve(end);
-                    // Deleting the lines collapses both ends onto the deletion (text inserted
-                    // there later, as a stash pop does, goes after them). An empty line has
-                    // nothing to delete.
-                    let deleted = !replaced
-                        && !anchor.text.is_empty()
-                        && start.to_offset(buffer) >= end.to_offset(buffer);
-                    if deleted {
-                        // Lines deleted again while outdated: the first place is the one that
-                        // had the comment's text.
-                        deleted_from = Some(
-                            anchor
-                                .deleted_from
-                                .clone()
-                                .unwrap_or_else(|| anchor.range.clone()),
-                        );
-                    }
-                    if replaced || deleted {
-                        anchors.lines.remove(&id);
-                        anchors.lost.insert(id);
-                    }
+                let start_buffer = if is_mixed {
+                    let Some(buffer) = side_buffer(diff, path, *start_side, cx) else {
+                        continue;
+                    };
+                    Some(buffer)
+                } else {
+                    None
+                };
+                for buffer in start_buffer.iter().chain([&end_buffer]) {
+                    snapshots
+                        .entry(buffer.entity_id())
+                        .or_insert_with(|| buffer.read(cx).snapshot());
                 }
-
-                if !anchors.lines.contains_key(&id) {
-                    let max_row = buffer.max_point().row;
-                    let last_row = lines.end().saturating_sub(1);
-                    let start_row = lines.start().saturating_sub(1).min(max_row);
-                    let end_row = last_row.min(max_row).max(start_row);
-                    let (range, text) = line_anchor_and_text(buffer, start_row..=end_row);
-                    let outdated = last_row > max_row
-                        || comment
-                            .line_text
-                            .as_ref()
-                            .is_some_and(|line_text| *line_text != text);
-                    let was_lost = anchors.lost.remove(&id);
-                    // Other tabs anchor a checked comment on its lines without comparing, but an
-                    // outdated one whose lines have its text again (changed back while no tab
-                    // showed them) is current again.
-                    if session.needs_check(id) || was_lost || (is_outdated && !outdated) {
-                        checked.push((id, outdated));
-                        is_outdated = outdated && !comment.is_submitted();
-                    }
-                    // As stored, so that a position that had to be clamped is recorded below.
-                    anchors.lines.insert(
+                let (start_text, end_text) = match comment.line_text.as_deref() {
+                    Some(text) if is_mixed => match text.split_once('\n') {
+                        Some((start, end)) => (Some(start), Some(end)),
+                        None => (None, None),
+                    },
+                    text => (None, text),
+                };
+                let part =
+                    |lines: RangeInclusive<u32>, line_text, buffer: Entity<Buffer>| PartToAnchor {
                         id,
-                        LineAnchor {
-                            range,
-                            lines: lines.clone(),
-                            text: comment.line_text.clone().unwrap_or_default(),
-                            deleted_from: deleted_from.filter(|_| is_outdated),
-                            _buffer: buffer_entity.clone(),
-                        },
-                    );
-                }
-
-                let Some(anchor) = anchors.lines.get_mut(&id) else {
+                        lines,
+                        line_text,
+                        is_outdated: comment.is_outdated(),
+                        is_submitted: comment.is_submitted(),
+                        needs_check: session.needs_check(id),
+                        buffer,
+                    };
+                let end_lines = if is_mixed {
+                    *lines.end()..=*lines.end()
+                } else {
+                    lines.clone()
+                };
+                let Some(end) = snapshots.get(&end_buffer.entity_id()).map(|snapshot| {
+                    part(end_lines, end_text, end_buffer.clone())
+                        .update(&mut anchors.ends, snapshot)
+                }) else {
                     continue;
                 };
-                if !is_outdated {
-                    anchor.deleted_from = None;
-                } else if let Some((range, line_text)) = anchor
-                    .deleted_from
-                    .as_ref()
-                    .zip(comment.line_text.as_deref())
-                {
-                    if !buffer.can_resolve(&range.start) || !buffer.can_resolve(&range.end) {
-                        anchor.deleted_from = None;
-                    } else if let Some(restored) = restored_lines(buffer, range, line_text) {
-                        anchor.range = restored;
-                        anchor.deleted_from = None;
-                        checked.push((id, false));
-                        is_outdated = false;
+                let Some(start_buffer) = start_buffer else {
+                    if let Some(outdated) = end.checked {
+                        checked.push((id, outdated));
                     }
-                }
-                // Typing on an empty commented line moves the range's start past its end; the
-                // block stays below the end.
-                let end_row = anchor.range.end.to_point(buffer).row;
-                let start_row = anchor.range.start.to_point(buffer).row.min(end_row);
-                let (_, text) = line_anchor_and_text(buffer, start_row..=end_row);
-                let lines = start_row + 1..=end_row + 1;
-                if anchor.lines != lines || anchor.text != text {
-                    // This tab's lines got the text the outdated comment was about back. Only a
-                    // change seen in this tab counts: another window whose buffer never lost
-                    // the text doesn't overrule the tab that saw it go.
-                    if is_outdated
-                        && anchor.text != text
-                        && comment.line_text.as_deref() == Some(text.as_str())
+                    if end.moved
+                        && let Some(anchor) = anchors.ends.lines.get(&id)
                     {
-                        anchor.deleted_from = None;
-                        checked.push((id, false));
+                        moves.push((id, anchor.lines.clone(), anchor.text.clone()));
                     }
-                    anchor.lines = lines.clone();
-                    anchor.text = text.clone();
-                    moves.push((id, lines, text));
+                    continue;
+                };
+                let Some(start) = snapshots.get(&start_buffer.entity_id()).map(|snapshot| {
+                    part(
+                        *lines.start()..=*lines.start(),
+                        start_text,
+                        start_buffer.clone(),
+                    )
+                    .update(&mut anchors.starts, snapshot)
+                }) else {
+                    continue;
+                };
+                let (Some(start_anchor), Some(end_anchor)) =
+                    (anchors.starts.lines.get(&id), anchors.ends.lines.get(&id))
+                else {
+                    continue;
+                };
+                if start.checked.is_some() || end.checked.is_some() {
+                    // An end that wasn't checked now is as outdated as its text says.
+                    let is_outdated = |update: &PartUpdate, anchor: &LineAnchor, text| {
+                        update.checked.unwrap_or_else(|| {
+                            comment.is_outdated() && Some(anchor.text.as_str()) != text
+                        })
+                    };
+                    checked.push((
+                        id,
+                        is_outdated(&start, start_anchor, start_text)
+                            || is_outdated(&end, end_anchor, end_text),
+                    ));
+                }
+                if start.moved || end.moved {
+                    moves.push((
+                        id,
+                        *start_anchor.lines.start()..=*end_anchor.lines.end(),
+                        format!("{}\n{}", start_anchor.text, end_anchor.text),
+                    ));
                 }
             }
 
             // Threads are anchored on their line numbers once, then follow the edits like
-            // comments do; lines past the end of the local file aren't shown.
+            // comments do; lines past the end of the local file aren't shown. A range from one
+            // side to the other is anchored on its last line, which it shows below.
             for block in self.remote.values_mut() {
-                let CommentTarget::Lines { path, side, lines } = &block.target else {
+                let CommentTarget::Lines {
+                    path,
+                    side,
+                    lines,
+                    start_side,
+                } = &block.target
+                else {
                     continue;
                 };
                 let Some(buffer) = side_buffer(diff, path, *side, cx) else {
@@ -1027,7 +1207,11 @@ impl CommentBlocks {
                     if end_row > buffer.max_point().row {
                         continue;
                     }
-                    let start_row = lines.start().saturating_sub(1).min(end_row);
+                    let start_row = if start_side == side {
+                        lines.start().saturating_sub(1).min(end_row)
+                    } else {
+                        end_row
+                    };
                     block.anchor = Some(line_anchor_and_text(buffer, start_row..=end_row).0);
                 }
             }
@@ -1075,35 +1259,75 @@ impl CommentBlocks {
                 };
                 self.add_file_comment_on(path, editor, window, cx);
             }
-            SelectedLines::Lines {
-                side,
-                buffer_id,
-                rows,
-            } => {
-                let Some((path, buffer)) = self.file_of_side_buffer(side, buffer_id, cx) else {
+            SelectedLines::Lines { start, end, .. } => {
+                let Some(LinesTarget {
+                    target,
+                    buffer,
+                    start_buffer,
+                }) = self.lines_target(start, end, cx)
+                else {
                     return;
                 };
-                let snapshot = buffer.read(cx).snapshot();
-                let (range, text) = line_anchor_and_text(&snapshot, rows.clone());
-                let lines = rows.start() + 1..=rows.end() + 1;
+                let anchor = |buffer: Entity<Buffer>, rows: RangeInclusive<u32>, cx: &App| {
+                    let (range, text) =
+                        line_anchor_and_text(&buffer.read(cx).snapshot(), rows.clone());
+                    LineAnchor {
+                        range,
+                        lines: rows.start() + 1..=rows.end() + 1,
+                        text,
+                        deleted_from: None,
+                        _buffer: buffer,
+                    }
+                };
+                let anchors = match start_buffer {
+                    Some(start_buffer) => (
+                        anchor(buffer, end.row..=end.row, cx),
+                        Some(anchor(start_buffer, start.row..=start.row, cx)),
+                    ),
+                    None => (anchor(buffer, start.row..=end.row, cx), None),
+                };
+                let line_text = match &anchors {
+                    (end, Some(start)) => format!("{}\n{}", start.text, end.text),
+                    (anchor, None) => anchor.text.clone(),
+                };
                 let new_comment = NewComment {
-                    target: CommentTarget::Lines {
-                        path,
-                        side,
-                        lines: lines.clone(),
-                    },
-                    line_text: Some(text.clone()),
+                    target,
+                    line_text: Some(line_text),
                 };
-                let anchor = LineAnchor {
-                    range,
-                    lines,
-                    text,
-                    deleted_from: None,
-                    _buffer: buffer,
-                };
-                self.add_comment(new_comment, Some(anchor), editor, window, cx);
+                self.add_comment(new_comment, Some(anchors), editor, window, cx);
             }
         }
+    }
+
+    /// The comment target of selected lines from `start` to `end`, the buffer of its last line
+    /// and, for a range from one side of the diff to the other, the buffer of its first line.
+    fn lines_target(
+        &self,
+        start: SelectedLine,
+        end: SelectedLine,
+        cx: &App,
+    ) -> Option<LinesTarget> {
+        let (path, buffer) = self.file_of_side_buffer(end.side, end.buffer_id, cx)?;
+        let start_buffer = if start.side == end.side {
+            None
+        } else {
+            let (start_path, start_buffer) =
+                self.file_of_side_buffer(start.side, start.buffer_id, cx)?;
+            if start_path != path {
+                return None;
+            }
+            Some(start_buffer)
+        };
+        Some(LinesTarget {
+            target: CommentTarget::Lines {
+                path,
+                side: end.side,
+                lines: start.row + 1..=end.row + 1,
+                start_side: start.side,
+            },
+            buffer,
+            start_buffer,
+        })
     }
 
     /// What `c` comments on in a side of the diff: `rows` (multibuffer rows), or the selection.
@@ -1140,17 +1364,8 @@ impl CommentBlocks {
             SelectedLines::FoldedFile(buffer_id) => Some(CommentTarget::File {
                 path: self.path_of_buffer(buffer_id, cx)?,
             }),
-            SelectedLines::Lines {
-                side,
-                buffer_id,
-                rows,
-            } => {
-                let (path, _) = self.file_of_side_buffer(side, buffer_id, cx)?;
-                Some(CommentTarget::Lines {
-                    path,
-                    side,
-                    lines: rows.start() + 1..=rows.end() + 1,
-                })
+            SelectedLines::Lines { start, end, .. } => {
+                Some(self.lines_target(start, end, cx)?.target)
             }
         }
     }
@@ -1184,12 +1399,20 @@ impl CommentBlocks {
         let selected = self.selected_lines(&editor, None, cx);
         collapse_selection_to_start(&editor, window, cx);
         let SelectedLines::Lines {
-            side,
-            buffer_id,
-            rows,
+            start,
+            end,
+            new_rows,
         } = selected?
         else {
             return None;
+        };
+        // From one side to the other: the new side's lines, as in a split diff's right side.
+        let (side, buffer_id, rows) = match new_rows {
+            Some(rows) => {
+                let new_end = if start.side == Side::New { start } else { end };
+                (Side::New, new_end.buffer_id, rows)
+            }
+            None => (end.side, end.buffer_id, start.row..=end.row),
         };
         let (_, buffer) = self.file_of_side_buffer(side, buffer_id, cx)?;
         let (_, text) = line_anchor_and_text(&buffer.read(cx).snapshot(), rows.clone());
@@ -1301,7 +1524,7 @@ impl CommentBlocks {
     fn add_comment(
         &mut self,
         new_comment: NewComment,
-        anchor: Option<LineAnchor>,
+        anchors: Option<(LineAnchor, Option<LineAnchor>)>,
         return_to: Entity<Editor>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1317,8 +1540,11 @@ impl CommentBlocks {
             self.show_toast("The review's comments haven't loaded yet", cx);
             return;
         };
-        if let Some(anchor) = anchor {
-            self.anchors.lines.insert(id, anchor);
+        if let Some((end, start)) = anchors {
+            self.anchors.ends.lines.insert(id, end);
+            if let Some(start) = start {
+                self.anchors.starts.lines.insert(id, start);
+            }
         }
         // The session's event comes later; the editor opens now.
         self.ensure_view(id, cx);
@@ -1906,6 +2132,7 @@ impl CommentBlocks {
             .filter_map(|comment| {
                 let anchor = self
                     .anchors
+                    .ends
                     .lines
                     .get(&comment.id)
                     .map(|anchor| &anchor.range);
@@ -2739,8 +2966,11 @@ fn selected_lines(
 }
 
 /// The lines of one file that `rows` (multibuffer rows of a side of the diff) cover: those of
-/// the file at the last row. A selection over the removed and added lines of a unified diff
-/// takes the added ones.
+/// the file at the last row, from the first row's line to the last row's, as GitHub takes a
+/// range. In a unified diff, a removed row is a line of the old side and an added row one of
+/// the new side, so a selection from removed rows to added ones (or back) spans both sides;
+/// an unchanged row is a line of either side, the side of the other end (the new side when
+/// both ends are unchanged rows), so that the range stays on one side when it can.
 fn lines_in_rows(
     snapshot: &MultiBufferSnapshot,
     rows: RangeInclusive<u32>,
@@ -2751,39 +2981,87 @@ fn lines_in_rows(
         .take(rows.clone().count())
         .collect::<Vec<_>>();
     let last = row_infos.last()?;
-    let is_removed = |row_info: &RowInfo| {
-        row_info
-            .diff_status
-            .is_some_and(|status| status.kind == DiffHunkStatusKind::Deleted)
-    };
-    let rows_of = |buffer_id: BufferId, removed: bool| {
+    // The left side shows the old file.
+    if is_lhs {
+        let buffer_id = last.buffer_id?;
         let rows = row_infos
             .iter()
-            .filter(|row_info| {
-                row_info.buffer_id == Some(buffer_id) && (is_lhs || is_removed(row_info) == removed)
-            })
+            .filter(|row_info| row_info.buffer_id == Some(buffer_id))
             .filter_map(|row_info| row_info.buffer_row)
             .collect::<Vec<_>>();
-        Some(*rows.iter().min()?..=*rows.iter().max()?)
+        let line = |row: u32| SelectedLine {
+            side: Side::Old,
+            buffer_id,
+            row,
+        };
+        return Some(SelectedLines::Lines {
+            start: line(*rows.iter().min()?),
+            end: line(*rows.iter().max()?),
+            new_rows: None,
+        });
+    }
+
+    let side_of = |row_info: &RowInfo| {
+        row_info.diff_status.map(|status| match status.kind {
+            DiffHunkStatusKind::Deleted => Side::Old,
+            DiffHunkStatusKind::Added | DiffHunkStatusKind::Modified => Side::New,
+        })
     };
-    // The left side shows the old file; on the right side, removed lines show the old file's
-    // rows (and buffer).
-    if !is_lhs {
-        let (anchor, _) =
-            snapshot.anchor_to_buffer_anchor(snapshot.anchor_before(Point::new(*rows.end(), 0)))?;
-        if let Some(rows) = rows_of(anchor.buffer_id, false) {
-            return Some(SelectedLines::Lines {
-                side: Side::New,
-                buffer_id: anchor.buffer_id,
-                rows,
+    // Removed rows show the old file's rows and buffer; a file is known by that buffer.
+    let base_of = |row_info: &RowInfo| {
+        let buffer_id = row_info.buffer_id?;
+        if side_of(row_info) == Some(Side::Old) {
+            return Some(buffer_id);
+        }
+        Some(
+            snapshot
+                .diff_for_buffer_id(buffer_id)
+                .map_or(buffer_id, |diff| diff.base_text().remote_id()),
+        )
+    };
+    let file = base_of(last)?;
+    let rows = row_infos
+        .iter()
+        .filter(|row_info| row_info.buffer_row.is_some() && base_of(row_info) == Some(file))
+        .collect::<Vec<_>>();
+    let (first, last) = (*rows.first()?, *rows.last()?);
+    let (start_side, end_side) = match (side_of(first), side_of(last)) {
+        (Some(start), Some(end)) => (start, end),
+        (Some(side), None) | (None, Some(side)) => (side, side),
+        (None, None) => (Side::New, Side::New),
+    };
+    let line = |row_info: &RowInfo, side: Side| {
+        let buffer_id = row_info.buffer_id?;
+        let row = row_info.buffer_row?;
+        if side == Side::Old && side_of(row_info).is_none() {
+            // An unchanged row's line in the diff base.
+            let diff = snapshot.diff_for_buffer_id(buffer_id)?;
+            let buffer = snapshot.buffer_for_id(buffer_id)?;
+            return Some(SelectedLine {
+                side,
+                buffer_id: diff.base_text().remote_id(),
+                row: diff
+                    .buffer_point_to_base_text_point(Point::new(row, 0), buffer)
+                    .row,
             });
         }
-    }
-    let buffer_id = last.buffer_id?;
+        Some(SelectedLine {
+            side,
+            buffer_id,
+            row,
+        })
+    };
+    let new_rows = (start_side != end_side).then(|| {
+        let rows = rows
+            .iter()
+            .filter(|row_info| side_of(row_info) != Some(Side::Old))
+            .filter_map(|row_info| row_info.buffer_row);
+        Some(rows.clone().min()?..=rows.max()?)
+    });
     Some(SelectedLines::Lines {
-        side: Side::Old,
-        buffer_id,
-        rows: rows_of(buffer_id, true)?,
+        start: line(first, start_side)?,
+        end: line(last, end_side)?,
+        new_rows: new_rows.flatten(),
     })
 }
 
@@ -2897,19 +3175,11 @@ mod tests {
     }
 
     fn lines(path: &str, lines: RangeInclusive<u32>) -> CommentTarget {
-        CommentTarget::Lines {
-            path: RepoPath::new(path).unwrap(),
-            side: Side::New,
-            lines,
-        }
+        CommentTarget::lines(RepoPath::new(path).unwrap(), Side::New, lines)
     }
 
     fn old_lines(path: &str, lines: RangeInclusive<u32>) -> CommentTarget {
-        CommentTarget::Lines {
-            path: RepoPath::new(path).unwrap(),
-            side: Side::Old,
-            lines,
-        }
+        CommentTarget::lines(RepoPath::new(path).unwrap(), Side::Old, lines)
     }
 
     /// Each hosted comment's block row, and whether it is on the left side.
@@ -4131,6 +4401,60 @@ mod tests {
         })
     }
 
+    /// A range from an old line to a new one follows each end in its side's buffer; its text is
+    /// its two ends', and deleting its new line makes it outdated.
+    #[gpui::test]
+    async fn test_ranges_across_sides_follow_edits(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        move_to_row_with_text(&rhs, "line 2", cx);
+        cx.simulate_keystrokes("shift-v j c");
+        cx.simulate_input("replaced");
+        cx.simulate_keystrokes("ctrl-enter");
+        let id = comment_ids(&review, cx)[0];
+        let mixed = |lines| CommentTarget::Lines {
+            path: RepoPath::new("a.rs").unwrap(),
+            side: Side::New,
+            lines,
+            start_side: Side::Old,
+        };
+        let line_text = |cx: &VisualTestContext| {
+            review.read_with(cx, |review, cx| {
+                let comment = review.session().read(cx).comments().get(id).unwrap();
+                comment.line_text.clone()
+            })
+        };
+        let label = |cx: &mut VisualTestContext| {
+            blocks(&review, cx).read_with(cx, |blocks, cx| {
+                blocks.view(id).unwrap().read(cx).location()
+            })
+        };
+        assert_eq!(line_state(&review, id, cx), (mixed(2..=2), false));
+        assert_eq!(line_text(cx).as_deref(), Some("line 2\nLINE 2"));
+        assert_eq!(label(cx).as_deref(), Some("Old line 2 – line 2"));
+
+        let buffer = display_buffer(&review, "a.rs", cx);
+        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "new\n")], None, cx));
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, id, cx), (mixed(2..=3), false));
+        assert_eq!(label(cx).as_deref(), Some("Old line 2 – line 3"));
+        buffer.update(cx, |buffer, cx| {
+            let offset = buffer.text().find("LINE 2").unwrap() + "LINE 2".len();
+            buffer.edit([(offset..offset, "!")], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(line_text(cx).as_deref(), Some("line 2\nLINE 2!"));
+
+        buffer.update(cx, |buffer, cx| {
+            let offset = buffer.text().find("LINE 2!\n").unwrap();
+            buffer.edit([(offset..offset + "LINE 2!\n".len(), "")], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(line_state(&review, id, cx), (mixed(2..=3), true));
+        assert_eq!(line_text(cx).as_deref(), Some("line 2\nLINE 2!"));
+    }
+
     #[gpui::test]
     async fn test_deleted_lines_make_comments_outdated(cx: &mut TestAppContext) {
         init(cx, DiffViewStyle::Unified);
@@ -4843,6 +5167,119 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         move_to_row_with_text(&rhs, "line 4", cx);
         cx.simulate_keystrokes("y i w");
         assert_eq!(clipboard(cx), "line");
+    }
+
+    /// In a unified diff, a selection from removed rows to added ones (or back) is a range
+    /// from an old line to a new one (GitHub's `start_side`), shown below its last row, on that
+    /// row's side of a split diff too. A selection from unchanged rows to removed ones is a
+    /// range of old lines, not just the unchanged ones.
+    #[gpui::test]
+    async fn test_range_comments_across_the_diffs_sides(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let mixed = |start_side, lines, side| CommentTarget::Lines {
+            path: RepoPath::new("a.rs").unwrap(),
+            side,
+            lines,
+            start_side,
+        };
+        let comment_on = |from: &str, keys: &str, body: &str, cx: &mut VisualTestContext| {
+            move_to_row_with_text(&rhs, from, cx);
+            cx.simulate_keystrokes(keys);
+            cx.simulate_keystrokes("c");
+            cx.run_until_parked();
+            assert!(open_editor(&review, cx).is_some(), "{body}");
+            cx.simulate_input(body);
+            cx.simulate_keystrokes("ctrl-enter");
+            assert_back_in_diff(&rhs, cx);
+        };
+
+        // a.rs: line 2 replaced by LINE 2, line 35 by LINE 35.
+        comment_on("line 2", "shift-v j", "replaced", cx);
+        move_to_row_with_text(&rhs, "LINE 2", cx);
+        cx.simulate_keystrokes("shift-v");
+        for _ in 0..20 {
+            if cursor_line(&rhs, cx) == "line 35" {
+                break;
+            }
+            cx.simulate_keystrokes("j");
+        }
+        assert_eq!(cursor_line(&rhs, cx), "line 35");
+        cx.simulate_keystrokes("c");
+        cx.simulate_input("added to removed");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&rhs, cx);
+        comment_on("line 34", "shift-v j", "unchanged and removed", cx);
+        let ids = comment_ids(&review, cx);
+        assert_eq!(
+            comments(&review, cx)
+                .into_iter()
+                .map(|(target, body, _)| (target, body))
+                .collect::<Vec<_>>(),
+            [
+                (mixed(Side::Old, 2..=2, Side::New), "replaced".to_string()),
+                (
+                    mixed(Side::New, 2..=35, Side::Old),
+                    "added to removed".to_string()
+                ),
+                (
+                    old_lines("a.rs", 34..=35),
+                    "unchanged and removed".to_string()
+                ),
+            ]
+        );
+        let locations = review.read_with(cx, |review, cx| {
+            review
+                .session()
+                .read(cx)
+                .comments()
+                .iter()
+                .filter_map(|comment| comment.location())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(locations, ["a.rs:~2-2", "a.rs:2-~35", "a.rs:~34-~35"]);
+        // Each shows below its last row: LINE 2, then the removed line 35.
+        let below = |text: &str, cx: &mut VisualTestContext| {
+            let row = move_to_row_with_text(&rhs, text, cx);
+            display_row(&rhs, row, cx) + 1
+        };
+        let line_2 = below("LINE 2", cx);
+        let line_35 = below("line 35", cx);
+        let added_35 = below("LINE 35", cx) - 1;
+        let hosted = hosted_rows(&review, cx)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(hosted.get(&ids[0]), Some(&line_2));
+        // The two comments below the removed line 35 stack there, above LINE 35.
+        assert!([ids[1], ids[2]].iter().all(|id| {
+            hosted
+                .get(id)
+                .is_some_and(|row| (line_35..added_35).contains(row))
+        }));
+        // The gutter's "+" at such a selection takes it too.
+        move_to_row_with_text(&rhs, "line 2", cx);
+        cx.simulate_keystrokes("shift-v j");
+        let end = display_row(&rhs, cursor_point(&rhs, cx).row, cx);
+        draw(cx);
+        assert!(plus_button(false, end, false, cx).is_some());
+        cx.simulate_keystrokes("escape");
+
+        // In a split diff, a range ending on a new line is on the right side, one ending on an
+        // old line on the left side.
+        cx.update(|window, cx| {
+            rhs.focus_handle(cx)
+                .dispatch_action(&editor::ToggleSplitDiff, window, cx)
+        });
+        cx.run_until_parked();
+        let on_sides = hosted_on_sides(&review, cx)
+            .into_iter()
+            .map(|(id, is_lhs, _)| (id, is_lhs))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            [ids[0], ids[1], ids[2]].map(|id| on_sides.get(&id).copied()),
+            [Some(false), Some(true), Some(true)]
+        );
     }
 
     #[gpui::test]

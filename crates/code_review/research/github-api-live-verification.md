@@ -223,6 +223,39 @@ Every 422 here is `{"message":"Unprocessable Entity","errors":["<text>"],…}`.
 - **REST `GET /pulls/4/reviews/{id}/comments` returns `line/side/start_line/start_side: null`** (only
   `position`), both for pending and for submitted reviews. Don't use that endpoint for anchors.
 
+### MX: ranges from one side to the other (2026-10-24, PR B #14, pending + delete)
+
+Run for bugs 2's follow-up on PR B #14 (head `073e29a…`, same diff as PR D; see §2 for its hunks:
+`src/engine.rs` `-3,8 +3,9` = L3–L5/R3–R5 context, L6–L7 deleted, R6–R8 added, then context;
+`-188,9 +189,10` = context, L191–L193 deleted, R192–R195 added, context). Each comment was posted
+alone as a pending review (`start_line`, `start_side`, `line`, `side` all sent), read back through
+GraphQL `reviewThreads`, then deleted. Nothing is left on the PR.
+
+| Case | Comment (start → end) | Status | Stored (GraphQL) |
+|---|---|---|---|
+| MX-1 | LEFT 6 (deleted) → RIGHT 8 (added), one hunk | 200 | startDiffSide LEFT, startLine 6, diffSide RIGHT, line 8 |
+| MX-2 | RIGHT 5 (context) → LEFT 7 (deleted below it) | **200** | startDiffSide RIGHT, startLine 5, diffSide LEFT, line 7 |
+| MX-3 | RIGHT 6 (added, hunk 1) → LEFT 192 (deleted, hunk 2) | **200** | RIGHT 6 → LEFT 192 |
+| MX-4 | RIGHT 8 (added) → LEFT 7 (deleted, **above** it in the diff) | 422 | `Start position could not be resolved` |
+| MX-5 | LEFT 6 → LEFT 192 (across hunks, added rows between) | 200 | LEFT/LEFT 6–192 |
+| MX-6 | LEFT 4 (context) → RIGHT 8 | 200 | LEFT 4 → RIGHT 8 |
+| MX-7 | LEFT 7 (deleted, hunk 1) → RIGHT 196 (context, hunk 2) | 200 | LEFT 7 → RIGHT 196 |
+| MX-8 | RIGHT 10 (context, hunk 1) → LEFT 191 (deleted, hunk 2) | 200 | RIGHT 10 → LEFT 191 |
+| MX-9 | LEFT 5 (context) → LEFT 7 | 200 | LEFT/LEFT 5–7 |
+| MX-10 | RIGHT 3 → RIGHT 9 (over the deleted and added rows) | 200 | RIGHT/RIGHT 3–9 |
+| MX-11 | `README.md` RIGHT 9 (context) → LEFT 10 (deleted) | 200 | RIGHT 9 → LEFT 10 |
+| MX-12 | LEFT 192 → RIGHT 192 (deleted row before the added one) | 200 | LEFT 192 → RIGHT 192 |
+| MX-13 | RIGHT 192 → LEFT 193 (end above the start) | 422 | `Start position could not be resolved` |
+| MX-14 | RIGHT 6 (added) → LEFT 7 (deleted, above it) | 422 | `Start position could not be resolved` |
+| MX-15 | RIGHT 8 (added, hunk 1) → LEFT 191 (deleted, hunk 2) | 200 | RIGHT 8 → LEFT 191 |
+
+So GitHub takes **every combination of sides**, LEFT → RIGHT and RIGHT → LEFT, in one hunk or
+across hunks, as long as both ends are in its hunks and the start comes no later than the end in
+unified-diff order (deleted rows before the added rows of the same change). It refuses only a
+start after the end (MX-4/13/14, as L9b/L9c). Threads keep the sides they were posted with
+(`startDiffSide` / `diffSide`), and §5.5's parsing reads them back (for a RIGHT start
+`startLine` is the start; MX-2/3/8/11/15 had `originalStartLine` equal to it).
+
 ### L10: `subject_type` inside create-review `comments[]` (PR D)
 
 | Case | Comment item | Status | errors[0] |
@@ -343,7 +376,8 @@ These replace the provisional rules in `M7-github.md` §0, §2 (parsing), §4(c/
   works (L9, L9g). An end above the start fails with `Start position could not be resolved` (L9b/L9c).
   A range **may span hunks** (L8 accepted), so the plan's "must stay inside one hunk" rule is stricter
   than GitHub. Recommendation: allow any range whose two ends are commentable (simpler, matches the
-  API). Keeping the same-hunk rule is a valid UX choice, but it is not required.
+  API). Keeping the same-hunk rule is a valid UX choice, but it is not required. The ends may be
+  on different sides either way round, RIGHT → LEFT too (MX).
 - Mapping (unchanged from the plan): added row → RIGHT new line, deleted row → LEFT old line, context
   row → RIGHT new line. Always send `side` and `start_side` explicitly; the defaults are RIGHT and
   `side` (L7h/L9e). Omit `start_line`/`start_side` when start == end; otherwise GitHub stores

@@ -13,7 +13,7 @@ use crate::{
     },
     pull_request::{
         LineMapping, LocalChanges, LocalChangesEvent, PullRequestState, SubmitReply, SubmitRequest,
-        SubmitTarget, check_comment_target,
+        SubmitTarget, check_comment_target, diff_side,
     },
     session::{ReviewOutcome, ReviewSession, ReviewSessionEvent},
     view::{ReviewView, head_oid},
@@ -135,7 +135,7 @@ pub(crate) fn plan_review(
                 planned.counts.files += 1;
                 planned.comment_ids.push(comment.id);
             }
-            CommentTarget::Lines { path, side, lines } => {
+            CommentTarget::Lines { path, .. } => {
                 if !at_head {
                     planned.waiting_for_head += 1;
                     continue;
@@ -144,63 +144,63 @@ pub(crate) fn plan_review(
                     planned.refused.push((location, not_loaded.clone()));
                     continue;
                 };
-                let lines = match side {
-                    Side::Old => lines.clone(),
-                    Side::New => match working_to_head(path, lines.clone()) {
-                        LineMapping::Lines(lines) => lines,
-                        LineMapping::Changed => {
+                let target =
+                    match comment.target.map_new_lines(|path, lines| {
+                        match working_to_head(path, lines) {
+                            LineMapping::Lines(lines) => Ok(lines),
+                            mapping => Err(mapping),
+                        }
+                    }) {
+                        Ok(target) => target,
+                        Err(mapping) => {
                             planned.refused.push((
                                 location,
-                                "Its lines have local changes, which the pull request doesn't \
-                                 have"
-                                    .into(),
+                                match mapping {
+                                    LineMapping::Unknown => {
+                                        "Its file is still being compared with HEAD".into()
+                                    }
+                                    LineMapping::Failed => {
+                                        "Its file couldn't be compared with HEAD, so its lines \
+                                         can't be numbered as GitHub numbers them"
+                                            .into()
+                                    }
+                                    LineMapping::Changed | LineMapping::Lines(_) => {
+                                        "Its lines have local changes, which the pull request \
+                                         doesn't have"
+                                            .into()
+                                    }
+                                },
                             ));
                             continue;
                         }
-                        LineMapping::Unknown => {
-                            planned.refused.push((
-                                location,
-                                "Its file is still being compared with HEAD".into(),
-                            ));
-                            continue;
-                        }
-                        LineMapping::Failed => {
-                            planned.refused.push((
-                                location,
-                                "Its file couldn't be compared with HEAD, so its lines can't be \
-                                 numbered as GitHub numbers them"
-                                    .into(),
-                            ));
-                            continue;
-                        }
-                    },
-                };
-                let target = CommentTarget::Lines {
-                    path: path.clone(),
-                    side: *side,
-                    lines: lines.clone(),
-                };
+                    };
                 if let Err(reason) = check_comment_target(commentable, &target) {
                     planned.refused.push((location, reason));
                     continue;
                 }
-                let side = match side {
-                    Side::Old => DiffSide::Left,
-                    Side::New => DiffSide::Right,
+                let CommentTarget::Lines {
+                    side,
+                    lines,
+                    start_side,
+                    ..
+                } = &target
+                else {
+                    continue;
                 };
-                let (start, end) = (*lines.start(), *lines.end());
+                let (side, start_side) = (diff_side(*side), diff_side(*start_side));
+                let is_range = target.is_range();
                 planned.line_comments.push(ReviewLineComment {
                     path: commentable.current_path(path.as_unix_str()).to_string(),
                     side,
-                    line: end,
-                    start: (start != end).then_some((side, start)),
+                    line: *lines.end(),
+                    start: is_range.then_some((start_side, *lines.start())),
                     body: comment_body(comment),
                 });
                 planned.counts.lines += 1;
-                if start != end {
+                if is_range {
                     planned.counts.ranges += 1;
                 }
-                planned.has_old_lines |= side == DiffSide::Left;
+                planned.has_old_lines |= side == DiffSide::Left || start_side == DiffSide::Left;
                 planned.comment_ids.push(comment.id);
             }
         }
@@ -1144,16 +1144,21 @@ mod tests {
     }
 
     fn lines(path: &str, side: Side, lines: RangeInclusive<u32>) -> CommentTarget {
-        CommentTarget::Lines {
-            path: RepoPath::new(path).unwrap(),
-            side,
-            lines,
-        }
+        CommentTarget::lines(RepoPath::new(path).unwrap(), side, lines)
     }
 
     fn file(path: &str) -> CommentTarget {
         CommentTarget::File {
             path: RepoPath::new(path).unwrap(),
+        }
+    }
+
+    fn mixed(start_side: Side, start: u32, side: Side, end: u32) -> CommentTarget {
+        CommentTarget::Lines {
+            path: RepoPath::new("src/engine.rs").unwrap(),
+            side,
+            lines: start..=end,
+            start_side,
         }
     }
 
@@ -1258,6 +1263,20 @@ mod tests {
             comment(11, CommentTarget::Review, ""),
             outdated,
             submitted,
+            // From removed lines to the added line replacing them, and from an added line to a
+            // removed one below it: GitHub's `start_side` (LV MX).
+            comment(
+                14,
+                mixed(Side::Old, 191, Side::New, 215),
+                "removed and added",
+            ),
+            comment(
+                15,
+                mixed(Side::New, 205, Side::Old, 185),
+                "added and removed",
+            ),
+            // Old line 185 comes before new line 207 in GitHub's diff.
+            comment(16, mixed(Side::New, 209, Side::Old, 185), "reversed"),
         ];
         let planned = plan_review(&comments, Some(&commentable), true, working_to_head);
         let line = |path: &str, side, line, start, body: &str| ReviewLineComment {
@@ -1293,6 +1312,20 @@ mod tests {
                     "deleted range"
                 ),
                 line("src/render.rs", DiffSide::Left, 18, None, "renamed"),
+                line(
+                    "src/engine.rs",
+                    DiffSide::Right,
+                    213,
+                    Some((DiffSide::Left, 191)),
+                    "removed and added"
+                ),
+                line(
+                    "src/engine.rs",
+                    DiffSide::Left,
+                    185,
+                    Some((DiffSide::Right, 203)),
+                    "added and removed"
+                ),
             ]
         );
         assert_eq!(
@@ -1306,15 +1339,15 @@ mod tests {
         assert_eq!(
             planned.counts,
             Counts {
-                lines: 5,
-                ranges: 2,
+                lines: 7,
+                ranges: 4,
                 files: 1,
                 review: 2,
             }
         );
         assert_eq!(
             planned.comment_ids,
-            (0..=7).map(CommentId).collect::<Vec<_>>()
+            (0..=7).chain([14, 15]).map(CommentId).collect::<Vec<_>>()
         );
         assert_eq!(planned.outdated, ["src/engine.rs:7"]);
         assert_eq!(
@@ -1332,6 +1365,10 @@ mod tests {
                     "README.md".into(),
                     "This file isn't part of the pull request on GitHub".into()
                 ),
+                (
+                    "src/engine.rs:209-~185".into(),
+                    "The selection's start comes after its end in GitHub's diff".into()
+                ),
             ]
         );
         assert_eq!(planned.waiting_for_head, 0);
@@ -1340,7 +1377,7 @@ mod tests {
         // Another commit checked out: line comments wait for the pull request's head, the rest
         // can go.
         let planned = plan_review(&comments, Some(&commentable), false, working_to_head);
-        assert_eq!(planned.waiting_for_head, 7);
+        assert_eq!(planned.waiting_for_head, 10);
         assert!(planned.line_comments.is_empty());
         assert_eq!(planned.file_comments.len(), 1);
         assert_eq!(planned.counts.review, 2);
@@ -1349,7 +1386,7 @@ mod tests {
         let planned = plan_review(&comments, None, true, working_to_head);
         assert!(planned.line_comments.is_empty());
         assert!(planned.file_comments.is_empty());
-        assert_eq!(planned.refused.len(), 9);
+        assert_eq!(planned.refused.len(), 12);
 
         // A file that couldn't be compared with HEAD: its working tree's numbers may not be
         // HEAD's, so its new lines aren't sent.

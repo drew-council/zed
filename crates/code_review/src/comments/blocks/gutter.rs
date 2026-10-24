@@ -192,20 +192,11 @@ impl CommentBlocks {
         cx: &App,
     ) -> Option<CommentTarget> {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let SelectedLines::Lines {
-            side,
-            buffer_id,
-            rows,
-        } = lines_in_rows(&snapshot, rows, is_lhs)?
+        let SelectedLines::Lines { start, end, .. } = lines_in_rows(&snapshot, rows, is_lhs)?
         else {
             return None;
         };
-        let (path, _) = self.file_of_side_buffer(side, buffer_id, cx)?;
-        Some(CommentTarget::Lines {
-            path,
-            side,
-            lines: rows.start() + 1..=rows.end() + 1,
-        })
+        Some(self.lines_target(start, end, cx)?.target)
     }
 
     /// The line a row of a side shows: on the left side and on the removed rows of a unified
@@ -221,11 +212,7 @@ impl CommentBlocks {
         };
         let (path, _) = self.file_of_side_buffer(side, info.buffer_id?, cx)?;
         let line = info.buffer_row? + 1;
-        Some(CommentTarget::Lines {
-            path,
-            side,
-            lines: line..=line,
-        })
+        Some(CommentTarget::lines(path, side, line..=line))
     }
 
     /// Why the review can't take a comment on `target`, if it can't.
