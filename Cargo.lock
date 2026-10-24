@@ -3271,6 +3271,7 @@ dependencies = [
  "multi_buffer",
  "picker",
  "project",
+ "pulldown-cmark 0.13.4",
  "regex",
  "remote_connection",
  "schemars 1.0.4",

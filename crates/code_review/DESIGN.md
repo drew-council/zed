@@ -2057,6 +2057,13 @@ over the diff after an expand; also for typing in a review comment, the Bots tog
 now lays the block out in `SplitBufferHeadersElement::request_layout`, ahead of both sides, when it's
 in view (at the last frame's width), and otherwise asks for another frame when its height changes.
 
+**Bugs 2, item 4 (wrapped list items in commit messages)** — hard-wrapping a list item whose first
+word is too long (a URL) leaves its marker alone on a line, which CommonMark (and GitHub) read as an
+empty item plus a paragraph outside the list. **Decision**: commit message bodies get such a
+marker's next line back (`top_block::join_bare_list_markers`, driven by pulldown-cmark's events, so
+quotes, code, headings and real items are untouched); pull request descriptions are left as GitHub
+renders them.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
