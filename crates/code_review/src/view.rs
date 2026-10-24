@@ -1684,6 +1684,8 @@ impl ReviewView {
         self.top_block_id
     }
 
+    /// The whole title, for the panel's header: places with a width truncate it to fit, only
+    /// the tab cuts a commit's subject.
     pub fn title(&self, cx: &App) -> SharedString {
         match &self.target {
             ReviewTarget::Uncommitted => "Uncommitted changes".into(),
@@ -2563,7 +2565,15 @@ impl Item for ReviewView {
         let text: SharedString = match &self.target {
             // "PR #N: …" already says what the tab is.
             ReviewTarget::PullRequest(_) => truncate_and_trailoff(&self.title(cx), 64).into(),
-            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } | ReviewTarget::Commits(_) => {
+            ReviewTarget::Commits(range) => format!(
+                "Review: {}",
+                self.top_block
+                    .read(cx)
+                    .commits_tab_title()
+                    .unwrap_or_else(|| range.head.display_short().into())
+            )
+            .into(),
+            ReviewTarget::Uncommitted | ReviewTarget::Branch { .. } => {
                 format!("Review: {}", self.title(cx)).into()
             }
         };

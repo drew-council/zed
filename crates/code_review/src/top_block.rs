@@ -289,8 +289,20 @@ impl ReviewTopBlock {
         )
     }
 
-    /// The tab title of a commit review: the commit, or the size and ends of the range.
+    /// The title of a commit review: the commit, or the size and ends of the range.
     pub(crate) fn commits_title(&self) -> Option<SharedString> {
+        self.commits_title_with_subject(|subject| subject.to_string())
+    }
+
+    /// [`Self::commits_title`] with a single commit's subject cut to fit in a tab.
+    pub(crate) fn commits_tab_title(&self) -> Option<SharedString> {
+        self.commits_title_with_subject(|subject| truncate_and_trailoff(subject, 20))
+    }
+
+    fn commits_title_with_subject(
+        &self,
+        subject_text: impl Fn(&str) -> String,
+    ) -> Option<SharedString> {
         let TopBlockContent::Commits { range, commits } = &self.content else {
             return None;
         };
@@ -302,13 +314,11 @@ impl ReviewTopBlock {
             // GitHub's squash merges end their subject with the pull request's number, which the
             // cut subject would lose.
             ([commit], false) => match split_pull_request_suffix(&commit.data.subject) {
-                Some((subject, number)) => {
-                    format!("#{number} {}", truncate_and_trailoff(subject, 20))
-                }
+                Some((subject, number)) => format!("#{number} {}", subject_text(subject)),
                 None => format!(
                     "{} {}",
                     commit.data.sha.display_short(),
-                    truncate_and_trailoff(&commit.data.subject, 20)
+                    subject_text(&commit.data.subject)
                 ),
             },
             ([newest, ..], true) => format!(
@@ -358,11 +368,14 @@ impl ReviewTopBlock {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         h_flex()
+            .w_full()
+            .min_w_0()
             .gap_1()
             .child(
                 Label::new(format!("Changes on {branch} since its merge base with"))
                     .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    .color(Color::Muted)
+                    .truncate(),
             )
             .child(
                 Button::new("review-change-base", base.clone())
@@ -691,6 +704,8 @@ impl ReviewTopBlock {
         let is_snapshot = self.diff.read(cx).is_snapshot(cx);
         let summary = self.commits_title().unwrap_or_default();
         let header = h_flex()
+            .w_full()
+            .min_w_0()
             .gap_1()
             .child(
                 Disclosure::new("review-commit-messages", self.expanded)
@@ -701,12 +716,13 @@ impl ReviewTopBlock {
                     }))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
             )
-            .child(Label::new(summary).size(LabelSize::Small))
+            .child(Label::new(summary).size(LabelSize::Small).truncate())
             .when(is_snapshot, |header| {
                 header.child(
                     Label::new("· Read-only snapshot")
                         .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        .color(Color::Muted)
+                        .flex_none(),
                 )
             });
 
@@ -835,17 +851,22 @@ fn render_commit(
         .py_1()
         .child(
             h_flex()
+                .items_start()
                 .gap_2()
                 .child(
                     Label::new(data.sha.display_short())
                         .size(LabelSize::Small)
                         .color(Color::Muted)
-                        .buffer_font(cx),
+                        .buffer_font(cx)
+                        .flex_none(),
                 )
+                // Wrapped: the header above truncates the subject, this is where it's read whole.
                 .child(
-                    Label::new(data.subject.clone())
-                        .size(LabelSize::Small)
-                        .weight(FontWeight::SEMIBOLD),
+                    div().flex_1().min_w_0().child(
+                        Label::new(data.subject.clone())
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::SEMIBOLD),
+                    ),
                 ),
         )
         .child(

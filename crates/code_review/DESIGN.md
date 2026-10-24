@@ -277,15 +277,18 @@ changed (only `Cargo.lock`); `code_review` now depends on `git_ui` (branch picke
 - **Top block**: a fixed header above the editor (CommitView precedent; an editor block can't sit
   above the first file header and is lost when the split LHS is recreated). Branch: one line
   "Changes on ‹branch› since its merge base with [‹base› ▾]". Commits: collapsed by default (summary =
-  tab title, plus "Read-only snapshot"), expanded = up to 100 commits newest first with sha, subject,
-  author, date and the markdown body (16 lines, then it scrolls; "…and more commits" past the limit).
-  Commit messages can't be commented on. `ToggleHeader` has no default key.
+  the title with the whole subject, truncated to the width on one line, plus "Read-only snapshot"),
+  expanded = up to 100 commits newest first with sha, subject (wrapped), author, date and the
+  markdown body (16 lines, then it scrolls; "…and more commits" past the limit). Commit messages
+  can't be commented on. `ToggleHeader` has no default key.
 - **Titles**: "Review: Uncommitted changes", "Review: ‹branch› vs ‹base›", "Review: ‹sha7› ‹subject (20
   chars)›" ("Review: #‹N› ‹subject (20 chars)›" for a squash merge's "subject (#N)"; the tooltip keeps
   the sha and the whole subject), "Review: ‹n› commits ‹oldest7›–‹newest7›" ("‹n›+ commits up to
   ‹newest7›" when truncated; before the commits load, the head's short sha). Snapshot tabs add
   "Read-only snapshot (no language server)" to the tooltip. The panel shows the same title and
-  follows changes.
+  follows changes. Only the tab cuts the subject at 20 characters (and a pull request's title at
+  64): the overview's header and the panel's header show the whole title and truncate it to their
+  width (user decision, bugs round 2).
 - **Reuse**: same target (`ReviewTarget::is_same_review`) and same repository → activate the open tab;
   anything else opens another tab. Persistence keys for M5 (§2.6): branch = repo + current branch name
   + base; commits = repo + `base..head`.
