@@ -51,32 +51,32 @@ pub(super) fn install(editor: &Entity<Editor>, blocks: WeakEntity<CommentBlocks>
                     .read(cx)
                     .gutter_button(&editor, gutter_row, cx)
                     .map(|button| render_button(button, &blocks, &editor, &drag_rows, cx));
-                Some(render_row(gutter_row.row, button, &editor, &drag_rows))
+                Some(render_row(gutter_row, button, &editor, &drag_rows))
             })),
             cx,
         );
     });
 }
 
-/// How far the area over a row's line number reaches from the start of the line-number column
-/// (where the "+" is): past the line numbers of any length. Its click handler only takes clicks
-/// on the line numbers, and lets the others through.
-const LINE_NUMBER_AREA_WIDTH: Rems = Rems(6.);
-
-/// What the review draws over a row's line number: the "+" when the row has one, in an area
-/// that takes the clicks on the line number.
+/// What the review draws over a row's gutter: an area that takes the clicks on the line number
+/// (and lets the others through), and the "+" when the row has one. The "+" goes between the
+/// line number and the text, as on GitHub: before the line numbers, the first and last rows of
+/// excerpts have their expand buttons.
 fn render_row(
-    row: DisplayRow,
+    gutter_row: &GutterRow,
     button: Option<AnyElement>,
     editor: &Entity<Editor>,
     drag_rows: &DragRows,
 ) -> AnyElement {
+    let row = gutter_row.row;
     let editor = editor.downgrade();
     let drag_rows = drag_rows.clone();
     h_flex()
         .h_full()
-        .w(LINE_NUMBER_AREA_WIDTH)
+        .w(gutter_row.right_padding.end)
+        .pl(gutter_row.right_padding.start)
         .items_center()
+        .justify_center()
         .debug_selector(move || format!("review-line-number-{}", row.0))
         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
             if window.default_prevented() {
@@ -461,8 +461,7 @@ fn render_button(
             if event.modifiers.shift {
                 return;
             }
-            // Neither the gutter's own line selection nor an excerpt's expand button below (on
-            // the first and last rows of excerpts) takes the click.
+            // The gutter's own line selection doesn't take the click.
             window.prevent_default();
             cx.stop_propagation();
             if refused {

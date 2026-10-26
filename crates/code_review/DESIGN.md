@@ -37,7 +37,8 @@ stacks: stacked pull requests are one row per stack in the Start Review picker, 
 stack's first pull request to review, and a pull request review in a stack shows the stack and
 steps up and down it (see "Stacked pull requests"). Then the user's bug findings on movement: the
 review tab dropped its own line cursor and keys for **Zed's own vim, unchanged**, on the read-only
-diff (see "Upstream vim in the review tab").
+diff (see "Upstream vim in the review tab"), and the gutter's "+" moved between the line numbers
+and the text, off the excerpts' expand buttons (see "Gutter buttons don't overlap").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -1833,14 +1834,15 @@ the user's §7 answers (Q5 breakpoint/bookmark hover off, Q6 "+" on the hovered 
 and the selection's end, Q7 "Cancel"/"Save", Q9 "Reviewed", Q11 drag from the "+": yes). No
 upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' order changed only.
 
-- **The "+"** (`comments/blocks/gutter.rs`): `gutter::install` sets the editor's gutter row
-  renderer on the right side once and on every new left side (`CommentBlocks`' left-side observer).
-  A solid accent "+" (GitHub's) over the start of the line-number column shows on the row under the
-  pointer (gutter or text), and on the cursor's row and the selection's last row of the side that
-  has the cursor (the split editor's focused side). It's for rows with a buffer row only: no
-  blocks, spacers or folded headers. Its target is the row's line: the old line on the left side
-  and on removed rows of a unified diff (`RowInfo`'s buffer and row), so the comment gate can say
-  per row whether the review takes it.
+- **The "+"** (`comments/blocks/gutter.rs`): `gutter::install` sets the editor's gutter row renderer
+  on the right side once and on every new left side (`CommentBlocks`' left-side observer). A solid
+  accent "+" (GitHub's) shows (since "Gutter buttons don't overlap": between the line numbers and
+  the text; it was over the start of the line-number column) on the row under the pointer (gutter or
+  text), and on the cursor's row and the selection's last row of the side that has the cursor (the
+  split editor's focused side). It's for rows with a buffer row only: no blocks, spacers or folded
+  headers. Its target is the row's line: the old line on the left side and on removed rows of a
+  unified diff (`RowInfo`'s buffer and row), so the comment gate can say per row whether the review
+  takes it.
 - **Click / drag**: pressing the "+" focuses its side, moves the line cursor to the row (unless the
   row is in the side's selection of several rows) and starts `start_gutter_row_drag`. While the
   button is held, the renderer sees the drag's rows and (deferred to after the frame) sets the
@@ -1851,9 +1853,10 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   the last row; a plain click on a "+" inside a selection comments on the whole selection. The
   side is passed explicitly: a side focused directly is the split editor's focused one only on the
   next frame. Shift-click on a "+" is left to the gutter (extends the selection); otherwise the
-  mouse down prevents the default and stops propagating, because the excerpts' expand buttons sit
+  mouse down prevents the default and stops propagating, because the excerpts' expand buttons sat
   under the "+" on the first and last rows of excerpts (found by a test: the click expanded the
-  excerpt and the editor never saw the mouse up, so the drag never ended).
+  excerpt and the editor never saw the mouse up, so the drag never ended; the "+" has been off them
+  since "Gutter buttons don't overlap").
 - **Ranges the native way**: shift-click on a row's text extends the selection; a drag in the
   gutter (not on the digits: a click on a line number of a multibuffer opens the file there,
   upstream) selects whole lines; either way the "+" at the selection's end (or on a hovered row
@@ -1906,8 +1909,9 @@ upstream edits: core patch #6 from slice A (§3.10) is now used; the keymaps' or
   an expanded excerpt outside GitHub's hunks with the tooltip "GitHub only accepts comments within
   its diff hunks", its click does nothing. Logs: only the usual noise.
 - **Notes for slice C**: the "+" sits where Zed draws excerpt expand buttons on excerpt edge rows
-  (it wins the click there); a review context menu (Q10) can reuse `add_line_comment_on` /
-  `add_file_comment_for` / `set_type`; the toolbar's "Add Review Comment" is `AddReviewComment`.
+  (it wins the click there; fixed in "Gutter buttons don't overlap"); a review context menu (Q10)
+  can reuse `add_line_comment_on` / `add_file_comment_for` / `set_type`; the toolbar's "Add Review
+  Comment" is `AddReviewComment`.
 
 **UX-1 slice C (pane toolbar, review context menu, panel mouse controls, line numbers)** —
 `plans/UX-1.md` part B (toolbar, panel) with the user's §7 answers (Q8: a pane toolbar row, the
@@ -1964,8 +1968,9 @@ editors). No upstream edits.
   public): it prevents the default (the editor's handler then returns), moves the line cursor to
   the row and starts a gutter row drag that selects rows as it goes and doesn't comment; shift-click
   extends the selection. Clicks elsewhere in the gutter (beside the digits, the fold area) keep
-  Zed's behaviour; blocks and sticky headers draw over the area. It is a fixed 6 rem wide, past the
-  gutter into the text, where it lets every click through.
+  Zed's behaviour; blocks and sticky headers draw over the area. It was a fixed 6 rem wide, past the
+  gutter into the text, where it let every click through; since "Gutter buttons don't overlap" it
+  ends with the gutter (`GutterRow::right_padding`).
 - Tests: 8 new (222 + 1 ignored): toolbar: counts follow `r` and comments, a split clone's toolbar
   acts on the clone, hidden for a file editor; each button against its key (`]f [f ]c [c ]t [t`,
   pressed while the panel has the focus), the single-file toggle and its info, Copy, Review
@@ -2140,6 +2145,46 @@ symbol and do `gd`". Split view stays (upstream's works with a real cursor).
   `pull_request::test_half_page_scrolls_reach_both_ends` (`ctrl-u`/`ctrl-d` from end to end, view
   and cursor moving one way, overview expanded and collapsed; `j` moves one row) and `yiw` through
   vim in `test_copy_review_comment_and_lines`. 225 pass, 1 ignored. Not done: a live run.
+
+**Gutter buttons don't overlap (the user's bug findings, item 5)** — ""expand excerpt" and +
+buttons overlap, should not happen. both are frequently used."
+
+- **Cause**: upstream draws an excerpt's expand button (`layout_expand_toggles`: `ExpandUp` on an
+  excerpt's first row, `ExpandDown` on its last, `ExpandVertical` on a one-row excerpt; both sides
+  of a split diff, the left side's delegated) in the gutter's left padding, from the git strip on,
+  as wide as that padding (an em more when the row's line number is shorter than the widest).
+  `Gutter::prepaint_button`, which core patch #6 uses for the review's row elements, draws at the
+  git strip + 2 px, so the "+" (15.5 px square in the tests) sat on the expand arrow of an edge row
+  whenever it showed there: on the hovered row, the cursor row and the selection's end. Hovering an
+  expand button always hovers its row, so the "+" covered it exactly when the user went for it, and
+  the "+"'s mouse down (`stop_propagation`) took the click: with the mouse, an excerpt couldn't be
+  expanded.
+- **Decision**: the "+" moved to the gutter's right padding, between the line numbers and the text,
+  on every row: GitHub's own place for it (at the code's edge), the same place on every row, and
+  nothing else draws there in a multibuffer (fold toggles are for singletons only; the review's
+  sides have 3 ch of it). The expand buttons keep upstream's place and size. Core patch #6 got
+  `GutterRow::right_padding` (where that padding is, from the element's origin), which the review's
+  row element (`render_row`) uses: it now reaches to the gutter's end (was a fixed 6 rem) and
+  centers the "+" in the padding. The line-number area and its clicks (UX-1 slice C) are unchanged.
+  Alternatives: no "+" on edge rows (upstream's own rule for its breakpoint hover button and run
+  indicators, `Gutter::layout_item`; but the user comments on those rows with the mouse too); the
+  "+" shifted right only on edge rows (a target that moves between rows; and a short line number's
+  expand button reaches an em into the digits' column); the "+" on top with the expand button
+  reachable around it (too small to hit). Not covered: with line numbers turned off, a multibuffer's
+  right padding is empty, and the "+" straddles the gutter's end.
+- Tests: `test_gutter_button_beside_expand_buttons` (unified: the cursor's "+" on an excerpt's first
+  row and the hovered "+" on its last row don't intersect their `ICON-ExpandUp` / `ICON-ExpandDown`
+  and sit between the line numbers and the text; with the "+" showing, a click on each expand button
+  expands the excerpt and opens no comment; the "+" of an excerpt's last row comments on it and
+  doesn't expand it) and `test_gutter_buttons_beside_expand_buttons_in_split_view` (the right side's
+  cursor "+" and the left side's hovered one on a first row, the left side's cursor "+" and the
+  right side's hovered one on a last row; the left side's expand buttons are found at the right
+  side's place in its own gutter, and clicking them expands both sides); both red before the fix,
+  stable under `ITERATIONS=5`. `test_no_breakpoint_button_in_the_gutter` now finds the line number
+  to hover with `line_number_column` (it went from the "+"'s old place). Editor:
+  `test_gutter_row_renderer_hover_and_drag` checks `right_padding` against the gutter's dimensions.
+  227 pass, 1 ignored; editor `gutter` tests 9 pass; clippy (`-p code_review -p editor`) clean. Not
+  done: a live run.
 
 **Known issues / notes for the next slices:**
 
@@ -2542,14 +2587,15 @@ review tab").
 - **Types:** untyped default; Issue / Suggestion / Note / Praise; `Tab` in the editor's **normal**
   mode cycles (insert-mode `Tab` is a tab); colored badge; `[TYPE] ` prefix on GitHub submission.
   Custom type sets later (settings).
-- **Mouse** (UX-1, GitHub-like): a "+" in the gutter of the hovered row, the cursor row and the
-  selection's end (both sides, removed rows too) comments on the row or the selection it's in;
-  pressing it and dragging over rows comments on them; disabled with the gate's reason where a pull
-  request doesn't take comments. The editor's footer has a type menu, Cancel, Save and (saved
-  comments) Delete; file headers have "Comment" and the "Reviewed" checkbox. Line numbers select
-  rows (click, drag, shift-click) instead of opening the file. The right-click menu comments on
-  the row or selection, or on the file, and edits, deletes or copies the comment there; the
-  panel's comment rows have edit/delete buttons on hover.
+- **Mouse** (UX-1, GitHub-like): a "+" in the gutter (between the line numbers and the text, clear
+  of the excerpts' expand buttons) of the hovered row, the cursor row and the selection's end (both
+  sides, removed rows too) comments on the row or the selection it's in; pressing it and dragging
+  over rows comments on them; disabled with the gate's reason where a pull request doesn't take
+  comments. The editor's footer has a type menu, Cancel, Save and (saved comments) Delete; file
+  headers have "Comment" and the "Reviewed" checkbox. Line numbers select rows (click, drag,
+  shift-click) instead of opening the file. The right-click menu comments on the row or selection,
+  or on the file, and edits, deletes or copies the comment there; the panel's comment rows have
+  edit/delete buttons on hover.
 - **Review-level comments** (`;c`) live in the top section and become the **GitHub review body** on
   submit (tuicr: `src/forge/submit.rs:568` `build_review_body` joins them with `[TYPE]` prefixes).
 - **Persistence:** drafts + reviewed marks saved locally in **Zed's DB**, keyed by review target
@@ -2689,7 +2735,7 @@ crates/code_review/
   review only puts a new left side's cursor on the row facing the right side's (`face_cursor` in
   `view.rs`: upstream leaves it at the end until the right side's cursor moves, and `ctrl-w h`
   would jump there) and turns the gutter's breakpoint/bookmark hover off on each side
-  (`configure_side`; the review's "+" takes that place).
+  (`configure_side`; the review's "+" is the gutter's hover button).
 - Rows of the newest selection, as the review's actions take them: `context_menu::selected_rows`
   (`selections.newest_adjusted`; an end at column 0 excludes that row).
 - Cursor never lands on custom blocks (`BlockSnapshot::clip_point`, `block_map.rs:2504-2558`);
@@ -2819,7 +2865,7 @@ change, so mismatched CLI/app versions don't break).
 | `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs`, `editor.rs` (`RowHighlightOptions`) | None any more: core patches #2 (`set_forbid_horizontal_autoscroll`) and #3 (`RowHighlightOptions::include_end_row`) went with the line cursor ("Upstream vim in the review tab"), #1 in polish B. `git diff v1.25.0-pre -- crates/editor/src/scroll.rs crates/editor/src/scroll/autoscroll.rs crates/editor/src/config.rs` is empty |
 | `crates/editor/src/display_map/block_map.rs` | Core patch #5 (UX-1, +14/−1): `Block::is_above_start` (a custom block at `BlockPlacement::Above(Anchor::Min)`) sorts right after the start comparison in `sort_blocks`, so it comes before the first buffer's header and a folded first buffer (`dedup_by` keeps both), and `balancing_block` keeps `Anchor::Min` for its spacer on the other side (else an excerpt anchor after that side's header). Upstream places no block there (only a test on a headerless singleton). Tests +127 (`test_block_above_multibuffer_start`) |
 | `crates/editor/src/split_editor_view.rs`, `element.rs` (`render_blocks`), `editor.rs` | Core patch #7 (UX-1, +149 in `split_editor_view.rs`, +13 in `element.rs`, +3 in `editor.rs`): `Editor::set_full_width_block(Option<CustomBlockId>)`. When that editor is the right side of a split diff, its `EditorElement` skips the block (and hands a focused-block record for it on), and `SplitBufferHeadersElement::build_full_width_block` renders it with the block's own render callback across the overlay's width, measures it there (`resize_blocks`, which resizes the left spacer too), paints it under the file headers, and keeps it rendered below the view while it holds the focus. Unsplit, nothing changes. Tests in `split.rs` +217 with #5's (`test_block_above_start_leads_both_sides`, `test_full_width_block_in_split_view`) |
-| `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 113-line new file, +38 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. Tests +141 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`) |
+| `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 119-line new file, +48 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. "Gutter buttons don't overlap" added `GutterRow::right_padding` (+6 in `gutter_row.rs`, +10 in `element.rs`): the gutter's right padding, between the line numbers and the text, as x offsets from the element's origin (`prepaint_button` draws it after the git strip), where the review puts its "+". Tests +152 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`, which also checks `right_padding`) |
 | `assets/keymaps/code_review*.json` | new files |
 | `nix/build.nix` | `releaseChannel ? "nightly"` argument (M9, +30/−7): a `channel` table (stable/preview/nightly), an assert that only Linux builds other channels than nightly, and the channel in `version`, `preBuild`'s `RELEASE_CHANNEL` and the Linux icons and desktop entry. The default derivation is unchanged (same `.drv`); `crates/code_review/INSTALL.md` uses `.override { releaseChannel = "stable"; }` |
 | `crates/settings_content/src/settings_content.rs`, `crates/settings/src/vscode_import.rs`, `assets/settings/default.json` | Review Pull Request picker: `SettingsContent::code_review` (`CodeReviewSettingsContent`: `pull_request_search`, `hide_approved_pull_requests`) in the struct and its `flattened_deserialize!` list (+21/−1), `code_review: None` in the VS Code import (+1), the defaults (+11). Editing `settings_content` rebuilds most of Zed |

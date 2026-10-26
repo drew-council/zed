@@ -50685,10 +50685,11 @@ async fn test_gutter_row_renderer_hover_and_drag(cx: &mut TestAppContext) {
                     let weak_editor = weak_editor.clone();
                     let ended = ended.clone();
                     let row = gutter_row.row;
-                    div()
+                    let right_padding = gutter_row.right_padding.clone();
+                    let button = div()
                         .id("gutter-row-button")
                         .debug_selector(|| "gutter-row-button".into())
-                        .size(px(8.))
+                        .size_full()
                         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                             window.prevent_default();
                             let ended = ended.clone();
@@ -50703,7 +50704,12 @@ async fn test_gutter_row_renderer_hover_and_drag(cx: &mut TestAppContext) {
                                     )
                                 })
                                 .ok();
-                        })
+                        });
+                    div()
+                        .pl(right_padding.start)
+                        .w(right_padding.end)
+                        .h(px(8.))
+                        .child(button)
                         .into_any_element()
                 })
             })),
@@ -50772,6 +50778,11 @@ async fn test_gutter_row_renderer_hover_and_drag(cx: &mut TestAppContext) {
         .debug_bounds("gutter-row-button")
         .expect("the renderer's element is painted");
     assert!(gutter_bounds.contains(&button.center()));
+    // The renderer knows where the gutter's right padding is (up to the layout's rounding).
+    let gutter_dimensions = cx.update_editor(|editor, _, _| editor.gutter_dimensions);
+    assert!(gutter_dimensions.right_padding > px(0.));
+    assert!((button.size.width - gutter_dimensions.right_padding).abs() < px(1.));
+    assert!((button.right() - (gutter_bounds.origin.x + gutter_dimensions.width)).abs() < px(1.));
     cx.simulate_mouse_down(button.center(), MouseButton::Left, Modifiers::none());
     cx.simulate_mouse_move(
         point(text_bounds.origin.x + px(5.), row_y(3.)),

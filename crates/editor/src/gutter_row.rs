@@ -1,6 +1,9 @@
-use std::{ops::RangeInclusive, rc::Rc};
+use std::{
+    ops::{Range, RangeInclusive},
+    rc::Rc,
+};
 
-use gpui::{AnyElement, App, Context, Window};
+use gpui::{AnyElement, App, Context, Pixels, Window};
 use multi_buffer::RowInfo;
 
 use crate::{DisplayRow, Editor};
@@ -14,6 +17,9 @@ pub struct GutterRow<'a> {
     /// The rows of the drag started by [`Editor::start_gutter_row_drag`], while its mouse button
     /// is held.
     pub drag: Option<RangeInclusive<DisplayRow>>,
+    /// The gutter's right padding, between the line numbers and the text, as x offsets from the
+    /// element's origin.
+    pub right_padding: Range<Pixels>,
 }
 
 /// Returns the element to draw over a row's line number, if any. It's called outside of any

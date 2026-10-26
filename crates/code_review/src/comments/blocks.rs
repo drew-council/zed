@@ -5186,7 +5186,7 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
                 comments(&review, cx).last().unwrap(),
                 &(lines("a.rs", 3..=5), "selected".to_string(), None)
             );
-            // Line 5 ends the excerpt, whose expand button the "+" covers.
+            // Line 5 ends the excerpt, which its "+" doesn't expand.
             assert_ne!(row_text(&rhs, line_3 + 3, cx), "line 6");
         }
 
@@ -5267,6 +5267,189 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         );
     }
 
+    /// The excerpt expand button drawn last with `selector`, which must be on the row of `plus`.
+    fn expand_button(
+        selector: &'static str,
+        plus: gpui::Bounds<gpui::Pixels>,
+        cx: &mut VisualTestContext,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} isn't drawn"));
+        assert!(
+            bounds.top() < plus.center().y && plus.center().y < bounds.bottom(),
+            "{selector} {bounds:?} isn't on the row of the \"+\" {plus:?}"
+        );
+        bounds
+    }
+
+    #[track_caller]
+    fn assert_apart(plus: gpui::Bounds<gpui::Pixels>, expand: gpui::Bounds<gpui::Pixels>) {
+        assert!(
+            !plus.intersects(&expand),
+            "the \"+\" {plus:?} overlaps the expand button {expand:?}"
+        );
+    }
+
+    /// The "+" is between the line numbers of `editor` and its text.
+    #[track_caller]
+    fn assert_after_line_numbers(
+        plus: gpui::Bounds<gpui::Pixels>,
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) {
+        let (line_numbers, text_start) = editor.update_in(cx, |editor, window, cx| {
+            let line_numbers = gutter::line_number_column(editor, window, cx).unwrap();
+            let style = editor.style(cx).clone();
+            let font_id = window.text_system().resolve_font(&style.text.font());
+            let font_size = style.text.font_size.to_pixels(window.rem_size());
+            let gutter = editor
+                .snapshot(window, cx)
+                .gutter_dimensions(font_id, font_size, &style, window, cx);
+            let text_start = line_numbers.end + gutter.right_padding;
+            (line_numbers, text_start)
+        });
+        assert!(
+            line_numbers.end <= plus.left() && plus.right() <= text_start,
+            "the \"+\" {plus:?} isn't between the line numbers {line_numbers:?} and the text \
+             ({text_start:?})"
+        );
+    }
+
+    /// The row above the one showing `text` shows `above`: an excerpt grew to them.
+    #[track_caller]
+    fn assert_row_above(
+        editor: &Entity<Editor>,
+        text: &str,
+        above: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let row = move_to_row_with_text(editor, text, cx);
+        assert_eq!(row_text(editor, row - 1, cx), above);
+    }
+
+    /// The "+" sits beside the expand buttons of the first and last rows of excerpts, whether it
+    /// shows for the cursor or for the pointer, and a click on either does its own thing.
+    #[gpui::test]
+    async fn test_gutter_button_beside_expand_buttons(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Unified);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let none = gpui::Modifiers::none();
+
+        // a.rs shows lines 1–5 and 33–38: line 33 starts an excerpt, line 38 ends the last one.
+        let line_33 = move_to_row_with_text(&rhs, "line 33", cx);
+        let (plus, line_33_row) = cursor_plus_button(&rhs, false, cx);
+        let expand_up = expand_button("ICON-ExpandUp", plus, cx);
+        assert_apart(plus, expand_up);
+        assert_after_line_numbers(plus, &rhs, cx);
+
+        let line_38_row = display_row(&rhs, line_33 + 6, cx);
+        let position = text_position(&rhs, line_38_row, plus, line_33_row, cx);
+        cx.simulate_mouse_move(position, None, none);
+        draw(cx);
+        let plus = plus_button(false, line_38_row, false, cx).expect("the hovered row has a \"+\"");
+        let expand_down = expand_button("ICON-ExpandDown", plus, cx);
+        assert_apart(plus, expand_down);
+        cx.simulate_mouse_move(expand_down.center(), None, none);
+        draw(cx);
+        assert_eq!(plus_button(false, line_38_row, false, cx), Some(plus));
+        cx.simulate_click(expand_down.center(), none);
+        cx.run_until_parked();
+        assert!(open_editor(&review, cx).is_none());
+        assert_row_above(&rhs, "line 39", "line 38", cx);
+
+        cx.simulate_mouse_move(expand_up.center(), None, none);
+        draw(cx);
+        assert!(plus_button(false, line_33_row, false, cx).is_some());
+        cx.simulate_click(expand_up.center(), none);
+        cx.run_until_parked();
+        assert!(open_editor(&review, cx).is_none());
+        assert_row_above(&rhs, "line 33", "line 32", cx);
+
+        // The "+" of an excerpt's last row comments on it.
+        let line_5 = move_to_row_with_text(&rhs, "line 5", cx);
+        let (plus, _) = cursor_plus_button(&rhs, false, cx);
+        cx.simulate_click(plus.center(), none);
+        cx.run_until_parked();
+        cx.simulate_input("five");
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_back_in_diff(&rhs, cx);
+        assert_eq!(
+            comments(&review, cx),
+            [(lines("a.rs", 5..=5), "five".to_string(), None)]
+        );
+        assert_ne!(row_text(&rhs, line_5 + 1, cx), "line 6");
+    }
+
+    /// Both sides of a split diff keep their "+" off their expand buttons, which expand the
+    /// excerpt on both sides.
+    #[gpui::test]
+    async fn test_gutter_buttons_beside_expand_buttons_in_split_view(cx: &mut TestAppContext) {
+        init(cx, DiffViewStyle::Split);
+        let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+        let rhs = rhs_editor(&review, cx);
+        let lhs = lhs_editor(&review, cx);
+        let none = gpui::Modifiers::none();
+        let origin = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |editor, _| editor.last_bounds().unwrap().origin)
+        };
+        // The right side is drawn last, so `expand_button` finds its buttons; the left side draws
+        // its own at the same place of its gutter.
+        let on_lhs = |rhs_bounds: gpui::Bounds<gpui::Pixels>, cx: &mut VisualTestContext| {
+            let lhs_origin = origin(&lhs, cx);
+            let rhs_origin = origin(&rhs, cx);
+            gpui::Bounds::new(rhs_bounds.origin - rhs_origin + lhs_origin, rhs_bounds.size)
+        };
+
+        // The right side's cursor row and the left side's hovered row, an excerpt's first row.
+        move_to_row_with_text(&rhs, "line 33", cx);
+        let (rhs_plus, row) = cursor_plus_button(&rhs, false, cx);
+        let rhs_expand = expand_button("ICON-ExpandUp", rhs_plus, cx);
+        assert_apart(rhs_plus, rhs_expand);
+        let lhs_expand = on_lhs(rhs_expand, cx);
+        let position = text_position(&lhs, row, rhs_plus, row, cx);
+        cx.simulate_mouse_move(position, None, none);
+        draw(cx);
+        let lhs_plus = plus_button(true, row, false, cx).expect("the hovered row has a \"+\"");
+        assert_apart(lhs_plus, lhs_expand);
+        assert_after_line_numbers(lhs_plus, &lhs, cx);
+        assert_after_line_numbers(rhs_plus, &rhs, cx);
+        assert_apart(rhs_plus, lhs_expand);
+
+        // The left side's cursor row and the right side's hovered row, an excerpt's last row.
+        cx.focus(&lhs);
+        move_to_row_with_text(&lhs, "line 38", cx);
+        let (lhs_plus, line_38_row) = cursor_plus_button(&lhs, true, cx);
+        let position = text_position(&rhs, line_38_row, lhs_plus, line_38_row, cx);
+        cx.simulate_mouse_move(position, None, none);
+        draw(cx);
+        let rhs_plus =
+            plus_button(false, line_38_row, false, cx).expect("the hovered row has a \"+\"");
+        let rhs_expand = expand_button("ICON-ExpandDown", rhs_plus, cx);
+        assert_apart(rhs_plus, rhs_expand);
+        assert_apart(lhs_plus, on_lhs(rhs_expand, cx));
+
+        // Each side's expand button takes its click while that side's "+" shows on its row.
+        cx.simulate_mouse_move(rhs_expand.center(), None, none);
+        draw(cx);
+        assert!(plus_button(false, line_38_row, false, cx).is_some());
+        cx.simulate_click(rhs_expand.center(), none);
+        cx.run_until_parked();
+        assert!(open_editor(&review, cx).is_none());
+        assert_row_above(&rhs, "line 39", "line 38", cx);
+        assert_row_above(&lhs, "line 39", "line 38", cx);
+
+        cx.simulate_mouse_move(lhs_expand.center(), None, none);
+        draw(cx);
+        assert!(plus_button(true, row, false, cx).is_some());
+        cx.simulate_click(lhs_expand.center(), none);
+        cx.run_until_parked();
+        assert!(open_editor(&review, cx).is_none());
+        assert_row_above(&rhs, "line 33", "line 32", cx);
+        assert_row_above(&lhs, "line 33", "line 32", cx);
+    }
+
     /// The gutter's breakpoint and bookmark button doesn't show in the review.
     #[gpui::test]
     async fn test_no_breakpoint_button_in_the_gutter(cx: &mut TestAppContext) {
@@ -5277,8 +5460,13 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         let (plus, row) = cursor_plus_button(&rhs, false, cx);
 
         // Over the line number of the next row, for longer than the button's delay.
+        let line_numbers = rhs
+            .update_in(cx, |editor, window, cx| {
+                gutter::line_number_column(editor, window, cx)
+            })
+            .unwrap();
         let position = gpui::point(
-            plus.center().x + gpui::px(8.),
+            line_numbers.end - gpui::px(2.),
             plus.center().y + line_height(&rhs, cx),
         );
         cx.simulate_mouse_move(position, None, gpui::Modifiers::none());

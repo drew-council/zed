@@ -2706,6 +2706,15 @@ impl EditorElement {
         };
         let hovered = editor.hovered_gutter_row;
         let drag = editor.gutter_row_drag.as_ref().map(|drag| drag.rows());
+        // Where `Gutter::prepaint_button` draws the elements.
+        let element_x = Self::gutter_strip_width(gutter.line_height, cx)
+            + gutter
+                .dimensions
+                .git_blame_entries_width
+                .unwrap_or_default()
+            + px(2.);
+        let right_padding = gutter.dimensions.width - gutter.dimensions.right_padding - element_x
+            ..gutter.dimensions.width - element_x;
         gutter
             .row_infos
             .iter()
@@ -2718,6 +2727,7 @@ impl EditorElement {
                     info,
                     hovered: hovered == Some(row),
                     drag: drag.clone(),
+                    right_padding: right_padding.clone(),
                 };
                 let element = renderer(&gutter_row, window, cx)?;
                 Some(gutter.prepaint_button(element, row, window, cx))
