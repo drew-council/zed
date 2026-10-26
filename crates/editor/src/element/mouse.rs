@@ -605,6 +605,38 @@ impl EditorElement {
         let mut click_count = event.click_count;
         let mut modifiers = event.modifiers;
 
+        if let Some(handler) = editor.line_number_click.clone()
+            && gutter_hitbox.is_hovered(window)
+        {
+            let display_row = DisplayRow(
+                (ScrollPixelOffset::from(
+                    (event.position - gutter_hitbox.bounds.origin).y / position_map.line_height,
+                ) + position_map.scroll_position.y) as u32,
+            );
+            let multi_buffer_row = position_map
+                .snapshot
+                .display_point_to_point(DisplayPoint::new(display_row, 0), Bias::Right)
+                .row;
+            let on_line_number = line_numbers
+                .get(&MultiBufferRow(multi_buffer_row))
+                .is_some_and(|line_layout| {
+                    line_layout.segments.iter().any(|segment| {
+                        segment
+                            .hitbox
+                            .as_ref()
+                            .is_some_and(|hitbox| hitbox.contains(&event.position))
+                    })
+                });
+            if on_line_number {
+                // The handler may update this editor.
+                window.defer(cx, move |window, cx| {
+                    handler(display_row, modifiers, window, cx)
+                });
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         if let Some(hovered_hunk) =
             position_map
                 .display_hunks

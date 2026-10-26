@@ -7,11 +7,7 @@ use editor::{
 use gpui::{Entity, Focusable as _, MouseButton, WeakEntity};
 use language::Point;
 use multi_buffer::{MultiBufferRow, RowInfo};
-use std::{
-    cell::RefCell,
-    ops::{Range, RangeInclusive},
-    rc::Rc,
-};
+use std::{cell::RefCell, ops::RangeInclusive, rc::Rc};
 use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::ResultExt as _;
 
@@ -44,70 +40,52 @@ pub(super) fn install(editor: &Entity<Editor>, blocks: WeakEntity<CommentBlocks>
     let drag_rows = DragRows::default();
     editor.update(cx, |editor, cx| {
         editor.set_gutter_row_renderer(
-            Some(Rc::new(move |gutter_row, window, cx| {
-                let editor = weak_editor.upgrade()?;
-                follow_drag(&editor, &drag_rows, gutter_row.drag.as_ref(), window, cx);
-                let button = blocks
-                    .upgrade()?
-                    .read(cx)
-                    .gutter_button(&editor, gutter_row, cx)
-                    .map(|button| render_button(button, &blocks, &editor, &drag_rows, cx));
-                Some(render_row(gutter_row, button, &editor, &drag_rows))
+            Some(Rc::new({
+                let weak_editor = weak_editor.clone();
+                let drag_rows = drag_rows.clone();
+                move |gutter_row, window, cx| {
+                    let editor = weak_editor.upgrade()?;
+                    follow_drag(&editor, &drag_rows, gutter_row.drag.as_ref(), window, cx);
+                    let button = blocks
+                        .upgrade()?
+                        .read(cx)
+                        .gutter_button(&editor, gutter_row, cx)?;
+                    let button = render_button(button, &blocks, &editor, &drag_rows, cx);
+                    Some(render_row(gutter_row, button))
+                }
             })),
             cx,
         );
+        // In a multibuffer, the editor opens the file at a clicked line number.
+        editor.set_line_number_click_handler(Some(Rc::new(move |row, modifiers, window, cx| {
+            if let Some(editor) = weak_editor.upgrade() {
+                select_from_line_number(&editor, row, modifiers.shift, &drag_rows, window, cx);
+            }
+        })));
     });
 }
 
-/// What the review draws over a row's gutter: an area that takes the clicks on the line number
-/// (and lets the others through), and the "+" when the row has one. The "+" goes between the
-/// line number and the text, as on GitHub: before the line numbers, the first and last rows of
-/// excerpts have their expand buttons.
-fn render_row(
-    gutter_row: &GutterRow,
-    button: Option<AnyElement>,
-    editor: &Entity<Editor>,
-    drag_rows: &DragRows,
-) -> AnyElement {
-    let row = gutter_row.row;
-    let editor = editor.downgrade();
-    let drag_rows = drag_rows.clone();
+/// The "+" of a row, between the line number and the text, as on GitHub: before the line
+/// numbers, the first and last rows of excerpts have their expand buttons.
+fn render_row(gutter_row: &GutterRow, button: AnyElement) -> AnyElement {
     h_flex()
         .h_full()
         .w(gutter_row.right_padding.end)
         .pl(gutter_row.right_padding.start)
         .items_center()
         .justify_center()
-        .debug_selector(move || format!("review-line-number-{}", row.0))
-        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-            if window.default_prevented() {
-                return;
-            }
-            let Some(editor) = editor.upgrade() else {
-                return;
-            };
-            let on_line_number = editor
-                .update(cx, |editor, cx| line_number_column(editor, window, cx))
-                .is_some_and(|column| column.contains(&event.position.x));
-            if !on_line_number {
-                return;
-            }
-            // In a multibuffer, the editor opens the file at a clicked line number.
-            window.prevent_default();
-            cx.stop_propagation();
-            select_from_line_number(&editor, row, event.modifiers.shift, &drag_rows, window, cx);
-        })
-        .children(button)
+        .child(button)
         .into_any_element()
 }
 
 /// Where a side's line numbers are drawn (window x coordinates, as last laid out): right-aligned
 /// at the end of the gutter, before its right padding, as wide as the widest line number.
+#[cfg(test)]
 pub(super) fn line_number_column(
     editor: &mut Editor,
     window: &mut Window,
     cx: &mut Context<Editor>,
-) -> Option<Range<Pixels>> {
+) -> Option<std::ops::Range<Pixels>> {
     let origin = editor.last_bounds()?.origin.x;
     let style = editor.style(cx).clone();
     let font_id = window.text_system().resolve_font(&style.text.font());

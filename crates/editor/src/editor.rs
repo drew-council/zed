@@ -119,7 +119,7 @@ pub use git::{
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
-pub use gutter_row::{GutterRow, GutterRowDragEnd, GutterRowRenderer};
+pub use gutter_row::{GutterRow, GutterRowDragEnd, GutterRowRenderer, LineNumberClick};
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
 pub use inline_input::InlineInputState;
@@ -1224,6 +1224,7 @@ pub struct Editor {
     pub(crate) gutter_row_renderer: Option<GutterRowRenderer>,
     pub(crate) hovered_gutter_row: Option<DisplayRow>,
     pub(crate) gutter_row_drag: Option<gutter_row::GutterRowDrag>,
+    pub(crate) line_number_click: Option<LineNumberClick>,
     /// See [`Editor::set_full_width_block`].
     pub(crate) full_width_block: Option<CustomBlockId>,
 }
@@ -2611,6 +2612,7 @@ impl Editor {
             gutter_row_renderer: None,
             hovered_gutter_row: None,
             gutter_row_drag: None,
+            line_number_click: None,
             full_width_block: None,
         };
 

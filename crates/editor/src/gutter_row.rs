@@ -3,7 +3,7 @@ use std::{
     rc::Rc,
 };
 
-use gpui::{AnyElement, App, Context, Pixels, Window};
+use gpui::{AnyElement, App, Context, Modifiers, Pixels, Window};
 use multi_buffer::RowInfo;
 
 use crate::{DisplayRow, Editor};
@@ -25,6 +25,10 @@ pub struct GutterRow<'a> {
 /// Returns the element to draw over a row's line number, if any. It's called outside of any
 /// update of the editor, so it may read the editor.
 pub type GutterRowRenderer = Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>;
+
+/// Gets a mouse down on the line number of a row, with its modifiers, instead of the editor (a
+/// multibuffer opens the file at the row). It's called after the editor's update.
+pub type LineNumberClick = Rc<dyn Fn(DisplayRow, Modifiers, &mut Window, &mut App)>;
 
 /// Gets the rows of a gutter row drag once its mouse button is released.
 pub type GutterRowDragEnd = Box<dyn FnOnce(RangeInclusive<DisplayRow>, &mut Window, &mut App)>;
@@ -55,6 +59,12 @@ impl Editor {
         self.hovered_gutter_row = None;
         self.gutter_row_drag = None;
         cx.notify();
+    }
+
+    /// Hands mouse downs on line numbers to `handler` instead of handling them (see
+    /// [`LineNumberClick`]).
+    pub fn set_line_number_click_handler(&mut self, handler: Option<LineNumberClick>) {
+        self.line_number_click = handler;
     }
 
     /// The row under the pointer (in the gutter or in the text, not over a block), while a

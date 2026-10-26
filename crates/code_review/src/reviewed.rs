@@ -5,7 +5,7 @@ use gpui::{Entity, Focusable as _, Hsla, MouseButton, WeakEntity};
 use language::{BufferId, Point};
 use multi_buffer::MultiBufferRow;
 use std::ops::Range;
-use ui::{Checkbox, ElevationIndex, KeyBinding, Tooltip, prelude::*};
+use ui::{Checkbox, ElevationIndex, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 struct ReviewedHunkAdded;
@@ -19,7 +19,7 @@ pub(crate) fn render_file_checkbox(
     cx: &App,
 ) -> Option<AnyElement> {
     let review = view.read(cx);
-    let repo_path = review.diff().read(cx).repo_path_for_buffer(buffer_id, cx)?;
+    let repo_path = review.diff().read(cx).repo_path_for_buffer(buffer_id)?;
     let reviewed = review.session().read(cx).is_file_reviewed(&repo_path);
     let id = buffer_id.to_proto();
     let comment_button = Button::new(("review-file-comment", id), "Comment")
@@ -143,10 +143,15 @@ impl DiffHunkRenderer for ReviewHunkRenderer {
                             .color(Color::Success),
                     )
                 })
-                .key_binding(KeyBinding::for_action_in(
+                // Looked up on hover only: hunk controls are drawn on every frame.
+                .tooltip(Tooltip::for_action_title_in(
+                    if reviewed {
+                        "Mark as Not Reviewed"
+                    } else {
+                        "Mark as Reviewed"
+                    },
                     &ToggleHunkReviewed,
                     &focus_handle,
-                    cx,
                 ))
                 .on_click({
                     let view = view.downgrade();

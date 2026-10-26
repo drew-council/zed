@@ -4,7 +4,10 @@ use crate::{
     PreviousPullRequestInStack, ReviewView, SubmitReview, ToggleSingleFileMode,
     view::{copy_review_as_markdown, submit_review},
 };
-use gpui::{Action, Entity, EventEmitter, Focusable as _, Subscription, WeakEntity};
+use gpui::{
+    Action, AnyView, Entity, EventEmitter, Focusable as _, StyleRefinement, Subscription,
+    WeakEntity,
+};
 use ui::{Divider, TintColor, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
@@ -36,7 +39,8 @@ pub(crate) fn register(workspace: &Workspace, window: &mut Window, cx: &mut Cont
 }
 
 fn add_to_pane(pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Workspace>) {
-    let item = cx.new(|_| ReviewToolbar::default());
+    let content = cx.new(|_| ReviewToolbar::default());
+    let item = cx.new(|_| ReviewToolbarItem { content });
     pane.update(cx, |pane, cx| {
         pane.toolbar()
             .update(cx, |toolbar, cx| toolbar.add_item(item, window, cx))
@@ -123,13 +127,51 @@ fn counted(count: usize, noun: &str) -> String {
     }
 }
 
-impl EventEmitter<ToolbarItemEvent> for ReviewToolbar {}
+/// The pane's toolbar item: the review's toolbar as a cached view. The pane redraws its toolbar
+/// whenever the active item's cursor moves (for the breadcrumbs); the review's buttons only
+/// change with the review.
+pub(crate) struct ReviewToolbarItem {
+    content: Entity<ReviewToolbar>,
+}
 
-impl ToolbarItemView for ReviewToolbar {
+impl ReviewToolbarItem {
+    #[cfg(test)]
+    pub(crate) fn content(&self) -> &Entity<ReviewToolbar> {
+        &self.content
+    }
+}
+
+impl EventEmitter<ToolbarItemEvent> for ReviewToolbarItem {}
+
+impl ToolbarItemView for ReviewToolbarItem {
     fn set_active_pane_item(
         &mut self,
         active_pane_item: Option<&dyn ItemHandle>,
         _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        cx.notify();
+        self.content.update(cx, |content, cx| {
+            content.set_active_pane_item(active_pane_item, cx)
+        })
+    }
+}
+
+impl Render for ReviewToolbarItem {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.content.read(cx).review().is_none() {
+            return div().into_any_element();
+        }
+        AnyView::from(self.content.clone())
+            .cached(StyleRefinement::default().w_full().h_8())
+            .into_any_element()
+    }
+}
+
+impl ReviewToolbar {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn ItemHandle>,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
         let review = active_pane_item.and_then(|item| item.act_as::<ReviewView>(cx));
@@ -441,8 +483,11 @@ mod tests {
                 .read(cx)
                 .toolbar()
                 .read(cx)
-                .item_of_type::<ReviewToolbar>()
+                .item_of_type::<ReviewToolbarItem>()
                 .expect("every pane has a review toolbar")
+                .read(cx)
+                .content()
+                .clone()
         })
     }
 

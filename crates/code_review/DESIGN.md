@@ -48,7 +48,8 @@ window (see "Faster, bigger Start Review picker"). Then `ctrl-u`/`ctrl-d` work o
 once (see "Stepping shows at once"), and the Start Review picker reopens with its last pull requests
 while it refreshes them (see "Instant reopen"). Then the overview stopped multiplying over folded
 files (see "The overview is one block"), and wrapping follows the language settings again, so
-`ctrl-u`/`ctrl-d` move whole lines as in other buffers (see "Wrapping follows the settings").
+`ctrl-u`/`ctrl-d` move whole lines as in other buffers (see "Wrapping follows the settings"). Then the review stopped redrawing its own UI on every keypress
+(see "Less work per keypress").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -2452,6 +2453,34 @@ it moves by ONE CHARACTER instead of one line! … IT WORKS PERFECTLY IN ANY OTH
   `test_wrapping_settings_wrap_the_diff` replace `test_long_lines_wrap_on_both_sides`; the
   half-page tests also run over reviewed (folded) first files and fail a move along a line.
 
+**Less work per keypress (the user's report)** — "navigating around with vim bindings is STILL
+EXTREMELY LAGGY … it should run at the same speed as the normal zed editor navigation"; "you need to
+find ALL of them introduced on this branch by your changes and fix".
+
+- **Measured** with a timing harness (removed after use; median of 200 `j`/`k` presses with a frame
+  each, debug build, the PR A fixture): before, the review ~34 ms per key against ~26 ms for Zed's
+  own diff view over the same multibuffer (a bare `SplittableEditor`) and ~19 ms for a plain
+  editor; after, ~30 ms, and ~27 ms with every review addition switched off: what's left is spread
+  over the remaining additions (~1 ms each group).
+- **Toolbar** (~3.5 ms): the pane redraws its toolbar on every cursor move (breadcrumbs), and the
+  review's toolbar is a row of buttons. `ReviewToolbarItem` now hosts `ReviewToolbar` as a cached
+  view (`AnyView::cached`, `w_full().h_8()`), redrawn only when the review notifies it.
+- **Gutter "+"** : the renderer returned an element for every visible row, only to take clicks on
+  line numbers. Those now come through `Editor::set_line_number_click_handler` (§3.10, core patch
+  #6), and the renderer draws an element only for a row with a "+".
+- **Lookups by file** (every frame, for every visible file header, the hunk controls and the
+  comment gate): `repo_path_for`, `repo_path_for_buffer` and `entry` scanned every file; the diff
+  keeps `repo_paths_by_key` / `repo_paths_by_buffer` (updated as files register, rebuilt after a
+  refresh drops some).
+- **Hunk controls**: "Mark Reviewed" looked its key binding up on every frame (`KeyBinding`); the
+  binding is in its tooltip now, looked up on hover.
+- Also checked, unchanged: one `SelectionsChanged` per key (no feedback loop with the panel, whose
+  cursor following costs ~2 ms only when its file changes), and an idle review notifies none of
+  its views (`test_idle_review_stays_idle`: a realistic overview with a long description and a
+  stack of seven, reviewed files folded at the start, unified and split at five widths). The idle
+  redraws seen in the user's profile came with the multiplying overview ("The overview is one
+  block").
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -3143,7 +3172,7 @@ change, so mismatched CLI/app versions don't break).
 | `crates/editor/src/scroll.rs`, `crates/vim/src/normal/scroll.rs`, `crates/vim/src/motion.rs` | Core patch #8 ("`ctrl-u`/`ctrl-d` over blocks", +11/−1 in `scroll.rs`, +27/−1 in vim's `scroll.rs`, +9/−3 in `motion.rs`): `SharedScrollAnchor::scroll_top_display_point` returns the view's real top row (the anchor's row moved by the offset, `floor(scroll_position.y)`; the anchor's own point when that's its row, so nothing changes without tall blocks); vim's half-page/line scroll leaves a block row for the cursor the way the view scrolled (`Bias::Right` down, `Left` up), taking the other way only when that stays on screen and still goes with the scroll; `window_bottom` (`L`) adds only the offset's fraction. Tests in `code_review` (`test_half_page_scrolls_go_one_way`, `…_in_split_view`); vim's 577 and editor's scroll/split tests pass |
 | `crates/editor/src/display_map/block_map.rs` | Core patch #5 (UX-1, +14/−1): `Block::is_above_start` (a custom block at `BlockPlacement::Above(Anchor::Min)`) sorts right after the start comparison in `sort_blocks`, so it comes before the first buffer's header and a folded first buffer (`dedup_by` keeps both), and `balancing_block` keeps `Anchor::Min` for its spacer on the other side (else an excerpt anchor after that side's header). Upstream places no block there (only a test on a headerless singleton). Tests +127 (`test_block_above_multibuffer_start`). "The overview is one block" (+14): `sync` extends an edit landing within a replacement block (a folded buffer) to the start of the replaced rows *before* preserving the transforms ahead of it, so the zero-row blocks right above (the overview) are rebuilt once instead of preserved and rebuilt; the test checks an edit within a folded first buffer |
 | `crates/editor/src/split_editor_view.rs`, `element.rs` (`render_blocks`), `editor.rs` | Core patch #7 (UX-1, +149 in `split_editor_view.rs`, +13 in `element.rs`, +3 in `editor.rs`): `Editor::set_full_width_block(Option<CustomBlockId>)`. When that editor is the right side of a split diff, its `EditorElement` skips the block (and hands a focused-block record for it on), and `SplitBufferHeadersElement::build_full_width_block` renders it with the block's own render callback across the overlay's width, measures it there (`resize_blocks`, which resizes the left spacer too), paints it under the file headers, and keeps it rendered below the view while it holds the focus. Unsplit, nothing changes. Tests in `split.rs` +217 with #5's (`test_block_above_start_leads_both_sides`, `test_full_width_block_in_split_view`) |
-| `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 119-line new file, +48 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. "Gutter buttons don't overlap" added `GutterRow::right_padding` (+6 in `gutter_row.rs`, +10 in `element.rs`): the gutter's right padding, between the line numbers and the text, as x offsets from the element's origin (`prepaint_button` draws it after the git strip), where the review puts its "+". Tests +152 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`, which also checks `right_padding`) |
+| `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 119-line new file, +48 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. "Gutter buttons don't overlap" added `GutterRow::right_padding` (+6 in `gutter_row.rs`, +10 in `element.rs`): the gutter's right padding, between the line numbers and the text, as x offsets from the element's origin (`prepaint_button` draws it after the git strip), where the review puts its "+". Tests +152 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`, which also checks `right_padding`). "Less work per keypress" added `LineNumberClick` / `Editor::set_line_number_click_handler` (+10 in `gutter_row.rs`, +28 in `element/mouse.rs`, +2 in `editor.rs`): a mouse down on a line number's hitbox goes to the handler (deferred past the editor's update) instead of a multibuffer's opening the file, so the review no longer draws an element over every row's line number to catch those clicks |
 | `assets/keymaps/code_review*.json` | new files |
 | `nix/build.nix` | `releaseChannel ? "nightly"` argument (M9, +30/−7): a `channel` table (stable/preview/nightly), an assert that only Linux builds other channels than nightly, and the channel in `version`, `preBuild`'s `RELEASE_CHANNEL` and the Linux icons and desktop entry. The default derivation is unchanged (same `.drv`); `crates/code_review/INSTALL.md` uses `.override { releaseChannel = "stable"; }` |
 | `crates/settings_content/src/settings_content.rs`, `crates/settings/src/vscode_import.rs`, `assets/settings/default.json` | Review Pull Request picker: `SettingsContent::code_review` (`CodeReviewSettingsContent`: `pull_request_search`, `hide_approved_pull_requests`) in the struct and its `flattened_deserialize!` list (+21/−1), `code_review: None` in the VS Code import (+1), the defaults (+11). Editing `settings_content` rebuilds most of Zed |

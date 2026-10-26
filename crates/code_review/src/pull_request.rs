@@ -4144,6 +4144,115 @@ pub(crate) mod tests {
             }
         }
 
+        /// An idle review doesn't redraw: drawing frames with nothing happening notifies none of
+        /// its views or editors (a view notified on every frame redraws the whole review every
+        /// frame, which keys then wait behind).
+        #[gpui::test]
+        async fn test_idle_review_stays_idle(cx: &mut TestAppContext) {
+            use crate::github::test_support::{stack_node, stacked_pull_request};
+            // A description like a real one: paragraphs, long lines, a list, links, code.
+            let paragraph = "This adds SBC end dates, as already extracted by the extractor, as a \
+                data source for Connection.EstimatedMedicalPlanYearEnd, and backfills the \
+                existing rows; see https://github.com/drew-council/code-review-sandbox/issues/7 \
+                and #5 for the background. ";
+            let body = format!(
+                "{}\n\n- one\n- two with `code`\n- three\n\n```rust\nfn main() {{}}\n```\n\n{}",
+                paragraph.repeat(3),
+                paragraph.repeat(2)
+            );
+            let mut details: serde_json::Value = serde_json::from_str(PR1_DETAILS).unwrap();
+            details["data"]["repository"]["pullRequest"]["body"] = json!(body);
+            let stack = stack_node(
+                7,
+                (1..=7)
+                    .map(|number| stacked_pull_request(number, "OPEN", number == 7, false))
+                    .collect(),
+            );
+            let respond = move |request: &SentRequest| match request.operation() {
+                Some("PullRequestDetails") => Some(Reply::json(details.to_string())),
+                Some("PullRequestStackOf") => Some(Reply::json(
+                    json!({ "data": { "repository": { "pullRequest": { "stack": stack } } } })
+                        .to_string(),
+                )),
+                _ => None,
+            };
+            let respond: Arc<dyn Fn(&SentRequest) -> Option<Reply> + Send + Sync> =
+                Arc::new(respond);
+            for (split, width) in [
+                (false, 1600.),
+                (false, 1100.),
+                (true, 1700.),
+                (true, 1300.),
+                (true, 900.),
+            ] {
+                let mut test_cx = cx.clone();
+                let (_fs, workspace, review, _requests, cx) = open_review(
+                    Fixture {
+                        split,
+                        respond: Some(respond.clone()),
+                        ..Fixture::default()
+                    },
+                    &mut test_cx,
+                )
+                .await;
+                cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(1000.)));
+                cx.run_until_parked();
+                crate::test_support::add_review_panel(&workspace, cx);
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.open_panel::<crate::ReviewPanel>(window, cx)
+                });
+                let rhs = rhs_editor(&review, cx);
+                cx.focus(&rhs);
+                // Reviewed files fold, as in a review under way: the first ones here.
+                for _ in 0..3 {
+                    cx.focus(&rhs);
+                    cx.simulate_keystrokes("g g r");
+                    cx.run_until_parked();
+                }
+                cx.focus(&rhs);
+                fn watch<T: 'static>(
+                    name: &'static str,
+                    entity: &Entity<T>,
+                    notified: &Rc<RefCell<Vec<&'static str>>>,
+                    cx: &mut VisualTestContext,
+                ) -> gpui::Subscription {
+                    let notified = notified.clone();
+                    cx.update(|_, cx| {
+                        cx.observe(entity, move |_, _| notified.borrow_mut().push(name))
+                    })
+                }
+                let notified = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+                let splittable = splittable(&review, cx);
+                let mut subscriptions = vec![
+                    watch("review", &review, &notified, cx),
+                    watch("splittable", &splittable, &notified, cx),
+                    watch("rhs", &rhs, &notified, cx),
+                ];
+                // Too narrow for two sides, a split diff shows one.
+                if splittable.read_with(cx, |editor, _| editor.is_split()) {
+                    let lhs = lhs_editor(&review, cx);
+                    subscriptions.push(watch("lhs", &lhs, &notified, cx));
+                }
+                let frame = |cx: &mut VisualTestContext| {
+                    cx.update(|window, cx| window.draw(cx).clear(cx));
+                    cx.run_until_parked();
+                };
+                for _ in 0..3 {
+                    frame(cx);
+                }
+                notified.borrow_mut().clear();
+                for _ in 0..10 {
+                    frame(cx);
+                }
+                assert_eq!(
+                    *notified.borrow(),
+                    Vec::<&str>::new(),
+                    "split {split} at {width}"
+                );
+                drop(subscriptions);
+            }
+        }
+
         /// `ctrl-u` and `ctrl-d` from all over a review with tall blocks (the overview, file
         /// headers, comments) move the view and the cursor one way only, until the cursor reaches
         /// the diff's first or last row. Zed's scroll top used to be the scroll anchor's row even

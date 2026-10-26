@@ -196,6 +196,10 @@ pub struct ReviewDiff {
     base_check_task: Task<()>,
     editor: Entity<SplittableEditor>,
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
+    /// The files of `buffer_subscriptions` by excerpt key and by display buffer: file headers,
+    /// hunk controls and comment checks look files up on every frame.
+    repo_paths_by_key: HashMap<PathKey, RepoPath>,
+    repo_paths_by_buffer: HashMap<BufferId, RepoPath>,
     /// Single-file mode: only this file's excerpts are in the multibuffer.
     single_file: Option<PathKey>,
     /// Files hidden by the review's filters: they have no excerpts.
@@ -313,6 +317,8 @@ impl ReviewDiff {
             source,
             editor,
             buffer_subscriptions: HashMap::default(),
+            repo_paths_by_key: HashMap::default(),
+            repo_paths_by_buffer: HashMap::default(),
             single_file: None,
             hidden: HashSet::default(),
             listed_paths: Vec::new(),
@@ -436,10 +442,22 @@ impl ReviewDiff {
 
     /// The repository path of a file in the review.
     pub(crate) fn repo_path_for(&self, path_key: &PathKey) -> Option<RepoPath> {
-        self.buffer_subscriptions
+        self.repo_paths_by_key.get(path_key).cloned()
+    }
+
+    fn reindex(&mut self, cx: &App) {
+        self.repo_paths_by_key = self
+            .buffer_subscriptions
             .iter()
-            .find(|(_, entry)| &entry.path_key == path_key)
-            .map(|(repo_path, _)| repo_path.clone())
+            .map(|(repo_path, entry)| (entry.path_key.clone(), repo_path.clone()))
+            .collect();
+        self.repo_paths_by_buffer = self
+            .buffer_subscriptions
+            .iter()
+            .map(|(repo_path, entry)| {
+                (entry.display_buffer.read(cx).remote_id(), repo_path.clone())
+            })
+            .collect();
     }
 
     fn refresh_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -517,6 +535,15 @@ impl ReviewDiff {
             .map_or((false, false, None), |entry| {
                 (entry.has_hunks, entry.shown, entry.digest.clone())
             });
+        if let Some(previous) = self.buffer_subscriptions.get(&repo_path) {
+            self.repo_paths_by_key.remove(&previous.path_key);
+            self.repo_paths_by_buffer
+                .remove(&previous.display_buffer.read(cx).remote_id());
+        }
+        self.repo_paths_by_key
+            .insert(path_key.clone(), repo_path.clone());
+        self.repo_paths_by_buffer
+            .insert(display_buffer.read(cx).remote_id(), repo_path.clone());
         self.buffer_subscriptions.insert(
             repo_path.clone(),
             BufferSubscriptions {
@@ -758,11 +785,8 @@ impl ReviewDiff {
         Some(&self.entry(path_key)?.display_buffer)
     }
 
-    pub(crate) fn repo_path_for_buffer(&self, buffer_id: BufferId, cx: &App) -> Option<RepoPath> {
-        self.buffer_subscriptions
-            .iter()
-            .find(|(_, entry)| entry.display_buffer.read(cx).remote_id() == buffer_id)
-            .map(|(repo_path, _)| repo_path.clone())
+    pub(crate) fn repo_path_for_buffer(&self, buffer_id: BufferId) -> Option<RepoPath> {
+        self.repo_paths_by_buffer.get(&buffer_id).cloned()
     }
 
     /// The file whose diff base (the old side of the diff) is the buffer `base_buffer_id`, and
@@ -792,8 +816,7 @@ impl ReviewDiff {
 
     fn entry(&self, path_key: &PathKey) -> Option<&BufferSubscriptions> {
         self.buffer_subscriptions
-            .values()
-            .find(|entry| &entry.path_key == path_key)
+            .get(self.repo_paths_by_key.get(path_key)?)
     }
 
     /// Whether a comment can go on `lines` of a file's `side` in this diff: inside one of the
@@ -1000,6 +1023,7 @@ impl ReviewDiff {
             });
             this.buffer_subscriptions
                 .retain(|repo_path, _| live_repo_paths.contains(repo_path));
+            this.reindex(cx);
             if this.buffer_subscriptions.len() != file_count {
                 cx.emit(ReviewDiffEvent::FilesChanged);
             }

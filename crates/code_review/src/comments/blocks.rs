@@ -1129,7 +1129,7 @@ impl CommentBlocks {
     /// The file a buffer of either side of the diff shows.
     fn path_of_buffer(&self, buffer_id: BufferId, cx: &App) -> Option<RepoPath> {
         let diff = self.diff.read(cx);
-        diff.repo_path_for_buffer(buffer_id, cx)
+        diff.repo_path_for_buffer(buffer_id)
             .or_else(|| diff.base_buffer(buffer_id, cx).map(|(path, _)| path))
     }
 
@@ -1169,7 +1169,7 @@ impl CommentBlocks {
         let diff = self.diff.read(cx);
         match side {
             Side::New => {
-                let path = diff.repo_path_for_buffer(buffer_id, cx)?;
+                let path = diff.repo_path_for_buffer(buffer_id)?;
                 let buffer = diff.display_buffer(&review_path_key(&path))?.clone();
                 Some((path, buffer))
             }
