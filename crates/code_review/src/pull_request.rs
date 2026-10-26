@@ -2813,9 +2813,7 @@ pub(crate) mod tests {
             // Up skips the closed #8. #4's tab shows at once, before anything loaded; when #4
             // can't be loaded it says so, and closing it goes back to #1's review.
             fail_details.store(true, Ordering::SeqCst);
-            cx.update(|window, cx| {
-                window.dispatch_action(Box::new(NextPullRequestInStack), cx)
-            });
+            cx.update(|window, cx| window.dispatch_action(Box::new(NextPullRequestInStack), cx));
             let opening = opening_tab(cx).expect("#4's tab shows at once");
             assert_eq!(
                 workspace.read_with(cx, |workspace, cx| workspace
@@ -2840,9 +2838,7 @@ pub(crate) mod tests {
             fail_details.store(false, Ordering::SeqCst);
 
             // Loaded, #4's review replaces both tabs.
-            cx.update(|window, cx| {
-                window.dispatch_action(Box::new(NextPullRequestInStack), cx)
-            });
+            cx.update(|window, cx| window.dispatch_action(Box::new(NextPullRequestInStack), cx));
             assert!(opening_tab(cx).is_some());
             cx.run_until_parked();
             assert!(opening_tab(cx).is_none());
@@ -4095,12 +4091,69 @@ pub(crate) mod tests {
             }
         }
 
+        /// Over a long line (300 columns, in the uncommitted fixture's `long.txt`), `ctrl-u` and
+        /// `ctrl-d` move whole lines, as in any Zed buffer that doesn't wrap: the cursor stays
+        /// at the start of lines and never lands along the long line.
+        #[gpui::test]
+        async fn test_half_page_scrolls_move_whole_lines(cx: &mut TestAppContext) {
+            use editor::SelectionEffects;
+            crate::test_support::init_vim_test(cx, DiffViewStyle::Unified);
+            let (_fs, _workspace, review, cx) = crate::test_support::open_review_fixture(cx).await;
+            cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(400.)));
+            cx.run_until_parked();
+            let rhs = rhs_editor(&review, cx);
+            let position = |cx: &mut VisualTestContext| {
+                draw(cx);
+                rhs.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let head = editor.selections.newest::<Point>(&snapshot).head();
+                    (editor.scroll_position(cx).y, head.row, head.column)
+                })
+            };
+            let last_row = rhs.update(cx, |editor, cx| {
+                editor.buffer().read(cx).snapshot(cx).max_point().row
+            });
+            rhs.update_in(cx, |editor, window, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.select_ranges([Point::new(last_row, 0)..Point::new(last_row, 0)])
+                    },
+                )
+            });
+            for keys in ["ctrl-u", "ctrl-d"] {
+                let mut trace = vec![position(cx)];
+                for _ in 0..12 {
+                    cx.simulate_keystrokes(keys);
+                    trace.push(position(cx));
+                }
+                assert!(
+                    trace.iter().all(|(_, _, column)| *column == 0),
+                    "{keys}: {trace:?}"
+                );
+                let rows = trace.iter().map(|(_, row, _)| *row);
+                let (first, last) = (trace[0].1, trace[trace.len() - 1].1);
+                assert_eq!(
+                    last,
+                    if keys == "ctrl-u" { 0 } else { last_row },
+                    "{keys}: {trace:?}"
+                );
+                assert!(rows.count() > 1 && first != last, "{keys}: {trace:?}");
+            }
+        }
+
         /// `ctrl-u` and `ctrl-d` from all over a review with tall blocks (the overview, file
         /// headers, comments) move the view and the cursor one way only, until the cursor reaches
         /// the diff's first or last row. Zed's scroll top used to be the scroll anchor's row even
         /// when the view's top was in the blocks above it, and vim moved a cursor that landed in a
         /// block to the row above: `ctrl-u` dragged the cursor down, `ctrl-d` left it behind.
-        async fn assert_half_page_scrolls_go_one_way(split: bool, cx: &mut TestAppContext) {
+        async fn assert_half_page_scrolls_go_one_way(
+            split: bool,
+            reviewed_files: usize,
+            cx: &mut TestAppContext,
+        ) {
             use editor::SelectionEffects;
             let (_fs, _workspace, review, _requests, cx) = open_review(
                 Fixture {
@@ -4117,12 +4170,19 @@ pub(crate) mod tests {
                 cx.simulate_input("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
                 cx.simulate_keystrokes("ctrl-enter");
             }
+            // Reviewed files fold to their header, the first ones of the diff here.
+            for _ in 0..reviewed_files {
+                cx.focus(&rhs);
+                cx.simulate_keystrokes("g g r");
+                cx.run_until_parked();
+            }
+            cx.focus(&rhs);
             let position = |cx: &mut VisualTestContext| {
                 draw(cx);
                 rhs.update(cx, |editor, cx| {
                     let snapshot = editor.display_snapshot(cx);
                     let head = editor.selections.newest::<Point>(&snapshot).head();
-                    (editor.scroll_position(cx).y, head.row)
+                    (editor.scroll_position(cx).y, head.row, head.column)
                 })
             };
             for (width, height) in [(800., 400.), (1600., 1000.)] {
@@ -4159,6 +4219,14 @@ pub(crate) mod tests {
                                 one_way,
                                 "{keys} at {width}x{height} from row {start}: {trace:?}"
                             );
+                            // A half page moves rows (or nothing at an end), not along a line.
+                            assert!(
+                                current.0 != previous.0
+                                    || current.1 != previous.1
+                                    || current.2 == previous.2,
+                                "{keys} moved within a line at {width}x{height} from row \
+                                 {start}: {trace:?}"
+                            );
                             if current == previous {
                                 break;
                             }
@@ -4177,12 +4245,24 @@ pub(crate) mod tests {
 
         #[gpui::test]
         async fn test_half_page_scrolls_go_one_way(cx: &mut TestAppContext) {
-            assert_half_page_scrolls_go_one_way(false, cx).await
+            assert_half_page_scrolls_go_one_way(false, 0, cx).await
         }
 
         #[gpui::test]
         async fn test_half_page_scrolls_go_one_way_in_split_view(cx: &mut TestAppContext) {
-            assert_half_page_scrolls_go_one_way(true, cx).await
+            assert_half_page_scrolls_go_one_way(true, 0, cx).await
+        }
+
+        #[gpui::test]
+        async fn test_half_page_scrolls_go_one_way_over_reviewed_files(cx: &mut TestAppContext) {
+            assert_half_page_scrolls_go_one_way(false, 2, cx).await
+        }
+
+        #[gpui::test]
+        async fn test_half_page_scrolls_go_one_way_over_reviewed_files_in_split_view(
+            cx: &mut TestAppContext,
+        ) {
+            assert_half_page_scrolls_go_one_way(true, 2, cx).await
         }
 
         /// Vim's half-page scrolls run to either end of a review with the overview above its

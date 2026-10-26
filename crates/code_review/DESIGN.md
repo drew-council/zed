@@ -47,7 +47,8 @@ window (see "Faster, bigger Start Review picker"). Then `ctrl-u`/`ctrl-d` work o
 (see "Cursor movement speed"), and stepping through a stack shows the next pull request's tab at
 once (see "Stepping shows at once"), and the Start Review picker reopens with its last pull requests
 while it refreshes them (see "Instant reopen"). Then the overview stopped multiplying over folded
-files (see "The overview is one block").
+files (see "The overview is one block"), and wrapping follows the language settings again, so
+`ctrl-u`/`ctrl-d` move whole lines as in other buffers (see "Wrapping follows the settings").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -2431,6 +2432,26 @@ in sight; "6/7 reviewed".
   files; split failed at once with a folded first file). The editor's block map tests (20, with
   the randomized ones) pass.
 
+**Wrapping follows the settings (the user's report)** — "CONTROL AND U ARE STILL … BROKEN!!!! now
+it moves by ONE CHARACTER instead of one line! … IT WORKS PERFECTLY IN ANY OTHER ZED BUFFER!"
+
+- **Cause**: "Long lines wrap" forced `SoftWrap::EditorWidth` on the review. Vim's half-page
+  scrolls move the cursor by display rows, so with wrapping they land along a long line (from
+  the uncommitted fixture's last row: row 20, column 166 of the 300-column line), and over long
+  lines the cursor creeps along lines instead of moving by lines. Any other buffer of the user's
+  doesn't wrap (Zed's default), so vim moves whole lines there.
+- **Fix**: the override is gone; wrapping follows the language settings like Zed's own diff
+  views (they set nothing), so the review behaves like the user's other buffers, wrapped or not.
+  Long lines out of view scroll sideways (trackpad, scrollbar, `$`, `l`; covered since "Long
+  lines wrap"). The review's `ToggleSoftWrap` capture stays: it switches both sides together and
+  only while the diff has the focus (Zed's split toggle would also take a comment editor's).
+- Tests: `test_half_page_scrolls_move_whole_lines` (the uncommitted fixture at 800×400 with its
+  300-column line: `ctrl-u` and `ctrl-d` from the end to either end keep column 0 and reach the
+  first and last rows; it failed with the override); `test_wrapping_follows_the_settings` (no
+  wrapping by default, `ToggleSoftWrap` on both sides, new left sides follow) and
+  `test_wrapping_settings_wrap_the_diff` replace `test_long_lines_wrap_on_both_sides`; the
+  half-page tests also run over reviewed (folded) first files and fail a move along a line.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -2799,10 +2820,11 @@ review tab").
 
 - The caret, selections, visual modes (`v`, `V`, `ctrl-v`), every motion, text object, count,
   search, `gd`/`gr`/`K`, yank (`y`, `yiw`, …), `h`/`l`, `{`/`}`, marks, `ctrl-d/u/f/b` and the
-  scroll keys are vim's. Long lines wrap at the editor's width on both sides, whatever the
-  language settings say; `ToggleSoftWrap` turns wrapping off (then long lines scroll sideways:
-  trackpad, scrollbar, cursor motions) and on for both sides together, and a new left side
-  follows the right side (see "Long lines wrap").
+  scroll keys are vim's. Wrapping follows the language settings, as in Zed's own diff views
+  (Zed's default doesn't wrap; long lines then scroll sideways: trackpad, scrollbar, cursor
+  motions); `ToggleSoftWrap` turns it on and off for both sides together, and a new left side
+  follows the right side (see "Wrapping follows the settings", which replaced "Long lines
+  wrap").
 - The review binds only keys that would edit the read-only diff, and two-key sequences on vim
   prefixes: insert/change/replace keys become review actions or no-ops, `]`/`[` and `;` lead
   review keys. `;` alone still repeats `f`/`t` after the keymap's pending-key timeout.

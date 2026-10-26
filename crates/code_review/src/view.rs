@@ -4262,13 +4262,12 @@ mod tests {
         };
         use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, VisualTestContext};
 
-        fn init(cx: &mut TestAppContext, diff_view_style: DiffViewStyle) {
+        fn init(cx: &mut TestAppContext, diff_view_style: DiffViewStyle, soft_wrap: SoftWrap) {
             init_vim_test(cx, diff_view_style);
-            // Zed's default, explicitly: the review wraps anyway.
             cx.update(|cx| {
                 cx.update_global::<SettingsStore, _>(|store, cx| {
                     store.update_user_settings(cx, |settings| {
-                        settings.project.all_languages.defaults.soft_wrap = Some(SoftWrap::None);
+                        settings.project.all_languages.defaults.soft_wrap = Some(soft_wrap);
                     });
                 });
             });
@@ -4358,38 +4357,27 @@ mod tests {
             cx.run_until_parked();
         }
 
-        /// Long lines wrap on both sides, whatever the language settings say, and on every new
-        /// left side: after toggling the split and after the pane gets too narrow for two
-        /// sides and wide again. `ToggleSoftWrap` turns wrapping off and on for both sides, and
-        /// a new left side follows the right side's state.
+        /// Wrapping follows the language settings, as in Zed's own diff views (Zed's default
+        /// doesn't wrap: vim then moves by whole lines, `ctrl-u` and `ctrl-d` too).
+        /// `ToggleSoftWrap` turns it on and off for both sides, and a new left side (after
+        /// toggling the split, or after the pane gets too narrow for two sides and wide again)
+        /// follows the right side.
         #[gpui::test]
-        async fn test_long_lines_wrap_on_both_sides(cx: &mut TestAppContext) {
-            init(cx, DiffViewStyle::Split);
+        async fn test_wrapping_follows_the_settings(cx: &mut TestAppContext) {
+            init(cx, DiffViewStyle::Split, SoftWrap::None);
             let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
             let rhs = rhs_editor(&review, cx);
             let lhs = lhs_editor(&review, cx);
-            assert!(wraps(&rhs, cx));
-            assert!(wraps(&lhs, cx));
-            assert!(display_rows(&rhs, &new_line(), cx).1 > 1);
-            assert!(display_rows(&lhs, &old_line(), cx).1 > 1);
-
-            cx.focus(&rhs);
-            dispatch(ToggleSoftWrap, cx);
             assert!(!wraps(&rhs, cx));
             assert!(!wraps(&lhs, cx));
             assert_eq!(display_rows(&rhs, &new_line(), cx).1, 1);
             assert_eq!(display_rows(&lhs, &old_line(), cx).1, 1);
 
-            toggle_split(&review, cx);
-            toggle_split(&review, cx);
-            let lhs = lhs_editor(&review, cx);
-            assert!(!wraps(&lhs, cx));
-            assert_eq!(display_rows(&lhs, &old_line(), cx).1, 1);
-
             cx.focus(&rhs);
             dispatch(ToggleSoftWrap, cx);
             assert!(wraps(&rhs, cx));
             assert!(wraps(&lhs, cx));
+            assert!(display_rows(&rhs, &new_line(), cx).1 > 1);
             assert!(display_rows(&lhs, &old_line(), cx).1 > 1);
 
             toggle_split(&review, cx);
@@ -4401,19 +4389,32 @@ mod tests {
             resize(500., cx);
             assert!(!splittable(&review, cx).read_with(cx, |editor, _| editor.is_split()));
             assert!(wraps(&rhs, cx));
-            assert!(display_rows(&rhs, &new_line(), cx).1 > 1);
             resize(1600., cx);
             let new_lhs = lhs_editor(&review, cx);
             assert_ne!(new_lhs, lhs);
             assert!(wraps(&new_lhs, cx));
-            assert!(display_rows(&new_lhs, &old_line(), cx).1 > 1);
+
+            cx.focus(&rhs);
+            dispatch(ToggleSoftWrap, cx);
+            assert!(!wraps(&rhs, cx));
+            assert!(!wraps(&new_lhs, cx));
+            assert_eq!(display_rows(&new_lhs, &old_line(), cx).1, 1);
+        }
+
+        #[gpui::test]
+        async fn test_wrapping_settings_wrap_the_diff(cx: &mut TestAppContext) {
+            init(cx, DiffViewStyle::Unified, SoftWrap::EditorWidth);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let rhs = rhs_editor(&review, cx);
+            assert!(wraps(&rhs, cx));
+            assert!(display_rows(&rhs, &new_line(), cx).1 > 1);
         }
 
         /// A long line wrapped into more rows on one side than on the other faces a spacer:
         /// the rows after it stay side by side.
         #[gpui::test]
         async fn test_wrapped_lines_stay_aligned_in_split_view(cx: &mut TestAppContext) {
-            init(cx, DiffViewStyle::Split);
+            init(cx, DiffViewStyle::Split, SoftWrap::EditorWidth);
             let (fs, _workspace, review, cx) = open_review_fixture(cx).await;
             let longer_line = "y".repeat(900);
             fs.insert_file(
@@ -4455,12 +4456,11 @@ mod tests {
             diff_view_style: DiffViewStyle,
             cx: &mut TestAppContext,
         ) {
-            init(cx, diff_view_style);
+            init(cx, diff_view_style, SoftWrap::None);
             let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
             let rhs = rhs_editor(&review, cx);
             let lhs = (diff_view_style == DiffViewStyle::Split).then(|| lhs_editor(&review, cx));
             cx.focus(&rhs);
-            dispatch(ToggleSoftWrap, cx);
             assert!(!wraps(&rhs, cx));
             assert_eq!(scroll_x(&rhs, cx), 0.);
 
