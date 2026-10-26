@@ -1,9 +1,9 @@
-use crate::forge::{DiffSide, RemoteThread, ThreadAnchor};
+use crate::forge::{DiffSide, ForgeRepo, RemoteThread, ThreadAnchor};
 use editor::hover_markdown_style;
 use gpui::{Entity, deferred};
 use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{LinkPreview, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -111,7 +111,13 @@ pub(crate) fn comment_markdown_style(window: &Window, cx: &App) -> MarkdownStyle
 /// (`<details>`, `<summary>`), which bots use a lot, would show as raw HTML (HTML isn't parsed,
 /// as it could load remote images), so their tags go and a summary becomes a bold line. Only
 /// lines that start with one of these tags change, and nothing inside fenced code blocks.
-pub(crate) fn github_markdown(source: &SharedString) -> SharedString {
+/// References to issues and pull requests link to them, as on GitHub (see [`link_references`]);
+/// `repo` is the pull request's repository, which `#123` refers to.
+pub(crate) fn github_markdown(source: &SharedString, repo: &ForgeRepo) -> SharedString {
+    link_references(&without_collapsible_tags(source), repo)
+}
+
+fn without_collapsible_tags(source: &SharedString) -> SharedString {
     let mut fence: Option<(char, usize)> = None;
     let mut changed = false;
     let mut lines = Vec::new();
@@ -207,6 +213,190 @@ fn strip_collapsible_tags(line: &str) -> Option<String> {
     Some(output)
 }
 
+/// `source` with GitHub's references to issues and pull requests as links to them, as GitHub
+/// autolinks them: `#123` (in `repo`), `owner/repo#123` and `GH-123`, at word boundaries, and not
+/// in code, links or URLs. GitHub only links a reference to an issue that exists, which isn't
+/// known here, so `step #1` links too. An issue's URL also reaches a pull request with that
+/// number: GitHub redirects it.
+fn link_references(source: &SharedString, repo: &ForgeRepo) -> SharedString {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    // Text as the markdown crate parses it, in runs of adjacent text events (one only ends at
+    // markup, a line break or an escape), so that a reference is never split by markup it would
+    // break, and a URL is seen whole.
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    let mut in_run = false;
+    let mut skipped_depth = 0_usize;
+    for (event, range) in
+        Parser::new_ext(source, markdown::parser::PARSE_OPTIONS).into_offset_iter()
+    {
+        match event {
+            Event::Start(
+                Tag::Link { .. }
+                | Tag::Image { .. }
+                | Tag::CodeBlock(_)
+                | Tag::HtmlBlock
+                | Tag::MetadataBlock(_),
+            ) => skipped_depth += 1,
+            Event::End(
+                TagEnd::Link
+                | TagEnd::Image
+                | TagEnd::CodeBlock
+                | TagEnd::HtmlBlock
+                | TagEnd::MetadataBlock(_),
+            ) => skipped_depth = skipped_depth.saturating_sub(1),
+            // Text that differs from its source (an escape, an entity, a smart quote) isn't
+            // where it seems to be in the source.
+            Event::Text(text)
+                if skipped_depth == 0 && source.get(range.clone()) == Some(text.as_ref()) =>
+            {
+                match runs.last_mut() {
+                    Some(run) if in_run && run.end == range.start => run.end = range.end,
+                    _ => runs.push(range),
+                }
+                in_run = true;
+                continue;
+            }
+            _ => {}
+        }
+        in_run = false;
+    }
+
+    let mut references = Vec::new();
+    for run in runs {
+        let mut finder = linkify::LinkFinder::new();
+        finder.kinds(&[linkify::LinkKind::Url]);
+        let urls = finder
+            .links(&source[run.clone()])
+            .map(|link| run.start + link.start()..run.start + link.end())
+            .collect::<Vec<_>>();
+        references.extend(
+            references_in(source, run)
+                .filter(|(range, _)| !urls.iter().any(|url| overlaps(url, range))),
+        );
+    }
+    if references.is_empty() {
+        return source.clone();
+    }
+
+    references.sort_by_key(|(range, _)| range.start);
+    let mut output = String::with_capacity(source.len() + references.len() * 64);
+    let mut copied = 0;
+    for (range, reference) in references {
+        if range.start < copied {
+            continue;
+        }
+        let (owner, name) = reference
+            .repo
+            .unwrap_or((repo.owner.as_ref(), repo.name.as_ref()));
+        output.push_str(&source[copied..range.start]);
+        output.push_str(&format!(
+            "[{}](https://{}/{owner}/{name}/issues/{})",
+            &source[range.clone()],
+            repo.host,
+            reference.number
+        ));
+        copied = range.end;
+    }
+    output.push_str(&source[copied..]);
+    output.into()
+}
+
+/// An issue or pull request a text refers to.
+struct IssueReference<'a> {
+    /// Another repository's owner and name, as written.
+    repo: Option<(&'a str, &'a str)>,
+    number: u64,
+}
+
+/// The references in `run`, a range of plain text in `source`, by their range in `source`.
+fn references_in(
+    source: &str,
+    run: Range<usize>,
+) -> impl Iterator<Item = (Range<usize>, IssueReference<'_>)> {
+    let text = &source[run.clone()];
+    let numbered = text.match_indices('#').filter_map(move |(index, _)| {
+        let hash = run.start + index;
+        let end = number_end(source, hash + 1, run.end)?;
+        let number = source[hash + 1..end].parse().ok()?;
+        let before = &source[run.start..hash];
+        if before.ends_with(is_repo_name_char) {
+            let name_start = before.trim_end_matches(is_repo_name_char).len();
+            let owner_part = before[..name_start].strip_suffix('/')?;
+            let owner_start = owner_part
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '-')
+                .len();
+            let owner = &owner_part[owner_start..];
+            let name = &before[name_start..];
+            if owner.is_empty()
+                || owner.starts_with('-')
+                || !starts_reference(source, run.start + owner_start)
+            {
+                return None;
+            }
+            Some((
+                run.start + owner_start..end,
+                IssueReference {
+                    repo: Some((owner, name)),
+                    number,
+                },
+            ))
+        } else {
+            starts_reference(source, hash)
+                .then_some((hash..end, IssueReference { repo: None, number }))
+        }
+    });
+    let prefixed = text
+        .match_indices("GH-")
+        .filter_map(move |(index, prefix)| {
+            let start = run.start + index;
+            let number_start = start + prefix.len();
+            let end = number_end(source, number_start, run.end)?;
+            let number = source[number_start..end].parse().ok()?;
+            starts_reference(source, start)
+                .then_some((start..end, IssueReference { repo: None, number }))
+        });
+    numbered.chain(prefixed)
+}
+
+fn is_repo_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+}
+
+/// Where the issue number starting at `start` ends (before `limit`), if a number (not starting
+/// with 0) starts there and a word doesn't go on after it.
+fn number_end(source: &str, start: usize, limit: usize) -> Option<usize> {
+    let digits = source[start..limit]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let end = start + digits;
+    if digits == 0 || source[start..].starts_with('0') {
+        return None;
+    }
+    // Emphasis delimiters, which may close emphasis around the reference, don't continue it.
+    let after = source[end..].trim_start_matches(['*', '_', '~']);
+    if after.starts_with(|c: char| c.is_alphanumeric()) {
+        return None;
+    }
+    Some(end)
+}
+
+/// Whether a reference may start at `start`: at the start of a line or after a space or an
+/// opening bracket or quote, possibly with emphasis delimiters in between (`**#123**`), but not
+/// inside a word (`abc#123`, `a_#1`) or a path (`a/b/c#1`).
+fn starts_reference(source: &str, start: usize) -> bool {
+    source[..start]
+        .trim_end_matches(['*', '_', '~'])
+        .chars()
+        .next_back()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\''))
+}
+
+fn overlaps(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
 /// Markdown someone else wrote: its links show where they go while hovered (in the view's
 /// [`HoveredLink`], under `key`) and only open web pages.
 pub(crate) fn untrusted_markdown<V: 'static>(
@@ -249,6 +439,8 @@ pub(crate) struct RemoteThreadContent {
     /// Where the thread is, when its block's place doesn't say it: a range, an old line, a file,
     /// or the original lines of an outdated or moved thread.
     pub location: Option<SharedString>,
+    /// The pull request's repository, which `#123` in the comments refers to.
+    pub repo: ForgeRepo,
 }
 
 struct ThreadEntry {
@@ -297,7 +489,7 @@ impl RemoteThreadView {
                     .iter()
                     .map(|comment| {
                         let language_registry = self.language_registry.clone();
-                        let source = github_markdown(&comment.body);
+                        let source = github_markdown(&comment.body, &content.repo);
                         cx.new(|cx| Markdown::new(source, Some(language_registry), None, cx))
                     })
                     .collect();
@@ -330,6 +522,15 @@ impl RemoteThreadView {
         self.threads
             .iter()
             .map(|entry| entry.content.location.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body_sources(&self, cx: &App) -> Vec<SharedString> {
+        self.threads
+            .iter()
+            .flat_map(|entry| &entry.bodies)
+            .map(|body| body.read(cx).source().clone())
             .collect()
     }
 
@@ -639,9 +840,116 @@ mod tests {
         assert_eq!(hovered.0, None);
     }
 
+    fn repo() -> ForgeRepo {
+        ForgeRepo {
+            host: "github.com".into(),
+            owner: "o".into(),
+            name: "r".into(),
+        }
+    }
+
+    #[test]
+    fn test_github_markdown_links_references() {
+        let markdown = |source: &str| github_markdown(&source.into(), &repo()).to_string();
+        let issue = |number: u32| format!("https://github.com/o/r/issues/{number}");
+        assert_eq!(
+            markdown("Fixes #12."),
+            format!("Fixes [#12]({}).", issue(12))
+        );
+        assert_eq!(
+            markdown("#1 first\nthen #2\n> quoted #3\n- item #4\n# Heading #5"),
+            format!(
+                "[#1]({}) first\nthen [#2]({})\n> quoted [#3]({})\n- item [#4]({})\n# Heading [#5]({})",
+                issue(1),
+                issue(2),
+                issue(3),
+                issue(4),
+                issue(5)
+            )
+        );
+        assert_eq!(
+            markdown("(#1), [#2], **#3**, _#4_, ~~#5~~, \"#6\", '#7'"),
+            format!(
+                "([#1]({})), [[#2]({})], **[#3]({})**, _[#4]({})_, ~~[#5]({})~~, \"[#6]({})\", '[#7]({})'",
+                issue(1),
+                issue(2),
+                issue(3),
+                issue(4),
+                issue(5),
+                issue(6),
+                issue(7)
+            )
+        );
+        assert_eq!(
+            markdown("See zed-industries/zed.dev#7 and GH-8"),
+            format!(
+                "See [zed-industries/zed.dev#7](https://github.com/zed-industries/zed.dev/issues/7) \
+                 and [GH-8]({})",
+                issue(8)
+            )
+        );
+        assert_eq!(
+            markdown("| a | #1 |\n|---|---|\n| o2/r_2#2 | b |"),
+            format!(
+                "| a | [#1]({}) |\n|---|---|\n| [o2/r_2#2](https://github.com/o2/r_2/issues/2) | b |",
+                issue(1)
+            )
+        );
+        // A URL and a reference in one text: only the reference links.
+        assert_eq!(
+            markdown("https://example.com/page#1 and #2"),
+            format!("https://example.com/page#1 and [#2]({})", issue(2))
+        );
+        // Collapsible sections go first, then their summary's references link.
+        assert_eq!(
+            markdown("<details><summary>See #1</summary>"),
+            format!("**See [#1]({})**", issue(1))
+        );
+        // The pull request's host.
+        let enterprise = ForgeRepo {
+            host: "ghe.corp".into(),
+            ..repo()
+        };
+        assert_eq!(
+            github_markdown(&"#3 and a/b#4".into(), &enterprise).as_ref(),
+            "[#3](https://ghe.corp/o/r/issues/3) and [a/b#4](https://ghe.corp/a/b/issues/4)"
+        );
+
+        for source in [
+            // Inside words, paths and URLs.
+            "abc#12",
+            "issue#12 x-#1 foo_#2 a.b#3",
+            "a/b/c#1",
+            "path/o/r#1",
+            "-o/r#1",
+            "#12abc #3_x GH-4a XGH-5 gh-6",
+            "https://github.com/o/r/pull/1#12",
+            "see https://example.com/#3.",
+            "<https://example.com/#3>",
+            // Not numbers.
+            "#0 #01 # #x GH- #99999999999999999999999",
+            // Code, links and images.
+            "`#12` and `` o/r#1 ``",
+            "```\n#12\n```",
+            "~~~md\nGH-1\n~~~",
+            "    #12 indented code",
+            "[see #12](https://example.com)",
+            "[#12][ref]\n\n[ref]: https://example.com",
+            "![#12](image.png)",
+            // Escapes, entities and HTML.
+            "\\#12",
+            "&#35;12",
+            "<span title=\"#12\">x</span>",
+            "<div>\n#12\n</div>",
+            "",
+        ] {
+            assert_eq!(markdown(source), source, "{source}");
+        }
+    }
+
     #[test]
     fn test_github_markdown_drops_collapsible_tags() {
-        let markdown = |source: &str| github_markdown(&source.into()).to_string();
+        let markdown = |source: &str| github_markdown(&source.into(), &repo()).to_string();
         assert_eq!(
             markdown(
                 "Summary\n\n<details>\n<summary>Notes</summary>\n\nHidden text\n</details>\nAfter"

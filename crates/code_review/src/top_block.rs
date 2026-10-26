@@ -134,14 +134,15 @@ impl ReviewTopBlock {
             return;
         };
         let state = state.read(cx);
+        let repo = &state.forge().context().canonical;
         let sources = std::iter::once((
             SharedString::from(DESCRIPTION_KEY),
-            github_markdown(&state.details().body),
+            github_markdown(&state.details().body, repo),
         ))
         .chain(
             state
                 .visible_summaries()
-                .map(|summary| (summary.id.clone(), github_markdown(&summary.body))),
+                .map(|summary| (summary.id.clone(), github_markdown(&summary.body, repo))),
         )
         .collect::<Vec<_>>();
         let mut previous = std::mem::take(&mut self.markdown);

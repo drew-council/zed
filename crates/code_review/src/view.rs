@@ -460,6 +460,7 @@ fn remote_items(
 ) -> Vec<RemoteItem> {
     let pull_request = pull_request.read(cx);
     let local = local.read(cx);
+    let repo = &pull_request.forge().context().canonical;
     let filters = pull_request.filters();
     let commentable = pull_request.commentable();
     let mut items = Vec::new();
@@ -482,6 +483,7 @@ fn remote_items(
                     moved.entry(path).or_default().push(RemoteThreadContent {
                         thread: thread.clone(),
                         location,
+                        repo: repo.clone(),
                     });
                     continue;
                 }
@@ -498,12 +500,14 @@ fn remote_items(
                 threads: vec![RemoteThreadContent {
                     thread: thread.clone(),
                     location: thread_location(thread, false),
+                    repo: repo.clone(),
                 }],
             }),
             Some(ThreadPlacement::Moved { path }) => {
                 moved.entry(path).or_default().push(RemoteThreadContent {
                     thread: thread.clone(),
                     location: thread_location(thread, true),
+                    repo: repo.clone(),
                 })
             }
         }

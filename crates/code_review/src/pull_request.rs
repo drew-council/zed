@@ -3711,6 +3711,100 @@ pub(crate) mod tests {
             assert_eq!(scroll_top(cx), 0.);
         }
 
+        /// GitHub's references in the description, review summaries and threads link to their
+        /// issues on GitHub, and a click opens them.
+        #[gpui::test]
+        async fn test_references_link_to_github(cx: &mut TestAppContext) {
+            let mut details: serde_json::Value = serde_json::from_str(PR1_DETAILS).unwrap();
+            details["data"]["repository"]["pullRequest"]["body"] =
+                json!("GH-7 fixes it, after other/repo#8.\n\nNot `#9`.");
+            let mut summaries: serde_json::Value = serde_json::from_str(PR1_SUMMARIES).unwrap();
+            let summary = summaries["data"]["repository"]["pullRequest"]["reviews"]["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|summary| summary["id"] == USER_SUMMARY)
+                .unwrap();
+            summary["body"] = json!("Initial pass. Like #3.");
+            let thread_with_reference = json!({
+                "id": "PRRT_reference",
+                "isResolved": false,
+                "isOutdated": false,
+                "subjectType": "FILE",
+                "path": "src/util/strings.rs",
+                "line": null,
+                "startLine": null,
+                "originalLine": null,
+                "originalStartLine": null,
+                "diffSide": "RIGHT",
+                "startDiffSide": null,
+                "comments": {
+                    "totalCount": 1,
+                    "nodes": [{
+                        "id": "PRRC_reference",
+                        "databaseId": 3,
+                        "body": "Same as #5",
+                        "createdAt": "2026-10-17T04:00:00Z",
+                        "url": "https://github.com/drew-council/code-review-sandbox/pull/1#discussion_r3",
+                        "state": "SUBMITTED",
+                        "commit": { "oid": PR1_HEAD_OID },
+                        "author": { "__typename": "User", "login": "someone" },
+                    }],
+                },
+            });
+            let respond = move |request: &SentRequest| match request.operation() {
+                Some("PullRequestDetails") => Some(Reply::json(details.to_string())),
+                Some("ReviewSummaries") => Some(Reply::json(summaries.to_string())),
+                _ => None,
+            };
+            let fixture = Fixture {
+                respond: Some(Arc::new(respond)),
+                extra_threads: vec![thread_with_reference],
+                ..Fixture::default()
+            };
+            let (_fs, _workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            let issue = |number: u32| {
+                format!("https://github.com/drew-council/code-review-sandbox/issues/{number}")
+            };
+
+            let top_block = review.read_with(cx, |review, _| review.top_block().clone());
+            top_block.read_with(cx, |top_block, cx| {
+                assert_eq!(
+                    top_block.markdown_source("description", cx).unwrap(),
+                    format!(
+                        "[GH-7]({}) fixes it, after \
+                         [other/repo#8](https://github.com/other/repo/issues/8).\n\nNot `#9`.",
+                        issue(7)
+                    )
+                );
+                assert_eq!(
+                    top_block.markdown_source(USER_SUMMARY, cx).unwrap(),
+                    format!("Initial pass. Like [#3]({}).", issue(3))
+                );
+            });
+            let blocks = review.read_with(cx, |review, _| review.comments().clone());
+            let thread_bodies = blocks.read_with(cx, |blocks, cx| {
+                blocks
+                    .remote_view(&thread("PRRT_reference"))
+                    .unwrap()
+                    .read(cx)
+                    .body_sources(cx)
+            });
+            assert_eq!(thread_bodies, [format!("Same as [#5]({})", issue(5))]);
+
+            // The description starts with its first link: a click there opens the issue.
+            draw(cx);
+            let description = cx
+                .debug_bounds("review-pull-request-description-text")
+                .expect("the description shows");
+            cx.simulate_click(
+                description.origin + gpui::point(gpui::px(4.), gpui::px(6.)),
+                gpui::Modifiers::none(),
+            );
+            cx.run_until_parked();
+            assert_eq!(cx.opened_url(), Some(issue(7)));
+        }
+
         /// A file thread that shows up above the cursor on the file's first row (a reload, as
         /// after a submit) is shown with the file's header at the top, rather than where the
         /// view's top happens to be, which may leave it under the sticky header.

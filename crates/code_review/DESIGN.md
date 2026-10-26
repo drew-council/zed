@@ -38,7 +38,9 @@ stack's first pull request to review, and a pull request review in a stack shows
 steps up and down it (see "Stacked pull requests"). Then the user's bug findings on movement: the
 review tab dropped its own line cursor and keys for **Zed's own vim, unchanged**, on the read-only
 diff (see "Upstream vim in the review tab"), and the gutter's "+" moved between the line numbers
-and the text, off the excerpts' expand buttons (see "Gutter buttons don't overlap").
+and the text, off the excerpts' expand buttons (see "Gutter buttons don't overlap"). Then issue
+references (`#123`, `owner/repo#123`, `GH-123`) in GitHub's text link to GitHub (see "GitHub
+references link").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -107,7 +109,7 @@ What exists:
 | `crates/code_review/src/comments/blocks.rs` | `CommentBlocks` (one per review tab): a `CommentView` per comment, the comment and thread blocks on both sides of the diff (`ItemKey::{Remote(RemoteKey), Comment(CommentId)}`, `set_remote_items`/`RemoteItem`, `reconcile`, `placement`, `line_row_anchor`, `old_row_in_unified_diff`, `block_below_row`, re-hosting when the left side is recreated), the tab's own anchors (`TabAnchors`/`LineAnchor`, parked per session on a key switch; polish B: each holds its buffer, and remembers where deleted lines were, `restored_lines`) with the outdated check (both ways since polish B), deleted-line detection and live line numbers (`update_anchors`), comment editors (incl. the `vim::VimSave` capture) (`begin_edit`, `leave`, focus return + guard), the comment keys (`c`/`C`/`;c`/`i`/`dd`/`]t`; UX-1 B: `add_line_comment_on` a given side and rows, `add_file_comment_for`, `set_type`), comment at cursor, `Y`/visual `y` text; comment GPUI tests (UX-1 B: the mouse ones too) |
 | `crates/code_review/src/comments/blocks/gutter.rs` | UX-1 B: the gutter's "+" (`install` sets the editor's gutter row renderer on each side; visibility, the row's target and the gate's refusal, the click and the drag from it, `select_display_rows`); UX-1 C: the area over each row's line number (`render_row`, `line_number_column`, `select_from_line_number`): clicks on line numbers select rows instead of opening the file |
 | `crates/code_review/src/comments/view.rs` | `CommentView`: the comment card (type and OUTDATED/SUBMITTED badges, location, edit/delete buttons, markdown or the editor; UX-1 B: the editor's footer with the type menu, Cancel, Save, Delete) and its `ReviewComment` key context with the leave/keep actions |
-| `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered); fix 2: `github_markdown` (GitHub's `<details>`/`<summary>` tags dropped) |
+| `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered); fix 2: `github_markdown` (GitHub's `<details>`/`<summary>` tags dropped); `link_references` (GitHub's issue references as links, through `github_markdown`, which takes the pull request's repository) |
 | `crates/code_review/src/submit.rs` | M7d: `comment_body`/`review_body` (`[TYPE] ` prefixes), `needs_body` (LV §5.1), `plan_review` → `PlannedReview` (the payload mapping, counts, outdated and refused drafts), `SubmitReviewModal` (events, blockers, warnings, body prompt; polish A: re-plans on every change, starts `PullRequestState::submit`/`check_uncertain_submit` and shows their reply, can't be dismissed while its submit runs), `finish_local_review`; payload/flow/modal tests |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
 | `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`; M7d: `ReviewEvent`, `ReviewSubmission`, `ReviewLineComment`/`ReviewFileComment`, `SubmittedReview`; stacks: `PullRequestStack` (`review_start`, `neighbor`), `StackDirection`), the `Forge` trait (with `submit_review`; stacks: `pull_request_stacks`, `pull_request_stack`), `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
@@ -2186,6 +2188,50 @@ buttons overlap, should not happen. both are frequently used."
   227 pass, 1 ignored; editor `gutter` tests 9 pass; clippy (`-p code_review -p editor`) clean. Not
   done: a live run.
 
+**GitHub references link (the user's bug findings, item 4)** — "issue links not rendered, stay as
+plain numbers. need to have a link so i can view them." (and "at some point, should ideally render
+into dropdown so i can view inline": not built, see "Known issues").
+
+- **Where**: all GitHub-authored markdown the review renders: a pull request's description and
+  review summaries (top block) and every comment of its review threads (`RemoteThreadView`), all
+  through `github_markdown`, which now takes the pull request's repository
+  (`forge().context().canonical`; threads get it on `RemoteThreadContent::repo`). Not linked: the
+  review's own comments and the submit modal's body preview (the user's text; GitHub links it once
+  posted), and commit messages (only commit reviews show them, which have no pull request, so no
+  repository to resolve `#123` against).
+- **How** (`link_references` in `comments/remote.rs`, no upstream edit: the markdown crate has no
+  hook for custom autolinks): the source is rewritten before it is parsed, `#123` →
+  `[#123](https://HOST/OWNER/REPO/issues/123)` (an issue URL reaches a pull request too: GitHub
+  redirects; HOST is the pull request's, so Enterprise works). It walks pulldown-cmark's events with
+  the markdown crate's own `PARSE_OPTIONS`, so code spans, code blocks, links, images, autolinks,
+  HTML and metadata blocks are skipped exactly as the renderer sees them; adjacent text events are
+  joined into runs, and text that isn't verbatim source (escapes like `\#1`, entities, smart
+  quotes) is left alone. Bare URLs already link (the markdown crate runs linkify over text), so
+  linkify's URLs in a run are skipped too (`…/page#1`). Clicks go through `untrusted_markdown` →
+  `open_web_link` (only http(s) opens), and hovering shows the destination, as for other links.
+- **Rules** (GitHub's autolinks): `#N`, `owner/repo#N` (owner `[A-Za-z0-9-]`, not starting with
+  `-`; repo `[A-Za-z0-9._-]`) and `GH-N` (upper case only); N doesn't start with 0 and fits a u64.
+  A reference starts a line or follows whitespace, `(`, `[`, `{`, `"` or `'`, possibly through
+  emphasis delimiters (`**#1**`, `_#1_`, `~~#1~~`), so not `abc#1`, `a_#1`, `x-#1` or `a/b/c#1`; and
+  no letter or digit follows it (again through delimiters: `#1abc`, `#1_x` don't link).
+- **Decisions**: @mentions and commit SHAs aren't linked: GitHub links them only when the user or
+  commit exists, which isn't known offline, and look-alikes are common (`@Override`, `@here`, hex
+  words like `deadbeef`). Issue references have the same limit (GitHub only links existing issues,
+  so `step #1` links here and not on GitHub), but they are what was asked for. Alternatives: linking
+  inside the markdown crate's parser (upstream edit, rebuilds `markdown`'s dependents); a regex over
+  the raw source (would link inside code spans and links). New dependencies: `pulldown-cmark` and
+  `linkify` (workspace dependencies the markdown crate already uses).
+- Tests: `test_github_markdown_links_references` (line starts, lists, quotes, headings, tables,
+  brackets, quotes and emphasis around references, cross-repo with `.`/`-`/`_`, `GH-`, an
+  Enterprise host, a URL and a reference in one text, a `<summary>`'s references; untouched: inside
+  words and paths, `-o/r#1`, trailing letters, URLs with fragments and autolinks, `#0`/`#01`/`#`/
+  overflow, code spans, fenced and indented code, inline and reference links, images, escapes,
+  entities, inline and block HTML); `pull_request::tests::review::test_references_link_to_github`
+  (PR A with `GH-7`/`other/repo#8`/`` `#9` `` in the description, `#3` in a summary and `#5` in a
+  thread: each source links to the right URL, and a click on the description's first link opens
+  `…/drew-council/code-review-sandbox/issues/7`; red without the linking). 229 pass, 1 ignored;
+  clippy clean. Not done: a live run.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -2202,6 +2248,13 @@ buttons overlap, should not happen. both are frequently used."
   header gives the generic toast (V2.O3); a thread posted on a previous head shows as moved until
   GitHub re-anchors it (V5.O6). Stale relative line numbers after closing a clone (V2.O6) weren't
   seen again.
+- **Issue references, inline preview** (the user's bug findings, item 4, "at some point, should
+  ideally render into dropdown so i can view inline"): references link to GitHub in the browser
+  (see "GitHub references link"); showing the issue or pull request (title, state, body) in a
+  dropdown inside the review needs a GitHub query per reference (`repository.issueOrPullRequest`)
+  and a popover anchored on the markdown link, which the markdown crate doesn't offer (only
+  `on_url_click`/`on_url_hover`). Also not linked yet: @mentions, commit SHAs, references in the
+  review's own comments and in commit messages.
 - **Non-vim users and the palette** (V8.O1, by design): the review tab's keys are vim-only (no
   default non-vim bindings, which would clash with the base keymaps), so non-vim users reach the
   review actions through the command palette, and its recency ranking is a trap there: once
@@ -2270,8 +2323,8 @@ buttons overlap, should not happen. both are frequently used."
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 232 tests + 1 ignored live
-  GitHub test (after stacked pull requests; 224 after the Review Pull Request picker; 222 after UX-1 slice C; 214 after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 229 tests + 1 ignored live
+  GitHub test (after GitHub references link; 227 after the gutter buttons; 232 after stacked pull requests; 224 after the Review Pull Request picker; 222 after UX-1 slice C; 214 after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
   A; 166 after M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under
