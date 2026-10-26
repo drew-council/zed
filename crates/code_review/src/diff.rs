@@ -22,7 +22,10 @@ use gpui::{
     AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
     WeakEntity,
 };
-use language::{Anchor, Buffer, BufferId, BufferSnapshot, Capability, OffsetRangeExt as _, Point};
+use language::{
+    Anchor, Buffer, BufferId, BufferSnapshot, Capability, OffsetRangeExt as _, Point,
+    language_settings::SoftWrap,
+};
 use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
@@ -242,12 +245,16 @@ impl ReviewDiff {
                 Some(Arc::new(ReviewHunkRenderer { view: view.clone() })),
                 cx,
             );
-            editor.rhs_editor().update(cx, |editor, _| {
+            editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_read_only(true);
                 editor.register_addon(ReviewAddon {
                     source: source.clone(),
                     view,
                 });
+                // Long lines wrap whatever the language settings say (Zed's default doesn't
+                // wrap, and the first file's settings would decide for the whole review), so no
+                // change is out of view. The left side copies this when it is created.
+                editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
             });
             editor
         });

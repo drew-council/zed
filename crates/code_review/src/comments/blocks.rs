@@ -3485,14 +3485,14 @@ mod tests {
             window.dispatch_action(Box::new(editor::actions::ToggleSoftWrap), cx)
         });
         cx.run_until_parked();
-        assert!(!wraps(&rhs, cx));
+        assert!(wraps(&rhs, cx));
         assert!(!wraps(&editor, cx));
         cx.simulate_keystrokes("escape");
         cx.update(|window, cx| {
             window.dispatch_action(Box::new(editor::actions::ToggleSoftWrap), cx)
         });
         cx.run_until_parked();
-        assert!(wraps(&rhs, cx));
+        assert!(!wraps(&rhs, cx));
     }
 
     #[gpui::test]

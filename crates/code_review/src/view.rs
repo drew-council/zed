@@ -4253,4 +4253,242 @@ mod tests {
             assert!(comments.read_with(cx, |comments, cx| comments.is_editing(cx)));
         }
     }
+
+    mod soft_wrap {
+        use super::*;
+        use crate::test_support::{
+            dispatch, init_vim_test, lhs_editor, move_to_row_with_text, open_review_fixture,
+            redraw, rhs_editor, row_center, splittable,
+        };
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, VisualTestContext};
+
+        fn init(cx: &mut TestAppContext, diff_view_style: DiffViewStyle) {
+            init_vim_test(cx, diff_view_style);
+            // Zed's default, explicitly: the review wraps anyway.
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.project.all_languages.defaults.soft_wrap = Some(SoftWrap::None);
+                    });
+                });
+            });
+        }
+
+        fn new_line() -> String {
+            "y".repeat(300)
+        }
+
+        fn old_line() -> String {
+            "x".repeat(300)
+        }
+
+        fn wraps(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> bool {
+            editor.read_with(cx, |editor, cx| {
+                !matches!(editor.soft_wrap_mode(cx), editor::SoftWrap::None)
+            })
+        }
+
+        /// The first display row of the row with `text`, and the number of display rows it
+        /// takes.
+        fn display_rows(
+            editor: &Entity<Editor>,
+            text: &str,
+            cx: &mut VisualTestContext,
+        ) -> (u32, u32) {
+            redraw(cx);
+            cx.run_until_parked();
+            let row = move_to_row_with_text(editor, text, cx);
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                let end = Point::new(
+                    row,
+                    snapshot.buffer_snapshot().line_len(MultiBufferRow(row)),
+                );
+                let start = snapshot.point_to_display_point(Point::new(row, 0), Bias::Left);
+                let end = snapshot.point_to_display_point(end, Bias::Left);
+                (start.row().0, end.row().0 - start.row().0 + 1)
+            })
+        }
+
+        fn max_display_row(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> u32 {
+            editor.update(cx, |editor, cx| {
+                editor.display_snapshot(cx).max_point().row().0
+            })
+        }
+
+        fn toggle_split(review: &Entity<ReviewView>, cx: &mut VisualTestContext) {
+            let rhs = rhs_editor(review, cx);
+            cx.update(|window, cx| {
+                rhs.focus_handle(cx)
+                    .dispatch_action(&editor::ToggleSplitDiff, window, cx)
+            });
+            cx.run_until_parked();
+        }
+
+        fn resize(width: f32, cx: &mut VisualTestContext) {
+            cx.simulate_resize(gpui::size(px(width), px(1000.)));
+            cx.run_until_parked();
+            redraw(cx);
+            cx.run_until_parked();
+        }
+
+        fn scroll_x(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> f64 {
+            redraw(cx);
+            cx.run_until_parked();
+            editor.update(cx, |editor, cx| editor.scroll_position(cx).x)
+        }
+
+        /// A trackpad scroll by `pixels` to the right over the row with `text`.
+        fn scroll_right(
+            editor: &Entity<Editor>,
+            text: &str,
+            pixels: f32,
+            cx: &mut VisualTestContext,
+        ) {
+            redraw(cx);
+            let row = move_to_row_with_text(editor, text, cx);
+            redraw(cx);
+            let position = row_center(editor, row, cx);
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(gpui::point(px(-pixels), px(0.))),
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+
+        /// Long lines wrap on both sides, whatever the language settings say, and on every new
+        /// left side: after toggling the split and after the pane gets too narrow for two
+        /// sides and wide again. `ToggleSoftWrap` turns wrapping off and on for both sides, and
+        /// a new left side follows the right side's state.
+        #[gpui::test]
+        async fn test_long_lines_wrap_on_both_sides(cx: &mut TestAppContext) {
+            init(cx, DiffViewStyle::Split);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let lhs = lhs_editor(&review, cx);
+            assert!(wraps(&rhs, cx));
+            assert!(wraps(&lhs, cx));
+            assert!(display_rows(&rhs, &new_line(), cx).1 > 1);
+            assert!(display_rows(&lhs, &old_line(), cx).1 > 1);
+
+            cx.focus(&rhs);
+            dispatch(ToggleSoftWrap, cx);
+            assert!(!wraps(&rhs, cx));
+            assert!(!wraps(&lhs, cx));
+            assert_eq!(display_rows(&rhs, &new_line(), cx).1, 1);
+            assert_eq!(display_rows(&lhs, &old_line(), cx).1, 1);
+
+            toggle_split(&review, cx);
+            toggle_split(&review, cx);
+            let lhs = lhs_editor(&review, cx);
+            assert!(!wraps(&lhs, cx));
+            assert_eq!(display_rows(&lhs, &old_line(), cx).1, 1);
+
+            cx.focus(&rhs);
+            dispatch(ToggleSoftWrap, cx);
+            assert!(wraps(&rhs, cx));
+            assert!(wraps(&lhs, cx));
+            assert!(display_rows(&lhs, &old_line(), cx).1 > 1);
+
+            toggle_split(&review, cx);
+            toggle_split(&review, cx);
+            let lhs = lhs_editor(&review, cx);
+            assert!(wraps(&lhs, cx));
+            assert!(display_rows(&lhs, &old_line(), cx).1 > 1);
+
+            resize(500., cx);
+            assert!(!splittable(&review, cx).read_with(cx, |editor, _| editor.is_split()));
+            assert!(wraps(&rhs, cx));
+            assert!(display_rows(&rhs, &new_line(), cx).1 > 1);
+            resize(1600., cx);
+            let new_lhs = lhs_editor(&review, cx);
+            assert_ne!(new_lhs, lhs);
+            assert!(wraps(&new_lhs, cx));
+            assert!(display_rows(&new_lhs, &old_line(), cx).1 > 1);
+        }
+
+        /// A long line wrapped into more rows on one side than on the other faces a spacer:
+        /// the rows after it stay side by side.
+        #[gpui::test]
+        async fn test_wrapped_lines_stay_aligned_in_split_view(cx: &mut TestAppContext) {
+            init(cx, DiffViewStyle::Split);
+            let (fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let longer_line = "y".repeat(900);
+            fs.insert_file(
+                path!("/project/long.txt"),
+                format!("short\n{longer_line}\n").into_bytes(),
+            )
+            .await;
+            cx.run_until_parked();
+            let rhs = rhs_editor(&review, cx);
+            let lhs = lhs_editor(&review, cx);
+
+            let (new_start, new_rows) = display_rows(&rhs, &longer_line, cx);
+            let (old_start, old_rows) = display_rows(&lhs, &old_line(), cx);
+            assert_eq!(new_start, old_start);
+            assert!(old_rows > 1);
+            assert!(new_rows > old_rows);
+            assert_eq!(
+                display_rows(&rhs, "ONE", cx).0,
+                display_rows(&lhs, "one", cx).0
+            );
+            assert_eq!(max_display_row(&rhs, cx), max_display_row(&lhs, cx));
+        }
+
+        #[gpui::test]
+        async fn test_long_lines_scroll_horizontally_without_wrapping(cx: &mut TestAppContext) {
+            assert_long_lines_scroll_horizontally(DiffViewStyle::Unified, cx).await;
+        }
+
+        #[gpui::test]
+        async fn test_long_lines_scroll_horizontally_without_wrapping_in_split_view(
+            cx: &mut TestAppContext,
+        ) {
+            assert_long_lines_scroll_horizontally(DiffViewStyle::Split, cx).await;
+        }
+
+        /// With wrapping off, a trackpad scroll over a long line and `$` scroll the view
+        /// horizontally; in split view both sides move together, from either side.
+        async fn assert_long_lines_scroll_horizontally(
+            diff_view_style: DiffViewStyle,
+            cx: &mut TestAppContext,
+        ) {
+            init(cx, diff_view_style);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let lhs = (diff_view_style == DiffViewStyle::Split).then(|| lhs_editor(&review, cx));
+            cx.focus(&rhs);
+            dispatch(ToggleSoftWrap, cx);
+            assert!(!wraps(&rhs, cx));
+            assert_eq!(scroll_x(&rhs, cx), 0.);
+
+            scroll_right(&rhs, &new_line(), 200., cx);
+            let scrolled = scroll_x(&rhs, cx);
+            assert!(scrolled > 0., "{diff_view_style:?}");
+            if let Some(lhs) = &lhs {
+                assert_eq!(scroll_x(lhs, cx), scrolled);
+                scroll_right(lhs, &old_line(), 200., cx);
+                assert!(scroll_x(&rhs, cx) > scrolled);
+                assert_eq!(scroll_x(lhs, cx), scroll_x(&rhs, cx));
+            }
+
+            scroll_right(&rhs, &new_line(), -10_000., cx);
+            assert_eq!(scroll_x(&rhs, cx), 0., "{diff_view_style:?}");
+            cx.focus(&rhs);
+            move_to_row_with_text(&rhs, &new_line(), cx);
+            cx.simulate_keystrokes("$");
+            let scrolled = scroll_x(&rhs, cx);
+            assert!(scrolled > 0., "{diff_view_style:?}");
+            if let Some(lhs) = &lhs {
+                // Each side stops at its own end (the sides' gutters differ in width).
+                let lhs_scrolled = scroll_x(lhs, cx);
+                assert!(lhs_scrolled > 0. && (lhs_scrolled - scrolled).abs() < 3.);
+            }
+            cx.simulate_keystrokes("0");
+            // Back to the start, but for the gutter's margin, which autoscroll keeps in view.
+            assert!(scroll_x(&rhs, cx) < 1., "{diff_view_style:?}");
+        }
+    }
 }

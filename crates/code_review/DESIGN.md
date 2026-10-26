@@ -40,7 +40,8 @@ review tab dropped its own line cursor and keys for **Zed's own vim, unchanged**
 diff (see "Upstream vim in the review tab"), and the gutter's "+" moved between the line numbers
 and the text, off the excerpts' expand buttons (see "Gutter buttons don't overlap"). Then issue
 references (`#123`, `owner/repo#123`, `GH-123`) in GitHub's text link to GitHub (see "GitHub
-references link").
+references link"), and long lines wrap in the diff by default, on both sides (see "Long lines
+wrap").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -209,7 +210,8 @@ no upstream glue (M4: new deps `db`, `file_icons`, `fs`, `ignore`, `regex`, `sma
   first file's language settings decide for the whole multibuffer (Plain Text wraps), so `h`/`l` would
   depend on which file comes first. `editor::ToggleSoftWrap` is captured on the `CodeReview` div and
   switches both sides between no wrap and editor-width wrap (Zed's own toggle falls back to the
-  language settings first, which may change nothing).
+  language settings first, which may change nothing). *Superseded*: the review wraps by default
+  (see "Long lines wrap").
 - Keys (`code_review_vim.json`): `v`, `V`, `ctrl-v`, `ctrl-q` start line-wise visual. Null in normal +
   visual: `w W b B e E ge gE f F t T ; , ^ $ | home end g0 g^ g$ g<home> g<end> gM space backspace`,
   `( ) % * # g* g#`. Null in normal: `i a I A o O s S c C r R gi insert`; in visual: `i a c s S r R I A gI gA`.
@@ -2232,6 +2234,49 @@ into dropdown so i can view inline": not built, see "Known issues").
   `…/drew-council/code-review-sandbox/issues/7`; red without the linking). 229 pass, 1 ignored;
   clippy clean. Not done: a live run.
 
+**Long lines wrap (the user's bug findings, item 1)** — "markdown is rendered with line wrapping
+for me, but diff shown doesn't wrap lines (generally i'd guess). leads to cases where the entire
+line is off-screen and i can't actually see anything (no horizontal scroll either...)".
+
+- **Cause**: the review forced `SoftWrap::None` (tuicr's `wrap = false`, for the line cursor's
+  `h`/`l`); "Upstream vim in the review tab" removed that override, which left wrapping to the
+  language settings, and Zed's default (`"soft_wrap": "none"`) doesn't wrap either. "No horizontal
+  scroll" was the line cursor's doing too: core patch #2 forbade horizontal autoscroll on both
+  sides and the caret was hidden, so no cursor motion scrolled sideways, only the review's own
+  `h`/`l` (4 columns at a time). Both went with the line cursor. Nothing the review adds blocks
+  horizontal scrolling now: its blocks use `block_mouse_except_scroll`, the full-width overview
+  (core patch #7) adds no hitbox, the review sets no scrollbar settings, and `keep_scroll_at_start`
+  and the overview's scrolls keep the x offset.
+- **Decision** (the orchestrator's, for the user): the diff wraps at the editor's width by default
+  on both sides, whatever the language settings say (the first file's would decide for the whole
+  multibuffer): `ReviewDiff::new` sets the right side's `set_soft_wrap_mode(EditorWidth)`, and
+  upstream's `SplittableEditor::split` copies the right side's override to every new left side
+  (also the automatic ones when the pane gets wide enough). `ToggleSoftWrap` (the review's capture,
+  unchanged) turns it off and on for both sides; a left side created while it's off doesn't wrap
+  either. Comment editors wrap on their own, as before.
+- **Upstream behaviour, not patched**: with wrapping off, a horizontal wheel/trackpad delta, the
+  horizontal scrollbar (`scrollbar.axes.horizontal`; seen live in the final validation, V1.O5) and
+  cursor motions (`$`, `l`, `w`, …) scroll sideways. In
+  split view the sides share the x offset, but each side's view stops at its own widest line, so a
+  side with only short lines stays at x = 0 and a wheel over it doesn't scroll (its maximum is 0);
+  `0` after `$` leaves the gutter's margin (half a column) scrolled. With wrapping on, the split's
+  block map balances wrapped rows too (spacers from the other side's wrap snapshot), so a line
+  wrapped into more rows on one side faces a spacer and the rows after it stay side by side. Line
+  numbers and the gutter's "+" show on a wrapped line's first row only (continuation rows have no
+  buffer row).
+- Tests (`view::tests::soft_wrap`, with `"soft_wrap": "none"` set explicitly):
+  `test_long_lines_wrap_on_both_sides` (split: both sides wrap a 300-column line; the toggle turns
+  both off; a left side recreated by toggling the split follows (off, then on after the toggle);
+  too narrow for two sides and wide again, the new left side wraps),
+  `test_wrapped_lines_stay_aligned_in_split_view` (a 900-column new line against a 300-column old
+  one: the wrapped lines start on the same display row, the new one takes more rows, the next
+  file's facing rows and the last display rows match), and
+  `test_long_lines_scroll_horizontally_without_wrapping` (unified) / `…_in_split_view` (wrapping
+  off: a trackpad scroll over the long line moves the view, on both sides together and from
+  either side; scrolled back, `$` scrolls to the line's end on both sides and `0` back).
+  `test_typing_in_a_comment_isnt_taken_by_review_keys` now expects the diff to wrap at first. All
+  four new tests are red without the fix. 233 pass, 1 ignored; clippy clean. Not done: a live run.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -2600,8 +2645,10 @@ review tab").
 
 - The caret, selections, visual modes (`v`, `V`, `ctrl-v`), every motion, text object, count,
   search, `gd`/`gr`/`K`, yank (`y`, `yiw`, …), `h`/`l`, `{`/`}`, marks, `ctrl-d/u/f/b` and the
-  scroll keys are vim's. Soft wrap follows the language settings (`ToggleSoftWrap` switches both
-  sides together).
+  scroll keys are vim's. Long lines wrap at the editor's width on both sides, whatever the
+  language settings say; `ToggleSoftWrap` turns wrapping off (then long lines scroll sideways:
+  trackpad, scrollbar, cursor motions) and on for both sides together, and a new left side
+  follows the right side (see "Long lines wrap").
 - The review binds only keys that would edit the read-only diff, and two-key sequences on vim
   prefixes: insert/change/replace keys become review actions or no-ops, `]`/`[` and `;` lead
   review keys. `;` alone still repeats `f`/`t` after the keymap's pending-key timeout.
