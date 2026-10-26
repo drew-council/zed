@@ -29,7 +29,8 @@ struct GutterButton {
 }
 
 /// The rows of a side's selection, and the row its cursor is on.
-struct SelectionRows {
+#[derive(Clone)]
+pub(super) struct SelectionRows {
     rows: RangeInclusive<u32>,
     cursor: u32,
 }
@@ -165,7 +166,7 @@ impl CommentBlocks {
         let splittable = self.diff.read(cx).editor().read(cx);
         let is_lhs = splittable.lhs_editor() == Some(editor);
         let selection =
-            (splittable.focused_editor() == editor).then(|| selection_rows(editor.read(cx), cx));
+            (splittable.focused_editor() == editor).then(|| self.cached_selection_rows(editor, cx));
         let row = gutter_row.info.multibuffer_row?.0;
         let at_selection = selection
             .as_ref()
@@ -189,6 +190,19 @@ impl CommentBlocks {
             refusal: self.refusal(&target, cx),
             in_selection,
         })
+    }
+
+    fn cached_selection_rows(&self, editor: &Entity<Editor>, cx: &App) -> SelectionRows {
+        let newest = *editor.read(cx).selections.newest_anchor();
+        let mut cache = self.selection_rows.borrow_mut();
+        if let Some((selection, rows)) = cache.get(&editor.entity_id())
+            && *selection == newest
+        {
+            return rows.clone();
+        }
+        let rows = selection_rows(editor.read(cx), cx);
+        cache.insert(editor.entity_id(), (newest, rows.clone()));
+        rows
     }
 
     /// The lines `rows` (multibuffer rows of a side of the diff) show, as `c` takes them.

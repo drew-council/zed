@@ -17,6 +17,7 @@ anyhow.workspace = true
 askpass.workspace = true
 buffer_diff.workspace = true
 cli.workspace = true
+clock.workspace = true
 collections.workspace = true
 command_palette_hooks.workspace = true
 db.workspace = true

@@ -815,6 +815,9 @@ pub(crate) struct LocalChanges {
     /// texts some time later, so until a file's base text is this one its new lines can't be
     /// numbered in that commit.
     head_texts: Option<HeadTexts>,
+    /// The hash of each file's diff base text, by that text's version: the gutter checks the
+    /// cursor's line on every frame, and hashing a whole file each time is too slow.
+    base_text_hashes: RefCell<HashMap<RepoPath, (language::BufferId, clock::Global, Option<u64>)>>,
 }
 
 struct HeadTexts {
@@ -867,6 +870,7 @@ impl LocalChanges {
             project: project.downgrade(),
             files: HashMap::default(),
             head_texts: None,
+            base_text_hashes: RefCell::default(),
         }
     }
 
@@ -960,9 +964,19 @@ impl LocalChanges {
         let Some(expected) = texts.hashes.get(path) else {
             return true;
         };
-        let base = diff
-            .base_text_exists()
-            .then(|| text_hash(&diff.base_text().text()));
+        let base_text = diff.base_text();
+        let key = (base_text.remote_id(), base_text.version().clone());
+        let mut hashes = self.base_text_hashes.borrow_mut();
+        let base = match hashes.get(path) {
+            Some((buffer_id, version, hash)) if (buffer_id, version) == (&key.0, &key.1) => *hash,
+            _ => {
+                let hash = diff
+                    .base_text_exists()
+                    .then(|| text_hash(&base_text.text()));
+                hashes.insert(path.clone(), (key.0, key.1, hash));
+                hash
+            }
+        };
         base == *expected
     }
 

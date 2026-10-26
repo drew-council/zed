@@ -37,6 +37,7 @@ use multi_buffer::{
 };
 use std::{
     any::TypeId,
+    cell::RefCell,
     ops::{Range, RangeInclusive},
     sync::Arc,
 };
@@ -82,6 +83,11 @@ pub(crate) struct CommentBlocks {
     /// ([`Self::check`]).
     gate: Option<CommentGate>,
     focus_guard: Option<Subscription>,
+    /// Each side's newest selection with the rows it spans, for the gutter's "+" on every visible
+    /// row of every frame: the rows take a snapshot of the whole diff. Cleared when the diff's
+    /// buffers change, which moves rows under the same anchors.
+    selection_rows:
+        RefCell<HashMap<EntityId, (language::Selection<editor::Anchor>, gutter::SelectionRows)>>,
     /// The block showing the review's overview at the top of the right side, with the
     /// review-level comments in it, while it has something to show.
     overview_block: Option<CustomBlockId>,
@@ -254,7 +260,10 @@ impl CommentBlocks {
                     | EditorEvent::BuffersRemoved { .. }
                     | EditorEvent::BufferFoldToggled { .. }
                     | EditorEvent::BufferEdited
-                    | EditorEvent::BuffersEdited { .. } => this.reconcile(window, cx),
+                    | EditorEvent::BuffersEdited { .. } => {
+                        this.selection_rows.borrow_mut().clear();
+                        this.reconcile(window, cx)
+                    }
                     EditorEvent::SelectionsChanged { .. } => this.update_targeted(cx),
                     _ => {}
                 },
@@ -307,6 +316,7 @@ impl CommentBlocks {
             targeted: None,
             gate: None,
             focus_guard: None,
+            selection_rows: RefCell::default(),
             overview_block: None,
             reveal_overview_pending: false,
             _session_subscription: session_subscription,
@@ -2036,6 +2046,7 @@ impl CommentBlocks {
     fn items_at_cursor(&self, editor: &Entity<Editor>, cx: &mut App) -> Option<Vec<ItemKey>> {
         let rows = self.cursor_rows(editor, cx)?;
         let mut at_cursor = Vec::new();
+        let mut snapshots = HashMap::default();
         for (key, hosted) in &self.hosted {
             let Some(cursor_row) = rows.row(hosted.host) else {
                 continue;
@@ -2043,8 +2054,10 @@ impl CommentBlocks {
             let Some(editor) = hosted.editor.upgrade() else {
                 continue;
             };
-            let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
-            if hosted.placement.row.to_point(&snapshot).row == cursor_row {
+            let snapshot = snapshots
+                .entry(editor.entity_id())
+                .or_insert_with(|| editor.read(cx).buffer().read(cx).snapshot(cx));
+            if hosted.placement.row.to_point(snapshot).row == cursor_row {
                 at_cursor.push((hosted.placement.is_file, hosted.host != rows.focused, key));
             }
         }

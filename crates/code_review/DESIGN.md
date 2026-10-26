@@ -43,7 +43,8 @@ references (`#123`, `owner/repo#123`, `GH-123`) in GitHub's text link to GitHub 
 references link"), and long lines wrap in the diff by default, on both sides (see "Long lines
 wrap"). Then the Start Review picker loads its pull requests about 3× faster and takes most of the
 window (see "Faster, bigger Start Review picker"). Then `ctrl-u`/`ctrl-d` work over the diff's blocks
-(see "`ctrl-u`/`ctrl-d` over blocks").
+(see "`ctrl-u`/`ctrl-d` over blocks"), and cursor movement was measured against Zed's own editors
+(see "Cursor movement speed").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -2342,6 +2343,33 @@ them: the overview, file headers, comments and threads).
   `ctrl-d` until they stop: the view and the cursor move one way only and the cursor ends on the
   first or last row); both fail without the fix (`ctrl-u` from row 0: row 0 → row 3). vim's 577
   tests and editor's scroll/split tests pass. Not done: a live run.
+
+**Cursor movement speed (the user's report after the picker)** — "navigating around with vim
+bindings is STILL EXTREMELY LAGGY! … it should run at the same speed as the normal zed editor
+navigation"; "it will just skip several lines to try and catch up, when normal editor actually does
+proper key-repeat handling". "Upstream vim in the review tab" removed the line cursor but measured
+nothing; this does.
+
+- **Harness** (a timing test, removed after use): the PR A fixture with `src/engine.rs` grown to
+  20,269 lines and a hunk every 40 lines, 1600×1000, the cursor in that file, `j`/`k` each followed
+  by a drawn frame; against Zed's own diff view (a bare `SplittableEditor` over the review's
+  multibuffer, wrapping like it) and a plain editor on the file. A `refresh()`-ing draw invalidates
+  GPUI's view caches and overstates everything; the numbers are without it.
+- **Release-fast** (per key + frame): review 1.8 ms (small) / 3.2 ms (20k lines); Zed's diff view
+  1.2 / 2.5 ms; plain editor 1.4 / 1.6 ms. All far under a frame (8 ms at 120 Hz).
+- **Debug** (the user ran `target/debug/zed`): review ~43 ms, Zed's diff view ~33 ms, plain editor
+  ~23 ms. macOS key repeat comes every ~30 ms or faster, so a debug build's diff views (Zed's own
+  too) fall behind and skip lines; a plain editor just keeps up. Use a `release-fast` build to judge
+  speed.
+- **The review's own share** over Zed's diff view (debug profiles, `sample`): sticky file header
+  controls ~1.1 ms, hunk controls (`hunk_key_at`) ~1.1 ms, the gutter "+" layer ~0.8 ms, the
+  toolbar ~0.2 ms; the rest spread thin. Fixed here: the "+" took a multibuffer snapshot for every
+  visible row of every frame (now a cached newest selection per side, cleared on buffer events);
+  the comment gate hashed a file's whole base text on every frame (now cached per base text
+  version, `LocalChanges::base_text_hashes`); the comment at the cursor took a snapshot per hosted
+  block on every cursor move (now one per side). Zed's diff view itself costs ~10 ms (debug) over a
+  plain editor (the hunk gutter's `diff_hunks_in_range`, anchors over a long file): upstream's.
+- Not done: a live check by the user in a release-fast build.
 
 **Known issues / notes for the next slices:**
 

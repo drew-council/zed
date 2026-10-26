@@ -3246,6 +3246,7 @@ dependencies = [
  "askpass",
  "buffer_diff",
  "cli",
+ "clock",
  "collections",
  "command_palette",
  "command_palette_hooks",
