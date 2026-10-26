@@ -1,11 +1,11 @@
 use crate::{
     AddComment, AddFileComment, AddReviewComment, ChangeBase, CopyCommentAtCursor,
-    CopyReviewAsMarkdown, CopySelectedLines, DeleteComment, EditComment, FocusDiff, FocusPanel,
-    NextComment, NextFile, NextHunk, NextPullRequestInStack, NextUnreviewedFile, OpenFileAtCursor,
+    CopyReviewAsMarkdown, CopySelectedLines, DeleteComment, EditComment, FocusDiff, NextComment,
+    NextFile, NextHunk, NextPullRequestInStack, NextUnreviewedFile, OpenFileAtCursor,
     OpenPullRequestInBrowser, PreviousComment, PreviousFile, PreviousHunk,
     PreviousPullRequestInStack, PreviousUnreviewedFile, ReloadPullRequest, ReviewBranch,
-    ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight, SubmitReview,
-    ToggleBotReviews, ToggleFileReviewed, ToggleHeader, ToggleHunkReviewed, ToggleOutdatedThreads,
+    ReviewCommits, ReviewPanel, ReviewUncommitted, SubmitReview, ToggleBotReviews,
+    ToggleFileReviewed, ToggleHeader, ToggleHunkReviewed, ToggleOutdatedThreads,
     ToggleResolvedThreads, ToggleSingleFileMode,
     comments::{
         CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
@@ -21,7 +21,6 @@ use crate::{
     export::{self, ExportPreamble},
     forge::StackDirection,
     gitattributes::{FileAttributes, GitAttributes},
-    line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
     pull_request::{
         LineMapping, LocalChanges, LocalChangesEvent, PullRequestEvent, PullRequestState,
@@ -36,7 +35,7 @@ use crate::{
 use collections::{HashMap, HashSet};
 use editor::ToPoint as _;
 use editor::{
-    Editor, EditorEvent, PathKey, SelectionEffects, SplittableEditor,
+    Bias, Editor, EditorEvent, PathKey, SelectionEffects, SplittableEditor,
     actions::{OpenExcerpts, ReloadFile, ToggleSoftWrap},
     display_map::CustomBlockId,
     scroll::Autoscroll,
@@ -44,8 +43,8 @@ use editor::{
 use git::{Oid, repository::RepoPath, status::FileStatus};
 use git_ui::branch_picker::{self, SelectBranchCallback};
 use gpui::{
-    Action as _, AnyEntity, ClipboardItem, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    Subscription, Task, WeakEntity,
+    AnyEntity, ClipboardItem, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Subscription,
+    Task, WeakEntity,
 };
 use language::{Capability, LanguageRegistry, Point, language_settings::SoftWrap};
 use multi_buffer::MultiBufferRow;
@@ -147,7 +146,7 @@ pub(crate) fn register(workspace: &mut Workspace) {
     });
 }
 
-/// `y`: the review's comments as Markdown, on the clipboard.
+/// `; y`: the review's comments as Markdown, on the clipboard.
 pub(crate) fn copy_review_as_markdown(
     workspace: &mut Workspace,
     review: &Entity<ReviewView>,
@@ -642,7 +641,6 @@ pub struct ReviewView {
     /// The overview's block at the top of the diff's right side, while the overview has
     /// something to show.
     top_block_id: Option<CustomBlockId>,
-    line_cursor: Entity<LineCursor>,
     /// Shared by every tab reviewing the same thing; replaced when the review key changes.
     session: Entity<ReviewSession>,
     /// The sessions of the keys this tab reviewed before (another base, another branch), kept
@@ -932,13 +930,9 @@ impl ReviewView {
                     | EditorEvent::BuffersRemoved { .. }
                     | EditorEvent::BufferFoldToggled { .. } => this.repaint_reviewed_hunks(cx),
                     EditorEvent::Focused => this.stay_in_normal_mode_on_folded_header(window, cx),
-                    EditorEvent::ScrollPositionChanged { autoscroll, .. } => {
+                    EditorEvent::ScrollPositionChanged { .. } => {
                         let rhs = this.diff.read(cx).editor().read(cx).rhs_editor().clone();
                         rhs.update(cx, |editor, cx| keep_scroll_at_start(editor, window, cx));
-                        if *autoscroll {
-                            this.comments
-                                .update(cx, |comments, cx| comments.show_file_start_at_cursor(cx));
-                        }
                     }
                     _ => {}
                 },
@@ -949,6 +943,9 @@ impl ReviewView {
                 if lhs_editor_id != this.lhs_editor_id {
                     this.lhs_editor_id = lhs_editor_id;
                     if let Some(lhs_editor) = &lhs_editor {
+                        configure_side(lhs_editor, cx);
+                        let rhs_editor = splittable.read(cx).rhs_editor().clone();
+                        face_cursor(&rhs_editor, lhs_editor, cx);
                         context_menu::install(lhs_editor, cx.weak_entity(), cx);
                     }
                     this.repaint_reviewed_hunks(cx);
@@ -962,10 +959,10 @@ impl ReviewView {
         .into_iter()
         .flatten()
         {
+            configure_side(&side, cx);
             context_menu::install(&side, cx.weak_entity(), cx);
         }
         let lhs_editor_id = splittable.read(cx).lhs_editor().map(|lhs| lhs.entity_id());
-        let line_cursor = cx.new(|cx| LineCursor::new(splittable, cx));
         let session_subscription = cx.subscribe_in(&session, window, Self::handle_session_event);
         let mut this = Self {
             target,
@@ -973,7 +970,6 @@ impl ReviewView {
             diff,
             top_block,
             top_block_id: None,
-            line_cursor,
             session,
             previous_sessions: HashMap::default(),
             comments,
@@ -1527,8 +1523,7 @@ impl ReviewView {
         Some((repo_path, hunk_key))
     }
 
-    /// Repaints the reviewed hunks on both sides, then the line cursor, which must stay on top
-    /// (the newest row highlight wins).
+    /// Repaints the reviewed hunks on both sides.
     fn repaint_reviewed_hunks(&mut self, cx: &mut Context<Self>) {
         let splittable = self.diff.read(cx).editor().read(cx);
         let editors = [
@@ -1539,8 +1534,6 @@ impl ReviewView {
             let rows = self.reviewed_hunk_rows(&editor, cx);
             editor.update(cx, |editor, cx| paint_reviewed_hunks(editor, rows, cx));
         }
-        self.line_cursor
-            .update(cx, |line_cursor, cx| line_cursor.refresh(cx));
     }
 
     fn reviewed_hunk_rows(&self, editor: &Entity<Editor>, cx: &App) -> Vec<std::ops::Range<u32>> {
@@ -1886,24 +1879,6 @@ impl ReviewView {
             .update(cx, |top_block, cx| top_block.toggle_expanded(cx));
     }
 
-    fn scroll_left(&mut self, _: &ScrollLeft, window: &mut Window, cx: &mut Context<Self>) {
-        let scroll = self.line_cursor.update(cx, |line_cursor, cx| {
-            line_cursor.scroll_horizontally(-HORIZONTAL_SCROLL_COLUMNS, window, cx)
-        });
-        // In visual mode `h` only scrolls, so the selection isn't lost to a focus change.
-        if matches!(scroll, HorizontalScroll::AtLeftEdge) && !self.has_visual_selection(cx) {
-            window.dispatch_action(FocusPanel.boxed_clone(), cx);
-        }
-        discard_vim_count(window, cx);
-    }
-
-    fn scroll_right(&mut self, _: &ScrollRight, window: &mut Window, cx: &mut Context<Self>) {
-        self.line_cursor.update(cx, |line_cursor, cx| {
-            line_cursor.scroll_horizontally(HORIZONTAL_SCROLL_COLUMNS, window, cx)
-        });
-        discard_vim_count(window, cx);
-    }
-
     fn next_file(&mut self, _: &NextFile, window: &mut Window, cx: &mut Context<Self>) {
         // No wrapping, like tuicr: the last file is a stop.
         self.move_to_file(window, cx, |order, current| match current {
@@ -2031,6 +2006,23 @@ impl ReviewView {
             });
         }
         discard_vim_count(window, cx);
+    }
+
+    /// Zed's own key for opening the file at the cursor (vim's `g space`) opens a snapshot's
+    /// file from the working tree too, not as the historic buffer.
+    fn open_excerpts(&mut self, _: &OpenExcerpts, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.diff.read(cx).is_snapshot(cx) {
+            return;
+        }
+        let editor = self.diff.read(cx).editor().read(cx);
+        let diff_is_focused = [Some(editor.rhs_editor()), editor.lhs_editor()]
+            .into_iter()
+            .flatten()
+            .any(|editor| editor.focus_handle(cx).is_focused(window));
+        if diff_is_focused {
+            self.open_working_tree_file_at_cursor(window, cx);
+            cx.stop_propagation();
+        }
     }
 
     /// A snapshot's buffers are historic, so the file opens as it is in the working tree, at the
@@ -2218,7 +2210,7 @@ impl ReviewView {
         &self.comments
     }
 
-    /// The review's comments as Markdown for a coding agent (what `y` copies), or `None` when
+    /// The review's comments as Markdown for a coding agent (what `; y` copies), or `None` when
     /// there are none to send. Comment editors open in this tab count with their current text.
     pub fn review_markdown(&self, cx: &App) -> Option<String> {
         let unsaved = self.comments.read(cx).unsaved_bodies(cx);
@@ -2496,6 +2488,40 @@ impl ReviewView {
 
 impl EventEmitter<EditorEvent> for ReviewView {}
 
+/// Sets up a side of the review's diff (the left side on every split). The review's comment
+/// button takes the place of the gutter's hover button for breakpoints and bookmarks.
+fn configure_side(editor: &Entity<Editor>, cx: &mut App) {
+    editor.update(cx, |editor, cx| {
+        editor.set_show_breakpoints(false, cx);
+        editor.set_show_bookmarks(false, cx);
+    });
+}
+
+/// Puts a new left side's cursor on the row facing the right side's cursor, as the split
+/// editor does whenever the right side's cursor moves. A new left side otherwise keeps its own
+/// position until then (the end of the diff), and `ctrl-w h` would jump there. Changing the
+/// selections directly has no selection effects, so nothing mirrors back onto the right side.
+fn face_cursor(rhs_editor: &Entity<Editor>, lhs_editor: &Entity<Editor>, cx: &mut App) {
+    let display_point = rhs_editor.update(cx, |editor, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        let head = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_point(snapshot.buffer_snapshot());
+        snapshot.point_to_display_point(head, Bias::Right)
+    });
+    lhs_editor.update(cx, |editor, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        let display_point = snapshot.clip_point(display_point, Bias::Right);
+        let point = snapshot.display_point_to_point(display_point, Bias::Right);
+        editor.selections.change_with(&snapshot, |selections| {
+            selections.select_ranges([point..point])
+        });
+        cx.notify();
+    });
+}
+
 impl Focusable for ReviewView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.diff.read(cx).focus_handle(cx)
@@ -2517,8 +2543,7 @@ impl Render for ReviewView {
             .capture_action(|_: &git::UnstageAndNext, window, cx| block_write_action(window, cx))
             .capture_action(|_: &ReloadFile, window, cx| block_write_action(window, cx))
             .capture_action(cx.listener(Self::toggle_soft_wrap))
-            .on_action(cx.listener(Self::scroll_left))
-            .on_action(cx.listener(Self::scroll_right))
+            .capture_action(cx.listener(Self::open_excerpts))
             .on_action(cx.listener(Self::next_file))
             .on_action(cx.listener(Self::previous_file))
             .on_action(cx.listener(Self::next_unreviewed_file))
@@ -2748,7 +2773,7 @@ impl Item for ReviewView {
 mod tests {
     use super::*;
     use editor::test::editor_test_context::assert_state_with_diff;
-    use gpui::TestAppContext;
+    use gpui::{Action as _, TestAppContext};
     use project::FakeFs;
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
@@ -3909,13 +3934,13 @@ mod tests {
 
             for (keystrokes, path, line) in [
                 ("] f", "added.txt", "new 1"),
-                ("}", "deleted.txt", "gone 1"),
+                ("] f", "deleted.txt", "gone 1"),
                 ("] f", "long.txt", "short"),
                 ("] f", "modified.txt", "one"),
                 // The last file is a stop.
                 ("] f", "modified.txt", "one"),
                 ("[ f", "long.txt", "short"),
-                ("{", "deleted.txt", "gone 1"),
+                ("[ f", "deleted.txt", "gone 1"),
                 ("[ f", "added.txt", "new 1"),
                 ("[ f", "a.rs", "line 1"),
                 ("[ f", "a.rs", "line 1"),
@@ -4002,16 +4027,6 @@ mod tests {
             move_to_row_with_text(&editor, "short", cx);
             cx.simulate_keystrokes("; f");
             assert_eq!(excerpt_paths(&review, cx), ["long.txt"]);
-            let (scroll_top, header_row, _) = rows(cx);
-            assert_eq!(scroll_top, f64::from(header_row));
-
-            // A scroll following the cursor onto a file's first row (`gg` from the end) shows the
-            // file comment above it with the header.
-            cx.simulate_keystrokes("; f g g shift-c");
-            cx.simulate_input("the first file");
-            cx.simulate_keystrokes("ctrl-enter");
-            cx.simulate_keystrokes("shift-g g g");
-            assert_eq!(path_at_cursor(&review, cx).as_deref(), Some("a.rs"));
             let (scroll_top, header_row, _) = rows(cx);
             assert_eq!(scroll_top, f64::from(header_row));
         }
@@ -4135,7 +4150,7 @@ mod tests {
             let editor = rhs_editor(&review, cx);
 
             move_to_row_with_text(&editor, "three", cx);
-            cx.simulate_keystrokes("e");
+            cx.simulate_keystrokes("g space");
             cx.run_until_parked();
             workspace.update(cx, |workspace, cx| {
                 assert!(workspace.active_item_as::<ReviewView>(cx).is_none());

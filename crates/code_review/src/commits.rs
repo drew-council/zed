@@ -1058,7 +1058,7 @@ mod tests {
             }
         });
 
-        // The line cursor and file navigation work on historic buffers too.
+        // The cursor and file navigation work on historic buffers too.
         cx.focus(&review);
         cx.simulate_keystrokes("j");
         assert_eq!(cursor_line(&editor, cx), "fn b() {}");
@@ -1075,9 +1075,9 @@ mod tests {
             WORKTREE_LIB
         );
 
-        // `e` opens the working tree's file at the same row.
+        // `g space` opens the working tree's file at the same row.
         move_to_row_with_text(&editor, "fn b() {}", cx);
-        cx.simulate_keystrokes("e");
+        cx.simulate_keystrokes("g space");
         cx.run_until_parked();
         let opened = workspace.update(cx, |workspace, cx| {
             workspace.active_item_as::<Editor>(cx).unwrap()
@@ -1091,7 +1091,7 @@ mod tests {
         assert_eq!(cursor_point(&opened, cx).row, 1);
     }
 
-    /// `e` on a removed row of a snapshot shown unified opens the working tree's file at the
+    /// `g space` on a removed row of a snapshot shown unified opens the working tree's file at the
     /// removed row's line, as on the left side of a split diff (V1.F1).
     #[gpui::test]
     async fn test_open_file_at_a_removed_row_of_a_snapshot(cx: &mut TestAppContext) {
@@ -1112,7 +1112,7 @@ mod tests {
         cx.focus(&review);
         let row = move_to_row_with_text(&editor, "fn b() {}", cx);
         assert_eq!(row_text(&editor, row + 1, cx), "fn b() { 1 }");
-        cx.simulate_keystrokes("e");
+        cx.simulate_keystrokes("g space");
         cx.run_until_parked();
         let opened = workspace.update(cx, |workspace, cx| {
             workspace.active_item_as::<Editor>(cx).unwrap()

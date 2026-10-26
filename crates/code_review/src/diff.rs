@@ -22,10 +22,7 @@ use gpui::{
     AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
     WeakEntity,
 };
-use language::{
-    Anchor, Buffer, BufferId, BufferSnapshot, Capability, OffsetRangeExt as _, Point,
-    language_settings::SoftWrap,
-};
+use language::{Anchor, Buffer, BufferId, BufferSnapshot, Capability, OffsetRangeExt as _, Point};
 use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
@@ -245,16 +242,12 @@ impl ReviewDiff {
                 Some(Arc::new(ReviewHunkRenderer { view: view.clone() })),
                 cx,
             );
-            editor.rhs_editor().update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, _| {
                 editor.set_read_only(true);
                 editor.register_addon(ReviewAddon {
                     source: source.clone(),
                     view,
                 });
-                // Long lines scroll horizontally instead of wrapping, like tuicr. Without an
-                // override the first file's language settings would decide for the whole
-                // review. The left side copies this when it is created.
-                editor.set_soft_wrap_mode(SoftWrap::None, cx);
             });
             editor
         });

@@ -381,9 +381,6 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<gpui::Point<ScrollOffset>> {
         let (_, local) = autoscroll_request?;
-        if self.scroll_manager.forbid_horizontal_autoscroll {
-            return None;
-        }
         let em_advance = ScrollOffset::from(em_advance);
         let viewport_width = ScrollOffset::from(viewport_width);
         let scroll_width = ScrollOffset::from(scroll_width);

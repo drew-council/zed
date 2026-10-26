@@ -35,7 +35,9 @@ prefilled from the first `code_review` settings, reachable from the panel's "+" 
 Request picker"; since merged into the Start Review picker's Pull Requests section). Then GitHub
 stacks: stacked pull requests are one row per stack in the Start Review picker, which opens the
 stack's first pull request to review, and a pull request review in a stack shows the stack and
-steps up and down it (see "Stacked pull requests").
+steps up and down it (see "Stacked pull requests"). Then the user's bug findings on movement: the
+review tab dropped its own line cursor and keys for **Zed's own vim, unchanged**, on the read-only
+diff (see "Upstream vim in the review tab").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -61,8 +63,8 @@ untouched and equals upstream `main`. Review tabs exist for uncommitted changes,
 historic snapshot otherwise), and a GitHub pull request (checked out in place, Zed's way, or in a new
 `pr-N` worktree), opened from the `code_review::StartReview` picker or the direct actions
 `ReviewUncommitted` / `ReviewBranch { base }` / `ReviewCommits { commits }` / `OpenPullRequest {
-reference }`. Each tab has a
-tuicr-style line cursor and file navigation, an overview at the top that scrolls with the diff
+reference }`. Each tab has
+Zed's own vim cursor and motions, file navigation, an overview at the top that scrolls with the diff
 (branch base, or the commit messages; UX-1 slice A),
 per-file and per-hunk reviewed marks persisted in Zed's DB (reviewed files fold to their header,
 reviewed hunks are dimmed, marks stop counting while the diff content differs), and per-tab filters (include /
@@ -71,11 +73,11 @@ review panel shows the active review's file tree with progress, filters, path se
 menu, and below the tree the review's comments. Comments on lines and ranges of either side (`c`;
 old lines on the left side of a split diff or the removed rows of a unified one), files (`C`) and the
 whole review (`;c`) open vim editors in insert mode, render as markdown, have types, and are edited,
-deleted and navigated with `i`/`Enter`, `dd` and `]t`/`[t`/`m`/`M`; they are stored in Zed's DB per
+deleted and navigated with `i`/`Enter`, `dd` and `]t`/`[t`; they are stored in Zed's DB per
 review, follow the code while the review is open and are flagged outdated when their lines changed
 while it was closed or were deleted (current again once their text is back, e.g. after a stash
-pop). `y` copies the review as Markdown in tuicr's format, `Y` the comment at the cursor, visual `y`
-the selected lines. A GitHub client resolves a checkout's GitHub repository (a
+pop). `; y` copies the review as Markdown in tuicr's format, `; Y` the comment at the cursor, Copy
+Lines (menu, palette) the selected lines. A GitHub client resolves a checkout's GitHub repository (a
 fork's parent), lists and reads its pull requests, threads, reviews and commentable lines; the
 picker lists pull requests; a pull request review shows the description and review summaries in its
 top block, the existing review threads read-only below their lines (resolved, outdated and bot
@@ -123,7 +125,6 @@ What exists:
 | `crates/code_review/src/context_menu.rs` | UX-1 C: the review's right-click menu in both sides of the diff (`install` → `Editor::set_custom_context_menu`; entries filled right after the click: `menu_items` → `MenuItem`/`MenuEntry`, disabled entries with their reason); menu GPUI tests |
 | `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: the review's overview, a block above the diff's first file that scrolls with it (UX-1 slice A; `block_properties`, `is_empty`) — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, its stack (clickable), warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
 | `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Stacks section (one row per stack the search found pull requests of: `ListedStack`, `group_search_results`, `render_stack_row`), Pull Requests section (the GitHub search of `code_review.pull_request_search`, edited in place with `EditPullRequestSearch`, approved-by-you hidden, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action; `render_pull_request_row`, `pull_request_state`, `stack_member_label`. (The separate `pull_request_picker.rs` of the Review Pull Request picker was merged into this picker.) |
-| `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll; configures each side (UX-1 B: breakpoint/bookmark gutter hover off) |
 | `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the panel's and toolbar's read API (`panel_files`, `summary`, `single_file_position`, `draft_comment_count`, `shown_thread_count`), `submit_review`/`copy_review_as_markdown`; GPUI tests |
 | `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu (and the stack position with previous/next in a stacked pull request review), filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); UX-1 C: hover controls (a file row's reviewed checkbox, a comment row's edit/delete); GPUI tests |
 | `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only, `] s`/`[ s` for the stack) |
@@ -2107,6 +2108,39 @@ review. No upstream edits.
   the bottom, → skips a closed one and replaces the tab, `[ s`, the toolbar button). Not done: a
   live run in the app.
 
+**Upstream vim in the review tab (the user's bug findings, items 3 and 5)** — "general lag when
+scrolling around with j or k … you should remove any customization and mostly stick to the normal
+editor controls (keeping things read-only) instead of customizing to have this cross-bar
+highlight"; "ctrl+u seems to break if scrolling up to the top of the diff … you should use the
+upstream CORRECT implementation or no implementation at all"; then "set the buffer to read-only and
+otherwise, just use upstream vim binding stuff … i want the full vim motions so i can go over a
+symbol and do `gd`". Split view stays (upstream's works with a real cursor).
+
+- **Removed**: `line_cursor.rs` (hidden caret, the full-width row highlight repainted on both sides
+  on every cursor move, `h`/`l` horizontal scroll and `h` at the left edge focusing the panel),
+  `code_review::ScrollLeft`/`ScrollRight`, the keymap block that nulled vim's character and word
+  motions and made `v`/`ctrl-v` line-wise, the review's soft-wrap override (`SoftWrap::None`, for
+  `h`/`l`), and `show_file_start_at_cursor`: on every scroll that followed the cursor it scrolled
+  the cursor's file header back to the top when the cursor was on a file's first row (tuicr's
+  `gg`), a second scroll fighting vim's. Core patches #2 and #3 (only the line cursor used them)
+  are reverted: the editor's scroll files and `RowHighlightOptions` are upstream's again.
+- **Keys given back to vim** (they shadowed motions or operators): `e` (Open File at Cursor → Zed's
+  own `g space`, which the review captures for snapshots to open the working tree's file), `{`/`}`
+  (files: `[f`/`]f` stay), `m`/`M` (comments: `[t`/`]t` stay), `y`/`Y` (copy review / comment →
+  `; y` / `; Y`), visual `y` (Copy Lines: menu and palette), visual `i`/`a` (text objects).
+- **Kept**: insert/change/replace keys as review actions or no-ops (read-only diff), the review's
+  `]`/`[`/`;` sequences, `]c`/`[c` as the review's hunk navigation (Zed's `GoToHunk` doesn't skip
+  folded files and gets stuck on a reviewed file's header), `face_cursor` for a new left side,
+  `keep_scroll_at_start` (block heights at the very top; not a cursor follow).
+- **`ctrl-u` loop**: not reproduced in GPUI tests, neither before nor after (the old code passes the
+  new test too), so the cause isn't pinned down. All the review's own cursor and scroll code is gone; what
+  scrolls is upstream's.
+- Tests: `line_cursor.rs`'s tests removed with it; tests on `e`, `{`/`}`, `m`/`M`, `y`/`Y`, visual
+  `y`, the cursor highlight and `gg`'s header-at-top updated or dropped; new
+  `pull_request::test_half_page_scrolls_reach_both_ends` (`ctrl-u`/`ctrl-d` from end to end, view
+  and cursor moving one way, overview expanded and collapsed; `j` moves one row) and `yiw` through
+  vim in `test_copy_review_comment_and_lines`. 225 pass, 1 ignored. Not done: a live run.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -2460,34 +2494,38 @@ over `git rev-parse HEAD`).
 
 ### 2.5 Movement & keys (review tab)
 
-**Line cursor, not a character cursor** (tuicr feel). The user was emphatic: in the review tab you
-move line by line; there is no column.
+**Zed's own vim, unchanged, on a read-only diff** (the user, after using it: the tuicr-style line
+cursor and its custom movement lagged and broke `ctrl-u`; "just use upstream vim binding stuff …
+I want the full vim motions so I can go over a symbol and do `gd`"). This replaced the original
+line cursor (no caret, a full-width row highlight, `h`/`l` scrolling; see "Upstream vim in the
+review tab").
 
-- Visual: no caret, no char-level selection; the current line is a strong **full-width row highlight
-  incl. gutter**, mirrored on the other side in split view; visual mode highlights whole rows.
-- Under the hood: **Zed's real vim**; the column exists but is never shown (pinning it breaks `n`, §0). Counts, `{N}G`, `gg`/`G`,
-  `ctrl-d/u/f/b/e/y`, `zz/zt/zb`, `H/M/L`, `/` + `n`/`N` (lands on the row) all behave exactly as in
-  Zed. Character/word motions (`w b e f t 0 $ ^ …`) do nothing in the review tab.
-- `h`/`l` scroll the view horizontally (tuicr: 4 columns); `h` at the left edge focuses the panel.
-- `v` and `V` both start line-wise visual.
+- The caret, selections, visual modes (`v`, `V`, `ctrl-v`), every motion, text object, count,
+  search, `gd`/`gr`/`K`, yank (`y`, `yiw`, …), `h`/`l`, `{`/`}`, marks, `ctrl-d/u/f/b` and the
+  scroll keys are vim's. Soft wrap follows the language settings (`ToggleSoftWrap` switches both
+  sides together).
+- The review binds only keys that would edit the read-only diff, and two-key sequences on vim
+  prefixes: insert/change/replace keys become review actions or no-ops, `]`/`[` and `;` lead
+  review keys. `;` alone still repeats `f`/`t` after the keymap's pending-key timeout.
 
 | Keys | Action |
 |---|---|
-| `]f` / `[f`, `}` / `{` | next / previous file |
-| `]c` / `[c` | next / previous hunk (Zed vim default) |
-| `]t` / `[t`, `m` / `M` | next / previous comment thread (gives up vim marks in the review tab) |
+| `]f` / `[f` | next / previous file |
+| `]c` / `[c` | next / previous hunk (vim's keys; the review's action skips folded, reviewed files, where Zed's would get stuck on the header) |
+| `]t` / `[t` | next / previous comment thread |
 | `]u` / `[u` | next / previous unreviewed file |
+| `]s` / `[s` | next / previous pull request in the stack |
 | `c` (normal / visual) | comment on line / range |
 | `C` | file comment |
-| `;c` | review-level comment (tuicr leader `;`, dead with a line cursor) |
-| `i` / `Enter` | edit the comment at the cursor line |
+| `;c` | review-level comment |
+| `i` / `Enter` | edit the comment at the cursor line (else `Enter` is vim's) |
 | `dd` | delete comment at cursor (with confirmation) |
 | `r` | toggle file reviewed and advance to next file |
 | `R` | toggle hunk reviewed |
-| `e` | open file at cursor line in a normal editor |
-| `y` / `Y` / visual `y` | copy review as markdown / copy comment at cursor / copy selected source lines |
-| `;f` / `;e` / `;h` / `;l` | focus mode / toggle panel / focus panel / focus diff |
-| `a`, `o`, … | no-ops (would otherwise enter a useless insert mode on a read-only buffer) |
+| `g space` | open file at cursor line in a normal editor (Zed's key; a snapshot's file from the working tree) |
+| `;y` / `;Y` | copy review as markdown / copy comment at cursor (Copy Lines is in the menu and palette) |
+| `;f` / `;e` / `;h` / `;l` / `;s` | focus mode / toggle panel / focus panel / focus diff / submit |
+| `a`, `o`, `s`, … | no-ops (would otherwise enter a useless insert mode on a read-only buffer) |
 
 - **Old-side (deleted-line) comments:** unified view → `c` on deleted rows (they are real rows);
   split view → `ctrl-w h` to the left side, then `c`.
@@ -2578,7 +2616,6 @@ crates/code_review/
   src/commits.rs        # commit ranges: live (open_diff_since) or historic snapshot buffers; git helpers
   src/view.rs           # ReviewView: workspace Item wrapping a SplittableEditor (+ top block)
   src/top_block.rs      # fixed header above the diff: branch base / commit messages (M5/M7 extend it)
-  src/line_cursor.rs    # row highlight, companion mirroring, horizontal scroll
   src/comments/         # model, blocks, CommentEditor (vim child editor), focus/keys
   src/panel.rs          # ReviewPanel (dock): file tree, filters, comment list
   src/picker.rs         # StartReview picker (Local section; PR section in M7)
@@ -2644,27 +2681,22 @@ crates/code_review/
 - UX-1: the review's overview is a block at `Above(Anchor::Min)` on the right side, drawn across
   both sides by the split view (core patches #5 and #7, §3.10).
 
-### 3.4 Line cursor (§2.5)
+### 3.4 Cursor (§2.5)
 
-- Hide Zed's caret/selection painting: set `editor.show_local_selections = false` (public field,
-  `editor.rs:1013`) on both RHS and LHS editors. Vim keeps working; only painting stops.
-- Paint our own: `editor.highlight_rows::<ReviewCursorRow>(row, color_fn, RowHighlightOptions{
-  include_gutter: true, autoscroll: false, include_end_row: true})` (`editor.rs:9284-9362`; the last
-  field is core patch #3) on the cursor row; separate marker types for visual-range rows. Refresh on
-  `SelectionsChanged`. Keep `autoscroll: false` (else autoscroll
-  chases the highlight). Mirror onto the companion editor only when display rows match (spacer rows
-  can't be highlighted without a core change — skip).
-- ~~Column pinning~~: dropped in M2 — it breaks search repeat (`n`); see §0.
-- `v` → `vim::ToggleVisualLine` in the review contexts (normal + visual). Selection → row range via
-  `selections.newest_adjusted` + the `spanned_rows` rule (end column 0 excludes last row).
-- `h`/`l` → horizontal scroll actions; `h` at scroll-x 0 → focus panel. Needs core patch #2 (autoscroll
-  would snap x back on every `j`/`k`) and no soft wrap (the review turns it off by default).
-- Rebind `i`/`a`/`o` etc. (vim would enter insert mode on a read-only buffer).
-- Cursor never lands on custom blocks (`BlockSnapshot::clip_point`, `block_map.rs:2504-2558`) — good;
-  folded (reviewed) file headers *are* cursor stops (matches tuicr fork `a3ac1a3`).
-- Vim counts count buffer lines, not blocks (`vim/src/motion.rs:1537-1606`); `zz/zt/zb` count display
-  rows (correct visually). Known quirk to watch: vim `ctrl-d/u` may clip the cursor off-screen when the
-  scroll boundary lands inside a tall block (`vim/src/normal/scroll.rs:102-280`).
+- No cursor code of the review's own: each side is a plain read-only `Editor` with Zed's caret and
+  vim. Split view is upstream's `SplittableEditor`: `ctrl-w h/l` switch sides, the other side's
+  cursor follows to the facing row (`sync_cursor_to_other_side`), both sides scroll together. The
+  review only puts a new left side's cursor on the row facing the right side's (`face_cursor` in
+  `view.rs`: upstream leaves it at the end until the right side's cursor moves, and `ctrl-w h`
+  would jump there) and turns the gutter's breakpoint/bookmark hover off on each side
+  (`configure_side`; the review's "+" takes that place).
+- Rows of the newest selection, as the review's actions take them: `context_menu::selected_rows`
+  (`selections.newest_adjusted`; an end at column 0 excludes that row).
+- Cursor never lands on custom blocks (`BlockSnapshot::clip_point`, `block_map.rs:2504-2558`);
+  folded (reviewed) file headers *are* cursor stops.
+- Vim counts count buffer lines, not blocks (`vim/src/motion.rs:1537-1606`). Upstream's half-page
+  scroll leaves an off-screen cursor where it is (`newest_selection_on_screen`), so at the top of a
+  review whose overview fills the view, `ctrl-u` scrolls without moving the cursor.
 
 ### 3.5 Comment blocks & editors
 
@@ -2784,8 +2816,7 @@ change, so mismatched CLI/app versions don't break).
 | `crates/zed/src/zed/open_listener.rs` | review URL kind + routing (M8, +27: `OpenRequestKind::Review` + Debug arm, `parse`, the CLI request → `code_review::cli::handle_cli_review`) |
 | `crates/cli/src/main.rs` | `--review` flag (M8 + polish A, +58/−4: `mod review`, help example, the flag and its help and conflicts, `try_parse` (usage errors exit 1), link + path, the ping marker check, "Zed exited before the review finished") |
 | `crates/cli/src/review.rs` | new file (M8): the `--review` request and `check_exit` (95 lines + tests) |
-| `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs` | `Editor::set_forbid_horizontal_autoscroll` (core patch #2): a `ScrollManager` flag checked first in `autoscroll_horizontally`, so the review tab's `h`/`l` scroll survives `j`/`k` |
-| `crates/editor/src/editor.rs` | `RowHighlightOptions::include_end_row` (core patch #3, polish B, +9/−1): an opt-in field (default `false`, every existing caller unchanged) that keeps the row a highlight ends in when the range ends at column 0, so the line cursor on an empty row doesn't paint the spacers below it. Core patch #1 (`set_number_deleted_lines` → `pub` in `config.rs`) was reverted in polish B: `git diff v1.25.0-pre -- crates/editor/src/config.rs` is empty |
+| `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs`, `editor.rs` (`RowHighlightOptions`) | None any more: core patches #2 (`set_forbid_horizontal_autoscroll`) and #3 (`RowHighlightOptions::include_end_row`) went with the line cursor ("Upstream vim in the review tab"), #1 in polish B. `git diff v1.25.0-pre -- crates/editor/src/scroll.rs crates/editor/src/scroll/autoscroll.rs crates/editor/src/config.rs` is empty |
 | `crates/editor/src/display_map/block_map.rs` | Core patch #5 (UX-1, +14/−1): `Block::is_above_start` (a custom block at `BlockPlacement::Above(Anchor::Min)`) sorts right after the start comparison in `sort_blocks`, so it comes before the first buffer's header and a folded first buffer (`dedup_by` keeps both), and `balancing_block` keeps `Anchor::Min` for its spacer on the other side (else an excerpt anchor after that side's header). Upstream places no block there (only a test on a headerless singleton). Tests +127 (`test_block_above_multibuffer_start`) |
 | `crates/editor/src/split_editor_view.rs`, `element.rs` (`render_blocks`), `editor.rs` | Core patch #7 (UX-1, +149 in `split_editor_view.rs`, +13 in `element.rs`, +3 in `editor.rs`): `Editor::set_full_width_block(Option<CustomBlockId>)`. When that editor is the right side of a split diff, its `EditorElement` skips the block (and hands a focused-block record for it on), and `SplitBufferHeadersElement::build_full_width_block` renders it with the block's own render callback across the overlay's width, measures it there (`resize_blocks`, which resizes the left spacer too), paints it under the file headers, and keeps it rendered below the view while it holds the focus. Unsplit, nothing changes. Tests in `split.rs` +217 with #5's (`test_block_above_start_leads_both_sides`, `test_full_width_block_in_split_view`) |
 | `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 113-line new file, +38 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. Tests +141 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`) |

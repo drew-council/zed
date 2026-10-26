@@ -8,7 +8,6 @@ mod export;
 pub mod forge;
 mod gitattributes;
 mod github;
-mod line_cursor;
 mod panel;
 mod persistence;
 mod picker;
@@ -63,10 +62,6 @@ actions!(
         FocusDiff,
         /// Opens or closes the review panel.
         TogglePanel,
-        /// Scrolls the review diff left. At the left edge, focuses the review panel instead.
-        ScrollLeft,
-        /// Scrolls the review diff right.
-        ScrollRight,
         /// Moves to the first line of the next file in the review.
         NextFile,
         /// Moves to the first line of the previous file in the review.
@@ -909,7 +904,6 @@ mod tests {
                 "code_review::CycleCommentTypeBackward",
                 "code_review::CopyReviewAsMarkdown",
                 "code_review::CopyCommentAtCursor",
-                "code_review::CopySelectedLines",
             ] {
                 assert!(
                     vim_bindings

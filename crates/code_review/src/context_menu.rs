@@ -3,15 +3,16 @@ use crate::{
     CopySelectedLines, DeleteComment, EditComment, OpenFileAtCursor, ReviewView,
     ToggleFileReviewed, ToggleHunkReviewed,
     comments::{CommentTarget, ItemKey},
-    line_cursor::selected_rows,
 };
 use editor::{
     Bias, DisplayPoint, Editor, SelectionEffects,
     actions::{CopyPermalinkToLine, FindAllReferences, GoToDefinition},
+    display_map::DisplaySnapshot,
 };
 use git::repository::RepoPath;
 use gpui::{Action, ClipboardItem, Entity, Focusable as _, WeakEntity};
 use language::Point;
+use std::ops::RangeInclusive;
 use ui::{ContextMenu, ContextMenuEntry, ContextMenuItem, DocumentationSide, prelude::*};
 use util::ResultExt as _;
 use workspace::{Toast, notifications::NotificationId};
@@ -425,6 +426,17 @@ fn run(
             window.dispatch_action(action.boxed_clone(), cx);
         }
     }
+}
+
+/// The multibuffer rows spanned by the newest selection (whole lines in line-wise visual mode).
+pub(crate) fn selected_rows(editor: &Editor, snapshot: &DisplaySnapshot) -> RangeInclusive<u32> {
+    let selection = editor.selections.newest_adjusted(snapshot);
+    let start = selection.start.row;
+    let mut end = selection.end.row;
+    if end > start && selection.end.column == 0 {
+        end -= 1;
+    }
+    start..=end
 }
 
 #[cfg(test)]

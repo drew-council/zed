@@ -1,5 +1,5 @@
 use super::{CommentBlocks, CommentTarget, SelectedLines, Side, lines_in_rows};
-use crate::{AddComment, line_cursor::selected_rows};
+use crate::{AddComment, context_menu::selected_rows};
 use buffer_diff::DiffHunkStatusKind;
 use editor::{
     Bias, DisplayPoint, Editor, GutterRow, SelectionEffects, ToPoint as _, display_map::DisplayRow,
@@ -118,8 +118,8 @@ pub(super) fn line_number_column(
     Some(start..end)
 }
 
-/// A click on a line number moves the line cursor to its row (shift-click extends the selection
-/// to it), and dragging from it selects rows, as on GitHub. `e`, a header's Open File and the
+/// A click on a line number moves the cursor to its row (shift-click extends the selection
+/// to it), and dragging from it selects rows, as on GitHub. `g space`, a header's Open File and the
 /// review's context menu still open the file.
 fn select_from_line_number(
     editor: &Entity<Editor>,
@@ -346,7 +346,7 @@ fn selection_rows(editor: &Editor, cx: &App) -> SelectionRows {
     }
 }
 
-/// Shows a drag from a "+" as the side's selection (the line cursor paints it), once the editor
+/// Shows a drag from a "+" as the side's selection, once the editor
 /// that calls the renderer is drawn.
 fn follow_drag(
     editor: &Entity<Editor>,

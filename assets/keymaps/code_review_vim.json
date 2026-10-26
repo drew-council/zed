@@ -1,67 +1,17 @@
 [
   {
-    // The review editor has a line cursor: character and word motions do nothing.
-    "context": "CodeReview > Editor && mode == full && (vim_mode == normal || vim_mode == visual) && !menu",
-    "bindings": {
-      "v": "vim::ToggleVisualLine",
-      "ctrl-v": "vim::ToggleVisualLine",
-      "ctrl-q": "vim::ToggleVisualLine",
-      "h": "code_review::ScrollLeft",
-      "left": "code_review::ScrollLeft",
-      "l": "code_review::ScrollRight",
-      "right": "code_review::ScrollRight",
-      "w": null,
-      "shift-w": null,
-      "b": null,
-      "shift-b": null,
-      "e": null,
-      "shift-e": null,
-      "g e": null,
-      "g shift-e": null,
-      "f": null,
-      "shift-f": null,
-      "t": null,
-      "shift-t": null,
-      ";": null,
-      ",": null,
-      "^": null,
-      "$": null,
-      "|": null,
-      "home": null,
-      "end": null,
-      "g 0": null,
-      "g ^": null,
-      "g $": null,
-      "g home": null,
-      "g end": null,
-      "g shift-m": null,
-      "space": null,
-      "backspace": null,
-      "(": null,
-      ")": null,
-      "%": null,
-      "*": null,
-      "#": null,
-      "g *": null,
-      "g #": null,
-    },
-  },
-  {
     "context": "CodeReview > Editor && mode == full && vim_mode == normal && !menu",
     "bindings": {
       "] f": "code_review::NextFile",
       "[ f": "code_review::PreviousFile",
-      "}": "code_review::NextFile",
-      "{": "code_review::PreviousFile",
       "] u": "code_review::NextUnreviewedFile",
       "[ u": "code_review::PreviousUnreviewedFile",
-      "e": "code_review::OpenFileAtCursor",
       "; f": "code_review::ToggleSingleFileMode",
       "; e": "code_review::TogglePanel",
       "; h": "code_review::FocusPanel",
       "; l": "code_review::FocusDiff",
       // Nothing may enter insert mode on the read-only diff (comments rebind `i`, `c` and
-      // `shift-c` below).
+      // `shift-c` below). Motions, text objects and operators other than these stay vim's.
       "i": null,
       "a": null,
       "shift-i": null,
@@ -86,11 +36,7 @@
   {
     "context": "CodeReview > Editor && mode == full && vim_mode == visual && !menu",
     "bindings": {
-      "i": null,
-      "a": null,
       "c": "code_review::AddComment",
-      "y": "code_review::CopySelectedLines",
-      "shift-y": "code_review::CopySelectedLines",
       "s": null,
       "shift-s": null,
       "r": null,
@@ -103,8 +49,7 @@
   },
   {
     // Comments. After the block above: its `i` and `c` nulls rank lower, so these win, and a
-    // propagated `i` (no comment at the cursor) still doesn't reach vim's insert mode. `m` and
-    // `shift-m` give up vim's marks and `WindowMiddle` in the review.
+    // propagated `i` (no comment at the cursor) still doesn't reach vim's insert mode.
     "context": "CodeReview > Editor && mode == full && vim_mode == normal && !menu",
     "bindings": {
       "c": "code_review::AddComment",
@@ -114,11 +59,8 @@
       "enter": "code_review::EditComment",
       "] t": "code_review::NextComment",
       "[ t": "code_review::PreviousComment",
-      "m": "code_review::NextComment",
-      "shift-m": "code_review::PreviousComment",
-      // tuicr's export keys; vim's yank operator has nothing to yank in the review.
-      "y": "code_review::CopyReviewAsMarkdown",
-      "shift-y": "code_review::CopyCommentAtCursor",
+      "; y": "code_review::CopyReviewAsMarkdown",
+      "; shift-y": "code_review::CopyCommentAtCursor",
       "; s": "code_review::SubmitReview",
     },
   },

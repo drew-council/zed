@@ -2936,7 +2936,7 @@ pub(crate) mod tests {
             cx.simulate_keystrokes("[ t");
             assert_eq!(cursor_line(&rhs, cx), "filter 25");
 
-            // Threads are read-only: `i` opens nothing, `dd` refuses, `Y` copies the first
+            // Threads are read-only: `i` opens nothing, `dd` refuses, `; Y` copies the first
             // comment.
             cx.simulate_keystrokes("[ t [ t");
             assert_eq!(cursor_line(&rhs, cx), "ENGINE 134");
@@ -2946,7 +2946,7 @@ pub(crate) mod tests {
             cx.simulate_keystrokes("d d");
             assert_eq!(notification_count(&workspace, cx), 1);
             assert!(!has_open_comment_editor(&review, cx));
-            cx.simulate_keystrokes("shift-y");
+            cx.simulate_keystrokes("; shift-y");
             assert!(
                 cx.read_from_clipboard()
                     .and_then(|item| item.text())
@@ -3244,10 +3244,6 @@ pub(crate) mod tests {
                 splittable(&review, cx).read_with(cx, |editor, _| editor.focused_editor() == &lhs)
             );
             assert_eq!(cursor_line(&lhs, cx), "engine 193");
-            // The line cursor moved over with the focus.
-            let highlighted = crate::line_cursor::cursor_rows(&lhs, cx);
-            assert_eq!(highlighted.len(), 1, "{highlighted:?}");
-            assert_eq!(row_text(&lhs, highlighted[0].0, cx), "engine 193");
         }
 
         /// Restricted Mode: no git runs to check out a pull request (in place or in a new
@@ -3838,10 +3834,63 @@ pub(crate) mod tests {
             });
         }
 
+        /// Vim's half-page scrolls run to either end of a review with the overview above its
+        /// first file, expanded or collapsed, moving the view and the cursor one way only.
+        #[gpui::test]
+        async fn test_half_page_scrolls_reach_both_ends(cx: &mut TestAppContext) {
+            let (_fs, _workspace, review, _requests, cx) =
+                open_review(Fixture::default(), cx).await;
+            let rhs = rhs_editor(&review, cx);
+            let position = |cx: &mut VisualTestContext| {
+                draw(cx);
+                let scroll_top = rhs.update(cx, |editor, cx| editor.scroll_position(cx).y);
+                (scroll_top, cursor_point(&rhs, cx).row)
+            };
+            let last_row = rhs.update(cx, |editor, cx| {
+                editor.buffer().read(cx).snapshot(cx).max_point().row
+            });
+
+            for collapsed in [false, true] {
+                if collapsed {
+                    dispatch(crate::ToggleHeader, cx);
+                    cx.run_until_parked();
+                }
+                cx.simulate_keystrokes("shift-g");
+                let mut previous = position(cx);
+                assert!(previous.0 > 0., "{previous:?}");
+                for _ in 0..20 {
+                    cx.simulate_keystrokes("ctrl-u");
+                    let current = position(cx);
+                    assert!(
+                        current.0 <= previous.0 && current.1 <= previous.1,
+                        "ctrl-u went from {previous:?} to {current:?} (collapsed: {collapsed})"
+                    );
+                    previous = current;
+                }
+                assert_eq!(previous.0, 0., "collapsed: {collapsed}");
+
+                for _ in 0..20 {
+                    cx.simulate_keystrokes("ctrl-d");
+                    let current = position(cx);
+                    assert!(
+                        current.0 >= previous.0 && current.1 >= previous.1,
+                        "ctrl-d went from {previous:?} to {current:?} (collapsed: {collapsed})"
+                    );
+                    previous = current;
+                }
+                assert_eq!(previous.1, last_row, "collapsed: {collapsed}");
+            }
+
+            cx.simulate_keystrokes("g g");
+            for row in 1..=5 {
+                cx.simulate_keystrokes("j");
+                assert_eq!(cursor_point(&rhs, cx).row, row);
+            }
+        }
+
         /// The overview (the description, the reviews, the thread toggles, the review comments)
         /// is a block above the first file: it scrolls away with the diff like the rest of the
-        /// document, nothing in it scrolls on its own, it collapses to its header line, and
-        /// `g g` puts the first file's header at the top with the overview just above it (tuicr).
+        /// document, nothing in it scrolls on its own, and it collapses to its header line.
         #[gpui::test]
         async fn test_overview_scrolls_with_the_diff(cx: &mut TestAppContext) {
             use editor::display_map::BlockId;
@@ -3911,16 +3960,6 @@ pub(crate) mod tests {
             scroll_to(f64::from(overview_rows) - 2., cx);
             assert!(cx.debug_bounds("review-overview").is_some());
             assert!(!has_sticky_header(cx));
-
-            // `g g` from the end: the first file's header at the top.
-            cx.simulate_keystrokes("shift-g");
-            assert!(scroll_top(cx) > f64::from(overview_rows));
-            cx.simulate_keystrokes("g g");
-            assert_eq!(
-                path_at_cursor(&review, cx).as_deref(),
-                Some("docs/guide.md")
-            );
-            assert_eq!(scroll_top(cx), f64::from(overview_rows));
 
             // Its disclosure collapses it to the header line, which `; t`'s action expands.
             scroll_to(0., cx);

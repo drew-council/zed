@@ -4,6 +4,7 @@
     - you should not have to introduce ANY lag here. if you are, you should remove any customization and mostly stick to the normal editor controls (keeping things read-only) instead of customizing to have this cross-bar highlight. that was nice to have, but not worth any performance loss.
 - ctrl+u seems to break if scrolling up to the top of the diff
     - starts to loop down and count very strangely...
+    - might be addressed by generally fixing how you are handling keyboard inputs, you should use the upstream CORRECT implementation or no implementation at all. you cannot be trusted to do this correctly yourself.
 - issue links not rendered, stay as plain numbers. need to have a link so i can view them.
     - at some point, should ideally render into dropdown so i can view inline
-- "expand exerpt" and + buttons overlap, should not happen. both are frequently used.
+- "expand excerpt" and + buttons overlap, should not happen. both are frequently used.

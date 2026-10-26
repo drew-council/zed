@@ -219,7 +219,6 @@ fn highlight_run(
     let options = RowHighlightOptions {
         autoscroll: false,
         include_gutter: false,
-        ..RowHighlightOptions::default()
     };
     if is_deleted {
         editor.highlight_rows::<ReviewedHunkDeleted>(
@@ -293,7 +292,6 @@ mod tests {
     use project::FakeFs;
     use serde_json::json;
     use settings::DiffViewStyle;
-    use std::any::TypeId;
     use util::path;
 
     #[gpui::test]
@@ -683,24 +681,10 @@ mod tests {
         let editor = rhs_editor(&review, cx);
 
         // Both the deleted and the added rows of the hunk.
-        let row = move_to_row_with_text(&editor, "LINE 2", cx);
+        move_to_row_with_text(&editor, "LINE 2", cx);
         cx.simulate_keystrokes("shift-r");
         assert_eq!(row_texts(&editor, cx), ["line 2", "LINE 2"]);
         assert_eq!(cursor_line(&editor, cx), "LINE 2");
-        // The line cursor stays on top of the dimmed rows.
-        cx.update(|window, cx| {
-            editor.update(cx, |editor, cx| {
-                let highlights = editor.highlighted_display_rows(window, cx);
-                let cursor_highlight = highlights
-                    .values()
-                    .filter(|highlight| {
-                        highlight.type_id != Some(TypeId::of::<ReviewedHunkAdded>())
-                            && highlight.type_id != Some(TypeId::of::<ReviewedHunkDeleted>())
-                    })
-                    .count();
-                assert_eq!(cursor_highlight, 1, "row {row}");
-            })
-        });
 
         // The deleted row toggles it too; on a context row nothing happens but a toast.
         move_to_row_with_text(&editor, "line 2", cx);

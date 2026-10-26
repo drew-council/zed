@@ -6,9 +6,9 @@ use super::{
     view::{CommentView, EditingState, Leave},
 };
 use crate::{
+    context_menu::selected_rows,
     diff::{ReviewDiff, file_header_row, file_start_autoscroll, review_path_key},
     forge::LinesRefusal,
-    line_cursor::selected_rows,
     session::{ReviewSession, ReviewSessionEvent},
 };
 use buffer_diff::DiffHunkStatusKind;
@@ -576,35 +576,6 @@ impl CommentBlocks {
             {
                 return;
             }
-        }
-    }
-
-    /// After a scroll that follows the cursor (vim's `gg`, a reload of the diff) onto a file's
-    /// first row with the file's comments or threads above it, the file's header goes to the
-    /// top: the scroll only keeps the cursor's row in view, which leaves them under the sticky
-    /// header.
-    pub(crate) fn show_file_start_at_cursor(&self, cx: &mut App) {
-        for hosted in self.hosted.values() {
-            if hosted.placement.is_file
-                && let Some(editor) = hosted.editor.upgrade()
-                && editor.update(cx, |editor, cx| {
-                    show_file_start(editor, hosted.placement.row, cx)
-                })
-            {
-                return;
-            }
-        }
-        // The overview sits above the first file like its file blocks (tuicr's `gg`: the first
-        // file's header at the top, the overview just above it).
-        if self.overview_block.is_some() {
-            self.focused_diff_editor(cx).update(cx, |editor, cx| {
-                let first_row = editor
-                    .buffer()
-                    .read(cx)
-                    .snapshot(cx)
-                    .anchor_before(Point::zero());
-                show_file_start(editor, first_row, cx);
-            });
         }
     }
 
@@ -1196,7 +1167,7 @@ impl CommentBlocks {
         }
     }
 
-    /// Visual `y`: the text of the selected lines, of the side `c` would comment on, and how many
+    /// Copy Lines: the text of the selected lines, of the side `c` would comment on, and how many
     /// lines that is. Leaves visual mode on the selection's first row, like a yank.
     pub(crate) fn selected_text(
         &mut self,
@@ -2673,8 +2644,7 @@ fn block_properties(
         style: BlockStyle::Sticky,
         priority,
         render: Arc::new(move |cx: &mut BlockContext| {
-            // Opaque, so that a line cursor highlight reaching past an empty row doesn't show
-            // through.
+            // Opaque, so that a row highlight reaching past an empty row doesn't show through.
             div()
                 .w_full()
                 .pl(cx.margins.gutter.full_width())
@@ -2710,7 +2680,7 @@ fn facing_row(from: &Entity<Editor>, row: u32, to: &Entity<Editor>, cx: &mut App
     })
 }
 
-/// The lines `c` comments on (or visual `y` copies), on the side of the diff `editor` shows:
+/// The lines `c` comments on (or Copy Lines copies), on the side of the diff `editor` shows:
 /// `rows` (multibuffer rows), or the selection's ([`lines_in_rows`]).
 fn selected_lines(
     editor: &mut Editor,
@@ -3405,12 +3375,12 @@ mod tests {
             ("] t", "line 3", "a.rs"),
             ("] t", "line 36", "a.rs"),
             // File comments come first in their file.
-            ("m", "two", "modified.txt"),
+            ("] t", "two", "modified.txt"),
             ("] t", "three", "modified.txt"),
             // Wraps around; review-level comments aren't in the diff.
             ("] t", "line 3", "a.rs"),
             ("[ t", "three", "modified.txt"),
-            ("shift-m", "two", "modified.txt"),
+            ("[ t", "two", "modified.txt"),
             ("[ t", "line 36", "a.rs"),
         ] {
             cx.simulate_keystrokes(keys);
@@ -3460,12 +3430,7 @@ mod tests {
             diff.buffer_id_for(&review_path_key(&RepoPath::new("a.rs").unwrap()), cx)
                 .unwrap()
         });
-        for (start, keys, body) in [
-            ("new 1", "[ t", "line 36"),
-            ("new 1", "shift-m", "line 36"),
-            ("three", "] t ] t", "line 3"),
-            ("three", "m m", "line 3"),
-        ] {
+        for (start, keys, body) in [("new 1", "[ t", "line 36"), ("three", "] t ] t", "line 3")] {
             rhs.update(cx, |editor, cx| editor.fold_buffer(a_rs, cx));
             cx.run_until_parked();
             move_to_row_with_text(&rhs, start, cx);
@@ -4725,7 +4690,7 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        cx.simulate_keystrokes("y");
+        cx.simulate_keystrokes("; y");
         assert_eq!(clipboard(cx), "");
         for (row_text, keys, body, types) in [
             ("line 3", "c", "fix this\nplease", "tab"),
@@ -4743,7 +4708,7 @@ mod tests {
         }
 
         move_to_row_with_text(&rhs, "line 1", cx);
-        cx.simulate_keystrokes("y");
+        cx.simulate_keystrokes("; y");
         assert_eq!(
             clipboard(cx),
             "\
@@ -4766,10 +4731,10 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         assert_eq!(cursor_line(&rhs, cx), "line 2");
 
         move_to_row_with_text(&rhs, "line 3", cx);
-        cx.simulate_keystrokes("shift-y");
+        cx.simulate_keystrokes("; shift-y");
         assert_eq!(clipboard(cx), "fix this\nplease");
         move_to_row_with_text(&rhs, "line 5", cx);
-        cx.simulate_keystrokes("shift-y");
+        cx.simulate_keystrokes("; shift-y");
         assert_eq!(clipboard(cx), "fix this\nplease");
 
         // The export has what open comment editors say.
@@ -4785,28 +4750,34 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         cx.focus(&rhs);
         cx.run_until_parked();
         let before = clipboard(cx);
-        cx.simulate_keystrokes("shift-y");
+        cx.simulate_keystrokes("; shift-y");
         assert_eq!(clipboard(cx), before);
 
-        // Visual `y` copies the lines and leaves visual mode.
+        // Copy Lines copies the selected lines and leaves visual mode.
+        let copy_lines = |keys: &str, cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes(keys);
+            crate::test_support::dispatch(crate::CopySelectedLines, cx);
+            clipboard(cx)
+        };
         move_to_row_with_text(&rhs, "line 4", cx);
-        cx.simulate_keystrokes("v j y");
-        assert_eq!(clipboard(cx), "line 4\nline 5");
+        assert_eq!(copy_lines("shift-v j", cx), "line 4\nline 5");
         assert_back_in_diff(&rhs, cx);
         // Like vim's yank, it leaves the cursor at the selection's start.
         assert_eq!(cursor_line(&rhs, cx), "line 4");
         move_to_row_with_text(&rhs, "line 5", cx);
-        cx.simulate_keystrokes("shift-v k y");
-        assert_eq!(clipboard(cx), "line 4\nline 5");
+        assert_eq!(copy_lines("shift-v k", cx), "line 4\nline 5");
         assert_eq!(cursor_line(&rhs, cx), "line 4");
         // Over removed and added lines, the added lines (and unchanged ones) count.
         move_to_row_with_text(&rhs, "line 1", cx);
-        cx.simulate_keystrokes("shift-v j j y");
-        assert_eq!(clipboard(cx), "line 1\nLINE 2");
+        assert_eq!(copy_lines("shift-v j j", cx), "line 1\nLINE 2");
         assert_eq!(cursor_line(&rhs, cx), "line 1");
         move_to_row_with_text(&rhs, "gone 1", cx);
-        cx.simulate_keystrokes("v j y");
-        assert_eq!(clipboard(cx), "gone 1\ngone 2");
+        assert_eq!(copy_lines("shift-v j", cx), "gone 1\ngone 2");
+
+        // Vim's own yank works in the diff.
+        move_to_row_with_text(&rhs, "line 4", cx);
+        cx.simulate_keystrokes("y i w");
+        assert_eq!(clipboard(cx), "line");
     }
 
     #[gpui::test]
@@ -4993,7 +4964,7 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         assert_eq!(toasts(cx), 0);
     }
 
-    /// A click on a line number moves the line cursor there instead of opening the file (a
+    /// A click on a line number moves the cursor there instead of opening the file (a
     /// multibuffer's own behaviour); a drag from it selects rows, a shift-click extends the
     /// selection to it. Neither comments.
     #[gpui::test]
@@ -5022,7 +4993,7 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         let selection = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
             editor.update(cx, |editor, cx| {
                 let snapshot = editor.display_snapshot(cx);
-                crate::line_cursor::selected_rows(editor, &snapshot)
+                crate::context_menu::selected_rows(editor, &snapshot)
             })
         };
 
@@ -5116,7 +5087,7 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
             (old_lines("a.rs", 2..=2), "old".to_string(), None)
         );
 
-        // A click on a row's text puts the line cursor there.
+        // A click on a row's text puts the cursor there.
         let (plus, row) = cursor_plus_button(&rhs, false, cx);
         let line_1_row = display_row(&rhs, removed - 1, cx);
         let position = text_position(&rhs, line_1_row, plus, row, cx);
@@ -5124,16 +5095,9 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         cx.run_until_parked();
         assert_eq!(cursor_line(&rhs, cx), "line 1");
         assert_back_in_diff(&rhs, cx);
-        assert_eq!(
-            crate::line_cursor::cursor_rows(&rhs, cx)
-                .into_iter()
-                .map(|(row, _)| row)
-                .collect::<Vec<_>>(),
-            [removed - 1]
-        );
     }
 
-    /// Pressing a "+" and dragging over rows selects them (the line cursor paints them), and the
+    /// Pressing a "+" and dragging over rows selects them, and the
     /// release comments on them; a "+" in a selection comments on all of it, also on a
     /// selection made by shift-clicking; one outside it comments on its own row.
     #[gpui::test]
@@ -5143,10 +5107,11 @@ Comment types: ISSUE (problems to fix), PRAISE (positive feedback)
         let rhs = rhs_editor(&review, cx);
         let none = gpui::Modifiers::none();
         let painted_rows = |cx: &mut VisualTestContext| {
-            crate::line_cursor::cursor_rows(&rhs, cx)
-                .into_iter()
-                .map(|(row, _)| row_text(&rhs, row, cx))
-                .collect::<Vec<_>>()
+            let rows = rhs.update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                crate::context_menu::selected_rows(editor, &snapshot)
+            });
+            rows.map(|row| row_text(&rhs, row, cx)).collect::<Vec<_>>()
         };
 
         move_to_row_with_text(&rhs, "LINE 2", cx);

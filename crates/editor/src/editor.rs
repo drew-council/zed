@@ -1549,10 +1549,6 @@ impl SelectionHistory {
 pub struct RowHighlightOptions {
     pub autoscroll: bool,
     pub include_gutter: bool,
-    /// Highlights the row the range ends in even when the range ends at column 0, so a range
-    /// within an empty row highlights that row (instead of reaching into the next row and any
-    /// blocks before it).
-    pub include_end_row: bool,
 }
 
 impl Default for RowHighlightOptions {
@@ -1560,7 +1556,6 @@ impl Default for RowHighlightOptions {
         Self {
             autoscroll: Default::default(),
             include_gutter: true,
-            include_end_row: false,
         }
     }
 }
@@ -9496,10 +9491,7 @@ impl Editor {
                     let start = highlight.range.start.to_display_point(snapshot);
                     let end = highlight.range.end.to_display_point(snapshot);
                     let start_row = start.row().0.max(display_row_range.start.0);
-                    let mut end_row = if !highlight.range.end.is_max()
-                        && end.column() == 0
-                        && !highlight.options.include_end_row
-                    {
+                    let mut end_row = if !highlight.range.end.is_max() && end.column() == 0 {
                         end.row().0.saturating_sub(1)
                     } else {
                         end.row().0
