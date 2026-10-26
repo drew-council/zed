@@ -27,13 +27,24 @@ query SearchPullRequests($query: String!) {
   }
 }
 
+# Not in `PullRequestSummary`: GitHub works a pull request's review decision out from the base
+# branch's protection rules, and asking for it with the summaries made a search of 50 several
+# times slower (3 s instead of 0.75 s, measured live).
+query PullRequestReviewDecisions($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on PullRequest {
+      id
+      reviewDecision
+    }
+  }
+}
+
 fragment PullRequestSummary on PullRequest {
   id
   number
   title
   url
   state
-  reviewDecision
   isDraft
   isCrossRepository
   headRefName

@@ -41,7 +41,8 @@ diff (see "Upstream vim in the review tab"), and the gutter's "+" moved between 
 and the text, off the excerpts' expand buttons (see "Gutter buttons don't overlap"). Then issue
 references (`#123`, `owner/repo#123`, `GH-123`) in GitHub's text link to GitHub (see "GitHub
 references link"), and long lines wrap in the diff by default, on both sides (see "Long lines
-wrap").
+wrap"). Then the Start Review picker loads its pull requests about 3× faster and takes most of the
+window (see "Faster, bigger Start Review picker").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -2276,6 +2277,40 @@ line is off-screen and i can't actually see anything (no horizontal scroll eithe
   either side; scrolled back, `$` scrolls to the line's end on both sides and `0` back).
   `test_typing_in_a_comment_isnt_taken_by_review_keys` now expects the diff to wrap at first. All
   four new tests are red without the fix. 233 pass, 1 ignored; clippy clean. Not done: a live run.
+
+**Faster, bigger Start Review picker (the user's request after the bug findings)** — "loading pull
+requests takes a VERY long time. is there not a better way?"; "the view for the pulls selection is
+kinda small on screen … i care about width AND height being FAR too small".
+
+- **Cause** (measured live 2026-10-26 on `sheerhealth/sheer`, `review-requested:@me`, 34 hits, 8
+  stacks with 63 entries): `reviewDecision`. GitHub works it out per pull request from the base
+  branch's protection rules: the search took ~3 s with it and ~0.75 s without; `PullRequestStacks`
+  ~4–6 s with it and ~0.65 s without (no other field of the summary costs anything notable:
+  `latestOpinionatedReviews(first: 100)`, author, refs, `updatedAt` together ~0.5 s). The three
+  requests run one after the other, so the picker showed nothing for ~9–10 s.
+- **Fix**: `reviewDecision` left `PullRequestSummary` (searches and stacks come without it,
+  `review_decision: None`); a new `PullRequestReviewDecisions(ids)` (`nodes(ids:)`, in
+  `queries.graphql`: every GitHub has it) behind `Forge::review_decisions` fetches it for every
+  pull request listed (search hits and stack members) once the rows show, and
+  `SearchResults::set_review_decisions` fills the chips in. A failure is logged only (the rows
+  stay, without decision chips). A new search drops the pending request with the load task.
+  Measured live with `gh`: rows after ~2.7 s (search 1.2, stack ids 0.6, stacks 1.0), decision
+  chips ~5 s later. The review's own `PullRequestDetails` still asks for `reviewDecision` (one pull
+  request).
+- **Size**: the modal's wrapper had a fixed `w(rems(34.))`, which also kept Zed's picker resizing
+  from widening it. It's gone; the picker opens at 70% of the window's width (at least Zed's 34
+  rem) and up to 80% of its height (a plain picker shrinks to fit fewer rows), and its edges drag
+  as any Zed picker's, the size remembered per picker by Zed (`picker::persistence`). Not a
+  setting: Zed has no general picker size setting (only the file finder's `modal_max_width`).
+  A plain picker's opening width is also its minimum.
+- Tests: `github::test_review_decisions` (parsing, empty ids skipped, no request without ids; the
+  summary fragment has no `reviewDecision`), `picker::test_stacks_section` extended (the
+  decisions reach the rows and stack members; the request order), `picker::
+  test_picker_takes_most_of_the_window`; `github::test_pull_request_summaries` now expects no
+  decisions from a search. 235 pass, 1 ignored. Not done: a live run.
+- Possible next steps (not done): ask for the search hits' decisions while the stacks load
+  (chips ~3 s sooner), and keep the last results per search to show at once when the picker
+  reopens while they refresh.
 
 **Known issues / notes for the next slices:**
 

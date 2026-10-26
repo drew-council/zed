@@ -1087,8 +1087,6 @@ struct PullRequestSummaryNode {
     url: String,
     #[serde(default)]
     state: Option<String>,
-    #[serde(default)]
-    review_decision: Option<String>,
     is_draft: bool,
     is_cross_repository: bool,
     head_ref_name: String,
@@ -1102,6 +1100,16 @@ struct PullRequestSummaryNode {
 #[derive(Deserialize)]
 struct NodesData<N> {
     nodes: Vec<Option<N>>,
+}
+
+/// A node of `PullRequestReviewDecisions`: `{}` for an id that isn't a pull request's.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewDecisionNode {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    review_decision: Option<String>,
 }
 
 /// A node of `PullRequestStackIds`: `{}` for an id that isn't a pull request's.
@@ -1380,7 +1388,7 @@ fn summary(node: PullRequestSummaryNode, viewer: &str) -> PullRequestSummary {
             .and_then(|state| parse_pull_request_status(state).ok())
             .unwrap_or(PullRequestStatus::Open),
         is_draft: node.is_draft,
-        review_decision: parse_review_decision(node.review_decision.as_deref()),
+        review_decision: None,
         is_cross_repository: node.is_cross_repository,
         updated_at: node.updated_at,
         viewer_review,
@@ -1939,6 +1947,36 @@ impl GitHubClient {
             .into_iter()
             .flatten()
             .map(|node| stack(node, viewer))
+            .collect())
+    }
+
+    async fn review_decisions(
+        &self,
+        repo: &ForgeRepo,
+        node_ids: Vec<SharedString>,
+    ) -> Result<HashMap<SharedString, ReviewDecision>, GitHubError> {
+        let node_ids = node_ids
+            .into_iter()
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        if node_ids.is_empty() {
+            return Ok(HashMap::default());
+        }
+        let data: NodesData<ReviewDecisionNode> = self
+            .graphql(
+                "PullRequestReviewDecisions",
+                json!({ "ids": node_ids }),
+                &SharedString::from(repo.to_string()),
+            )
+            .await?;
+        Ok(data
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter_map(|node| {
+                let decision = parse_review_decision(node.review_decision.as_deref())?;
+                Some((SharedString::from(node.id), decision))
+            })
             .collect())
     }
 
@@ -2772,6 +2810,15 @@ impl Forge for GitHubForge {
         let repo = self.context.canonical.clone();
         let viewer = self.context.viewer.clone();
         async move { Ok(client.pull_request_stacks(&repo, &viewer, node_ids).await?) }.boxed()
+    }
+
+    fn review_decisions(
+        &self,
+        node_ids: Vec<SharedString>,
+    ) -> BoxFuture<'static, anyhow::Result<HashMap<SharedString, ReviewDecision>>> {
+        let client = self.client.clone();
+        let repo = self.context.canonical.clone();
+        async move { Ok(client.review_decisions(&repo, node_ids).await?) }.boxed()
     }
 
     fn pull_request_stack(
@@ -3824,7 +3871,6 @@ mod tests {
                     fixture(OPEN_PULL_REQUESTS)["data"]["repository"]["pullRequests"]["nodes"]
                         .clone();
                 nodes[0]["state"] = json!("MERGED");
-                nodes[0]["reviewDecision"] = json!("CHANGES_REQUESTED");
                 nodes[2]["state"] = json!("SOMETHING_NEW");
                 // Hits that aren't pull requests come back as `{}`.
                 if let Some(nodes) = nodes.as_array_mut() {
@@ -3873,15 +3919,67 @@ mod tests {
                 .map(|pull_request| (pull_request.status, pull_request.review_decision))
                 .collect::<Vec<_>>(),
             [
-                (
-                    PullRequestStatus::Merged,
-                    Some(ReviewDecision::ChangesRequested)
-                ),
+                (PullRequestStatus::Merged, None),
                 (PullRequestStatus::Open, None),
                 (PullRequestStatus::Open, None),
                 (PullRequestStatus::Open, None),
             ]
         );
+    }
+
+    #[test]
+    fn test_review_decisions() {
+        // GitHub is slow to work review decisions out, so summaries come without them.
+        let summary = &QUERIES[QUERIES.find("fragment PullRequestSummary").unwrap()..];
+        assert!(!summary[..summary.find("\n}").unwrap()].contains("reviewDecision"));
+        let (http, requests) = fake_github(|request| match request.operation() {
+            Some("PullRequestReviewDecisions") => Reply::json(
+                json!({ "data": { "nodes": [
+                    { "id": "PR_1", "reviewDecision": "APPROVED" },
+                    { "id": "PR_2", "reviewDecision": null },
+                    { "id": "PR_3", "reviewDecision": "CHANGES_REQUESTED" },
+                    { "id": "PR_4", "reviewDecision": "REVIEW_REQUIRED" },
+                    {},
+                    null,
+                ] } })
+                .to_string(),
+            ),
+            _ => Reply::status(500, "{}"),
+        });
+        let client = client(http);
+
+        let decisions = block_on(
+            client.review_decisions(
+                &sandbox(),
+                ["PR_1", "", "PR_2", "PR_3", "PR_4", "I_5", "PR_6"]
+                    .map(SharedString::from)
+                    .to_vec(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            decisions,
+            HashMap::from_iter([
+                ("PR_1".into(), ReviewDecision::Approved),
+                ("PR_3".into(), ReviewDecision::ChangesRequested),
+                ("PR_4".into(), ReviewDecision::ReviewRequired),
+            ])
+        );
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].variables()["ids"],
+            json!(["PR_1", "PR_2", "PR_3", "PR_4", "I_5", "PR_6"])
+        );
+        drop(sent);
+
+        // Nothing to ask for, no request.
+        assert!(
+            block_on(client.review_decisions(&sandbox(), Vec::new()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[test]

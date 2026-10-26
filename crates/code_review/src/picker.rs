@@ -12,6 +12,7 @@ use crate::{
     view::{ReviewView, active_repository, pick_base_for_new_review},
 };
 use anyhow::Context as _;
+use collections::HashMap;
 use fuzzy::StringMatchCandidate;
 use git::repository::CommitData;
 use gpui::{
@@ -129,9 +130,16 @@ impl StartReviewModal {
             settings.hide_approved_pull_requests,
             cx.focus_handle(),
         );
+        // Rows carry a stack's chain and several chips, so the picker takes most of the window
+        // (Zed's pickers can be dragged bigger, and remember it).
+        let viewport = window.viewport_size();
+        let width = Rems::from_pixels(viewport.width * 0.7, window);
+        let width = Rems(width.0.max(picker::DEFAULT_MODAL_WIDTH.0));
+        let height = Rems::from_pixels(viewport.height * 0.8, window);
         let picker = cx.new(|cx| {
             Picker::list(delegate, window, cx)
-                .initial_width(rems(34.))
+                .initial_width(width)
+                .max_height(height)
                 .show_scrollbar(true)
         });
         picker.update(cx, |picker, cx| {
@@ -223,7 +231,7 @@ impl Render for StartReviewModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("StartReview")
-            .w(rems(34.))
+            .debug_selector(|| "start-review-modal".into())
             .on_action(cx.listener(|this, _: &EditPullRequestSearch, window, cx| {
                 this.picker.update(cx, |picker, cx| {
                     if picker.delegate.is_editing_search() {
@@ -279,6 +287,18 @@ pub(crate) struct SearchResults {
     pub(crate) pull_requests: Vec<PullRequestSummary>,
     /// The stacks of the others, in the order of their first pull request found.
     pub(crate) stacks: Vec<ListedStack>,
+}
+
+impl SearchResults {
+    fn set_review_decisions(&mut self, decisions: &HashMap<SharedString, ReviewDecision>) {
+        let stacked = self
+            .stacks
+            .iter_mut()
+            .flat_map(|listed| &mut listed.stack.pull_requests);
+        for pull_request in self.pull_requests.iter_mut().chain(stacked) {
+            pull_request.review_decision = decisions.get(&pull_request.node_id).copied();
+        }
+    }
 }
 
 /// A stack the search found pull requests of. The whole stack is listed as one row, which opens
@@ -626,6 +646,16 @@ impl StartReviewDelegate {
                 anyhow::Ok((forge, found, stacks))
             }
             .await;
+            // The rows show first; their review decisions follow (GitHub is slow to work them
+            // out).
+            let decisions_request = result.as_ref().ok().map(|(forge, found, stacks)| {
+                let node_ids = found
+                    .iter()
+                    .chain(stacks.iter().flat_map(|stack| &stack.pull_requests))
+                    .map(|pull_request| pull_request.node_id.clone())
+                    .collect::<Vec<_>>();
+                forge.review_decisions(node_ids)
+            });
             picker
                 .update_in(cx, |picker, window, cx| {
                     let delegate = &mut picker.delegate;
@@ -651,6 +681,24 @@ impl StartReviewDelegate {
                         }
                     }
                     picker.refresh(window, cx);
+                })
+                .log_err();
+            let Some(decisions_request) = decisions_request else {
+                return;
+            };
+            let decisions = match cx.background_executor().spawn(decisions_request).await {
+                Ok(decisions) => decisions,
+                Err(error) => {
+                    log::warn!("loading the review decisions of pull requests: {error:#}");
+                    return;
+                }
+            };
+            picker
+                .update(cx, |picker, cx| {
+                    if let PullRequestList::Loaded(results) = &mut picker.delegate.pull_requests {
+                        results.set_review_decisions(&decisions);
+                        cx.notify();
+                    }
                 })
                 .log_err();
         });
@@ -2154,6 +2202,19 @@ mod tests {
                 ])] } })
                 .to_string(),
             ),
+            Some("PullRequestReviewDecisions") => {
+                let nodes = request.variables()["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|id| match id.as_str() {
+                        Some("PR_4") => json!({ "id": id, "reviewDecision": "CHANGES_REQUESTED" }),
+                        Some("PR_1") => json!({ "id": id, "reviewDecision": "APPROVED" }),
+                        _ => json!({ "id": id, "reviewDecision": null }),
+                    })
+                    .collect::<Vec<_>>();
+                Reply::json(json!({ "data": { "nodes": nodes } }).to_string())
+            }
             Some("PullRequestDetails") => match base_oid.lock().unwrap().as_deref() {
                 Some(base_oid) => Reply::json(PR1_DETAILS.replace(PR1_BASE_OID, base_oid)),
                 None => Reply::json(PR1_DETAILS),
@@ -2433,8 +2494,29 @@ mod tests {
     /// Stacked pull requests the search finds are one row per stack, in a section of their own,
     /// which reviews the stack's first pull request to review.
     #[gpui::test]
+    async fn test_picker_takes_most_of_the_window(cx: &mut TestAppContext) {
+        let (_fs, _workspace, _requests, cx) =
+            pull_request_fixture(Default::default(), Default::default(), false, cx).await;
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1000.)));
+        cx.run_until_parked();
+        dispatch(StartReview, cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let bounds = cx
+            .debug_bounds("start-review-modal")
+            .expect("the picker is drawn");
+        assert!(
+            bounds.size.width >= gpui::px(1600. * 0.69),
+            "{:?}",
+            bounds.size
+        );
+    }
+
+    #[gpui::test]
     async fn test_stacks_section(cx: &mut TestAppContext) {
-        let (_fs, workspace, _requests, cx) =
+        let (_fs, workspace, requests, cx) =
             pull_request_fixture(Default::default(), Default::default(), true, cx).await;
         dispatch(StartReview, cx);
         let picker = start_review_picker(&workspace, cx);
@@ -2469,7 +2551,41 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [5, 3, 1, 6]
             );
+            // The review decisions came after the rows, for every pull request listed.
+            let decisions = picker
+                .delegate
+                .loaded_pull_requests()
+                .iter()
+                .chain(&listed.stack.pull_requests)
+                .map(|pull_request| (pull_request.number, pull_request.review_decision))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                decisions,
+                [
+                    (4, Some(ReviewDecision::ChangesRequested)),
+                    (5, None),
+                    (3, None),
+                    (1, Some(ReviewDecision::Approved)),
+                    (6, None),
+                ]
+            );
         });
+        let operations = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request.operation().map(str::to_owned))
+            .filter(|operation| operation != "RepositoryContext")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            [
+                "SearchPullRequests",
+                "PullRequestStackIds",
+                "PullRequestStacks",
+                "PullRequestReviewDecisions",
+            ]
+        );
         assert_eq!(
             statuses(&picker, cx),
             ["1 pull request you approved is hidden"]

@@ -97,6 +97,7 @@ pub struct PullRequestSummary {
     pub base_ref: SharedString,
     pub status: PullRequestStatus,
     pub is_draft: bool,
+    /// `None` until [`Forge::review_decisions`] fills it in (searches and stacks leave it out).
     pub review_decision: Option<ReviewDecision>,
     /// Whether the head branch is in another repository (a fork).
     pub is_cross_repository: bool,
@@ -721,6 +722,13 @@ pub trait Forge: Send + Sync + 'static {
         &self,
         node_ids: Vec<SharedString>,
     ) -> BoxFuture<'static, Result<Vec<PullRequestStack>>>;
+
+    /// The review decisions of the pull requests with these [`PullRequestSummary::node_id`]s
+    /// (those without one left out). Summaries come without them: they are slow to work out.
+    fn review_decisions(
+        &self,
+        node_ids: Vec<SharedString>,
+    ) -> BoxFuture<'static, Result<HashMap<SharedString, ReviewDecision>>>;
 
     /// The stack pull request `number` is in, if any. Fails where the forge has no stacks.
     fn pull_request_stack(
