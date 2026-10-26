@@ -45,7 +45,8 @@ wrap"). Then the Start Review picker loads its pull requests about 3× faster an
 window (see "Faster, bigger Start Review picker"). Then `ctrl-u`/`ctrl-d` work over the diff's blocks
 (see "`ctrl-u`/`ctrl-d` over blocks"), and cursor movement was measured against Zed's own editors
 (see "Cursor movement speed"), and stepping through a stack shows the next pull request's tab at
-once (see "Stepping shows at once").
+once (see "Stepping shows at once"), and the Start Review picker reopens with its last pull requests
+while it refreshes them (see "Instant reopen").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -2313,9 +2314,8 @@ kinda small on screen … i care about width AND height being FAR too small".
   decisions reach the rows and stack members; the request order), `picker::
   test_picker_takes_most_of_the_window`; `github::test_pull_request_summaries` now expects no
   decisions from a search. 235 pass, 1 ignored. Not done: a live run.
-- Possible next steps (not done): ask for the search hits' decisions while the stacks load
-  (chips ~3 s sooner), and keep the last results per search to show at once when the picker
-  reopens while they refresh.
+- Possible next step (not done): ask for the search hits' decisions while the stacks load (chips
+  ~3 s sooner). Keeping the last results per search: done, see "Instant reopen".
 
 **`ctrl-u`/`ctrl-d` over blocks (the user's report after the picker)** — "ctrl+u is STILL BROKEN! …
 it still has cases where it starts to just switch between two adjacent lines or move DOWN LINE BY
@@ -2393,6 +2393,24 @@ independently and show when ready … decouple properly and keep things simple".
   action, before any request is answered, with its status drawn; #4's details failing shows the
   error, keeps #1's review, and closing the tab goes back to it; on success one tab is left. 237
   pass, 1 ignored. Not done: a live run.
+
+**Instant reopen (the user's request after "Faster, bigger Start Review picker")** — "the
+\"instant re-open\" sounds like a good idea, as long as you indicate refreshing status somehow".
+
+- `SearchResultsCache` (a global): the last `SearchResults` and hidden-approved count of each search,
+  by repository entity, search text and whether approved pull requests are hidden; written when a
+  search lands and again when its review decisions do. `load_pull_requests` (not while typing a
+  search, which keeps the shown results already) starts from the cached results when there are
+  some, else "Loading pull requests…"; the picker refreshes its rows right after opening so they
+  show in the first frame.
+- While a search runs over shown results (`searching` with `PullRequestList::Loaded`), the first
+  pull request header (Stacks, else Pull Requests) has a "Refreshing" `LoadingLabel` at its end
+  (`start-review-refreshing`). The fresh results replace the cached ones; a failure replaces them
+  with the error, as before.
+- Kept for Zed's session only (memory), not across restarts.
+- Test: `picker::test_reopening_shows_the_last_results_while_refreshing` (the reopened picker shows
+  the stack and the pull request before GitHub answers, with "Refreshing"; the second search
+  lands, the indicator goes). 238 pass, 1 ignored. Not done: a live run.
 
 **Known issues / notes for the next slices:**
 

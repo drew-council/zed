@@ -16,8 +16,8 @@ use collections::HashMap;
 use fuzzy::StringMatchCandidate;
 use git::repository::CommitData;
 use gpui::{
-    Action as _, AnyElement, DismissEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Subscription, Task, WeakEntity,
+    Action as _, AnyElement, DismissEvent, ElementId, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, FontWeight, Global, Subscription, Task, WeakEntity,
 };
 use picker::{Picker, PickerDelegate};
 use project::{Project, git_store::Repository};
@@ -25,8 +25,8 @@ use settings::Settings as _;
 use std::{sync::Arc, time::Duration};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
-    Chip, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, Tooltip,
-    prelude::*,
+    Chip, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, LoadingLabel,
+    Tooltip, prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
@@ -147,6 +147,8 @@ impl StartReviewModal {
             picker
                 .delegate
                 .load_pull_requests(search, false, window, cx);
+            // The last results of the search, if any, show at once.
+            picker.refresh(window, cx);
         });
         let picker_subscription =
             cx.subscribe(&picker, |_, _, _: &DismissEvent, cx| cx.emit(DismissEvent));
@@ -278,6 +280,13 @@ pub(crate) enum PullRequestList {
     /// The repository has no GitHub remote: the picker has no pull request section.
     Unsupported,
 }
+
+/// The last results of each search, by repository and whether approved pull requests are hidden:
+/// a picker opening again shows them at once while it searches again.
+#[derive(Default)]
+struct SearchResultsCache(HashMap<(EntityId, String, bool), (SearchResults, usize)>);
+
+impl Global for SearchResultsCache {}
 
 /// What a pull request search found, without the pull requests the viewer approved when those
 /// are hidden.
@@ -610,9 +619,18 @@ impl StartReviewDelegate {
         if matches!(self.pull_requests, PullRequestList::Unsupported) {
             return;
         }
+        let cache_key = (self.repo.entity_id(), search.clone(), self.hide_approved);
         if !debounce {
-            self.pull_requests = PullRequestList::Loading;
-            self.approved_hidden = 0;
+            let cached = cx
+                .try_global::<SearchResultsCache>()
+                .and_then(|cache| cache.0.get(&cache_key))
+                .cloned();
+            (self.pull_requests, self.approved_hidden) = match cached {
+                Some((results, approved_hidden)) => {
+                    (PullRequestList::Loaded(results), approved_hidden)
+                }
+                None => (PullRequestList::Loading, 0),
+            };
         }
         self.searching = true;
         let forge = match &self.forge {
@@ -665,6 +683,9 @@ impl StartReviewDelegate {
                             delegate.forge = Some(forge);
                             let (results, approved_hidden) =
                                 group_search_results(found, stacks, hide_approved);
+                            cx.default_global::<SearchResultsCache>()
+                                .0
+                                .insert(cache_key.clone(), (results.clone(), approved_hidden));
                             delegate.approved_hidden = approved_hidden;
                             delegate.pull_requests = PullRequestList::Loaded(results);
                         }
@@ -695,6 +716,13 @@ impl StartReviewDelegate {
             };
             picker
                 .update(cx, |picker, cx| {
+                    if let Some((cached, _)) = cx
+                        .default_global::<SearchResultsCache>()
+                        .0
+                        .get_mut(&cache_key)
+                    {
+                        cached.set_review_decisions(&decisions);
+                    }
                     if let PullRequestList::Loaded(results) = &mut picker.delegate.pull_requests {
                         results.set_review_decisions(&decisions);
                         cx.notify();
@@ -772,6 +800,29 @@ impl StartReviewDelegate {
         picker.set_query(&edit.query, window, cx);
         picker.refresh_placeholder(window, cx);
         picker.refresh(window, cx);
+    }
+
+    /// "Refreshing" on the first header of the pull requests while results already shown (the
+    /// last ones, or those of the search being typed) are searched again.
+    fn refreshing(&self, section: Section) -> Option<AnyElement> {
+        let PullRequestList::Loaded(results) = &self.pull_requests else {
+            return None;
+        };
+        let first_section = if results.stacks.is_empty() {
+            Section::PullRequests
+        } else {
+            Section::Stacks
+        };
+        (self.searching && section == first_section).then(|| {
+            div()
+                .debug_selector(|| "start-review-refreshing".into())
+                .child(
+                    LoadingLabel::new("Refreshing")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
+        })
     }
 
     pub(crate) fn pull_request_section_title(&self) -> SharedString {
@@ -1457,7 +1508,13 @@ impl PickerDelegate for StartReviewDelegate {
             Entry::Header(Section::Stacks) => Some(
                 div()
                     .pt_1()
-                    .child(ListSubHeader::new("Stacks").inset(true))
+                    .child(
+                        ListSubHeader::new("Stacks")
+                            .inset(true)
+                            .when_some(self.refreshing(Section::Stacks), |header, refreshing| {
+                                header.end_slot(refreshing)
+                            }),
+                    )
                     .into_any_element(),
             ),
             Entry::Stack { index, positions } => {
@@ -1466,7 +1523,14 @@ impl PickerDelegate for StartReviewDelegate {
             Entry::Header(Section::PullRequests) => Some(
                 div()
                     .pt_1()
-                    .child(ListSubHeader::new(self.pull_request_section_title()).inset(true))
+                    .child(
+                        ListSubHeader::new(self.pull_request_section_title())
+                            .inset(true)
+                            .when_some(
+                                self.refreshing(Section::PullRequests),
+                                |header, refreshing| header.end_slot(refreshing),
+                            ),
+                    )
                     .into_any_element(),
             ),
             Entry::Header(Section::Commits) => Some(
@@ -2512,6 +2576,55 @@ mod tests {
             "{:?}",
             bounds.size
         );
+    }
+
+    #[gpui::test]
+    async fn test_reopening_shows_the_last_results_while_refreshing(cx: &mut TestAppContext) {
+        let (_fs, workspace, requests, cx) =
+            pull_request_fixture(Default::default(), Default::default(), true, cx).await;
+        let searches = |requests: &crate::github::test_support::SentRequests| {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.operation() == Some("SearchPullRequests"))
+                .count()
+        };
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+        };
+        // The recent commits load on their own, from git.
+        let pull_request_keys = |picker: &Entity<Picker<StartReviewDelegate>>,
+                                 cx: &mut VisualTestContext| {
+            entry_keys(picker, cx)
+                .into_iter()
+                .flatten()
+                .filter(|key| matches!(key, EntryKey::Stack(_) | EntryKey::PullRequest(_)))
+                .collect::<Vec<_>>()
+        };
+        dispatch(StartReview, cx);
+        let picker = start_review_picker(&workspace, cx);
+        let loaded = pull_request_keys(&picker, cx);
+        assert_eq!(loaded, [EntryKey::Stack(7), EntryKey::PullRequest(4)]);
+        draw(cx);
+        assert!(cx.debug_bounds("start-review-refreshing").is_none());
+        dispatch(menu::Cancel, cx);
+        assert_eq!(searches(&requests), 1);
+
+        // Opened again, the last results show before GitHub answers, marked as refreshing.
+        cx.update(|window, cx| window.dispatch_action(Box::new(StartReview), cx));
+        let picker = start_review_picker(&workspace, cx);
+        assert_eq!(pull_request_keys(&picker, cx), loaded);
+        draw(cx);
+        assert!(cx.debug_bounds("start-review-refreshing").is_some());
+        cx.run_until_parked();
+        assert_eq!(searches(&requests), 2);
+        assert_eq!(pull_request_keys(&picker, cx), loaded);
+        draw(cx);
+        assert!(cx.debug_bounds("start-review-refreshing").is_none());
     }
 
     #[gpui::test]
