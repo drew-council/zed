@@ -46,7 +46,8 @@ window (see "Faster, bigger Start Review picker"). Then `ctrl-u`/`ctrl-d` work o
 (see "`ctrl-u`/`ctrl-d` over blocks"), and cursor movement was measured against Zed's own editors
 (see "Cursor movement speed"), and stepping through a stack shows the next pull request's tab at
 once (see "Stepping shows at once"), and the Start Review picker reopens with its last pull requests
-while it refreshes them (see "Instant reopen").
+while it refreshes them (see "Instant reopen"). Then the overview stopped multiplying over folded
+files (see "The overview is one block").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -2412,6 +2413,24 @@ independently and show when ready … decouple properly and keep things simple".
   the stack and the pull request before GitHub answers, with "Refreshing"; the second search
   lands, the indicator goes). 238 pass, 1 ignored. Not done: a live run.
 
+**The overview is one block (the user's report)** — a screenshot of a pull request review with the
+overview (header, stack, description, toggles) repeated eight times down the view, nothing else
+in sight; "6/7 reviewed".
+
+- **Cause** (Zed's block map with core patch #5): reviewed files fold to a `FoldedBuffer` block,
+  which replaces the file's rows. An edit landing within it (any re-sync of those rows) is
+  extended to the start of the replaced rows, but only after the transforms ahead of the edit's
+  original start were preserved, the overview among them (it takes no input rows and sits right
+  above the first file); the extended edit then rebuilt the overview as well: one more copy per
+  such edit. A folded first file is the common case after `r`. Copies are blocks the editor lays
+  out every frame, which also made everything slower.
+- **Fix**: the extension happens before anything is preserved (§3.10, core patch #5).
+- Tests: `block_map::test_block_above_multibuffer_start` (an edit within a folded first buffer:
+  one start block; it failed with two); `pull_request::test_overview_stays_one_block` (unified and
+  split: resizes, `G`/`gg`/`ctrl-d`/`ctrl-u`, reload, wrap and split toggles, reviewing the first
+  files; split failed at once with a folded first file). The editor's block map tests (20, with
+  the randomized ones) pass.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -3100,7 +3119,7 @@ change, so mismatched CLI/app versions don't break).
 | `crates/cli/src/review.rs` | new file (M8): the `--review` request and `check_exit` (95 lines + tests) |
 | `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs`, `editor.rs` (`RowHighlightOptions`) | None any more: core patches #2 (`set_forbid_horizontal_autoscroll`) and #3 (`RowHighlightOptions::include_end_row`) went with the line cursor ("Upstream vim in the review tab"), #1 in polish B. `git diff v1.25.0-pre -- crates/editor/src/scroll.rs crates/editor/src/scroll/autoscroll.rs crates/editor/src/config.rs` is empty |
 | `crates/editor/src/scroll.rs`, `crates/vim/src/normal/scroll.rs`, `crates/vim/src/motion.rs` | Core patch #8 ("`ctrl-u`/`ctrl-d` over blocks", +11/−1 in `scroll.rs`, +27/−1 in vim's `scroll.rs`, +9/−3 in `motion.rs`): `SharedScrollAnchor::scroll_top_display_point` returns the view's real top row (the anchor's row moved by the offset, `floor(scroll_position.y)`; the anchor's own point when that's its row, so nothing changes without tall blocks); vim's half-page/line scroll leaves a block row for the cursor the way the view scrolled (`Bias::Right` down, `Left` up), taking the other way only when that stays on screen and still goes with the scroll; `window_bottom` (`L`) adds only the offset's fraction. Tests in `code_review` (`test_half_page_scrolls_go_one_way`, `…_in_split_view`); vim's 577 and editor's scroll/split tests pass |
-| `crates/editor/src/display_map/block_map.rs` | Core patch #5 (UX-1, +14/−1): `Block::is_above_start` (a custom block at `BlockPlacement::Above(Anchor::Min)`) sorts right after the start comparison in `sort_blocks`, so it comes before the first buffer's header and a folded first buffer (`dedup_by` keeps both), and `balancing_block` keeps `Anchor::Min` for its spacer on the other side (else an excerpt anchor after that side's header). Upstream places no block there (only a test on a headerless singleton). Tests +127 (`test_block_above_multibuffer_start`) |
+| `crates/editor/src/display_map/block_map.rs` | Core patch #5 (UX-1, +14/−1): `Block::is_above_start` (a custom block at `BlockPlacement::Above(Anchor::Min)`) sorts right after the start comparison in `sort_blocks`, so it comes before the first buffer's header and a folded first buffer (`dedup_by` keeps both), and `balancing_block` keeps `Anchor::Min` for its spacer on the other side (else an excerpt anchor after that side's header). Upstream places no block there (only a test on a headerless singleton). Tests +127 (`test_block_above_multibuffer_start`). "The overview is one block" (+14): `sync` extends an edit landing within a replacement block (a folded buffer) to the start of the replaced rows *before* preserving the transforms ahead of it, so the zero-row blocks right above (the overview) are rebuilt once instead of preserved and rebuilt; the test checks an edit within a folded first buffer |
 | `crates/editor/src/split_editor_view.rs`, `element.rs` (`render_blocks`), `editor.rs` | Core patch #7 (UX-1, +149 in `split_editor_view.rs`, +13 in `element.rs`, +3 in `editor.rs`): `Editor::set_full_width_block(Option<CustomBlockId>)`. When that editor is the right side of a split diff, its `EditorElement` skips the block (and hands a focused-block record for it on), and `SplitBufferHeadersElement::build_full_width_block` renders it with the block's own render callback across the overlay's width, measures it there (`resize_blocks`, which resizes the left spacer too), paints it under the file headers, and keeps it rendered below the view while it holds the focus. Unsplit, nothing changes. Tests in `split.rs` +217 with #5's (`test_block_above_start_leads_both_sides`, `test_full_width_block_in_split_view`) |
 | `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 119-line new file, +48 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. "Gutter buttons don't overlap" added `GutterRow::right_padding` (+6 in `gutter_row.rs`, +10 in `element.rs`): the gutter's right padding, between the line numbers and the text, as x offsets from the element's origin (`prepaint_button` draws it after the git strip), where the review puts its "+". Tests +152 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`, which also checks `right_padding`) |
 | `assets/keymaps/code_review*.json` | new files |

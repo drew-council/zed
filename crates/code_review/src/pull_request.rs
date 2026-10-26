@@ -4030,6 +4030,71 @@ pub(crate) mod tests {
             });
         }
 
+        /// The overview is one block whatever happens to the diff: resizes, scrolling, reloads,
+        /// wrap and split toggles, and reviewed files folding at the start of the diff (a folded
+        /// first file used to get another copy of the overview each time it was rebuilt).
+        #[gpui::test]
+        async fn test_overview_stays_one_block(cx: &mut TestAppContext) {
+            for split in [false, true] {
+                let mut test_cx = cx.clone();
+                let (_fs, _workspace, review, _requests, cx) = open_review(
+                    Fixture {
+                        split,
+                        ..Fixture::default()
+                    },
+                    &mut test_cx,
+                )
+                .await;
+                let overview = review
+                    .read_with(cx, |review, _| review.top_block_id())
+                    .expect("the overview has a block");
+                let count = |cx: &mut VisualTestContext| {
+                    let rhs = rhs_editor(&review, cx);
+                    draw(cx);
+                    rhs.update(cx, |editor, cx| {
+                        let snapshot = editor.display_snapshot(cx);
+                        snapshot
+                            .blocks_in_range(
+                                editor::display_map::DisplayRow(0)
+                                    ..editor::display_map::DisplayRow(
+                                        snapshot.max_point().row().0 + 1,
+                                    ),
+                            )
+                            .filter(|(_, block)| {
+                                block.id() == editor::display_map::BlockId::Custom(overview)
+                            })
+                            .count()
+                    })
+                };
+                assert_eq!(count(cx), 1, "split {split}: opened");
+                for (width, height) in [(700., 500.), (1600., 1000.), (900., 700.), (1600., 1000.)]
+                {
+                    cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(height)));
+                    cx.run_until_parked();
+                    assert_eq!(count(cx), 1, "split {split}: {width}x{height}");
+                }
+                cx.simulate_keystrokes("shift-g g g ctrl-d ctrl-d ctrl-u ctrl-u");
+                assert_eq!(count(cx), 1, "split {split}: scrolled");
+                dispatch(crate::ReloadPullRequest, cx);
+                assert_eq!(count(cx), 1, "split {split}: reloaded");
+                dispatch(editor::actions::ToggleSoftWrap, cx);
+                dispatch(editor::actions::ToggleSoftWrap, cx);
+                assert_eq!(count(cx), 1, "split {split}: wrap toggled");
+                dispatch(editor::ToggleSplitDiff, cx);
+                dispatch(editor::ToggleSplitDiff, cx);
+                assert_eq!(count(cx), 1, "split {split}: split toggled");
+
+                // Reviewed files fold to their header, the first ones too.
+                let rhs = rhs_editor(&review, cx);
+                for reviewed in 1..=3 {
+                    cx.focus(&rhs);
+                    cx.simulate_keystrokes("g g r");
+                    cx.run_until_parked();
+                    assert_eq!(count(cx), 1, "split {split}: {reviewed} files reviewed");
+                }
+            }
+        }
+
         /// `ctrl-u` and `ctrl-d` from all over a review with tall blocks (the overview, file
         /// headers, comments) move the view and the cursor one way only, until the cursor reaches
         /// the diff's first or last row. Zed's scroll top used to be the scroll anchor's row even

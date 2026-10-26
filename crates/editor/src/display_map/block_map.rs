@@ -943,6 +943,23 @@ impl BlockMap {
             let mut old_start = edit.old.start;
             let mut new_start = edit.new.start;
 
+            // An edit within a block that replaces lines starts at the start of the replaced
+            // lines (see below), before anything is preserved: the blocks right above them take
+            // no input rows and are rebuilt with them, so preserving them too would add copies.
+            let mut replacement = transforms.cursor::<WrapRow>(());
+            replacement.seek(&old_start, Bias::Right);
+            if let Some(transform) = replacement.item()
+                && transform
+                    .block
+                    .as_ref()
+                    .is_some_and(|block| block.is_replacement())
+                && *replacement.start() < old_start
+            {
+                let rows_before_edit = old_start - *replacement.start();
+                old_start -= rows_before_edit;
+                new_start -= rows_before_edit;
+            }
+
             // Only preserve transforms that:
             // * Strictly precedes this edit
             // * Isomorphic transforms that end *at* the start of the edit
@@ -5916,6 +5933,19 @@ mod tests {
             [(0, "start"), (3, "folded"), (5, "header")]
         );
         assert!(snapshot.sticky_header_excerpt(1.).is_none());
+        // An edit within the folded buffer rebuilds it from its start, the block above it once.
+        let snapshot = block_map.read(
+            wrap_snapshot.clone(),
+            Patch::new(vec![text::Edit {
+                old: WrapRow(1)..WrapRow(2),
+                new: WrapRow(1)..WrapRow(2),
+            }]),
+            None,
+        );
+        assert_eq!(
+            describe(&snapshot),
+            [(0, "start"), (3, "folded"), (5, "header")]
+        );
 
         let mut writer = block_map.write(wrap_snapshot.clone(), Patch::default(), None);
         buffer.read_with(cx, |buffer, cx| {
