@@ -1225,6 +1225,8 @@ pub struct Editor {
     pub(crate) hovered_gutter_row: Option<DisplayRow>,
     pub(crate) gutter_row_drag: Option<gutter_row::GutterRowDrag>,
     pub(crate) line_number_click: Option<LineNumberClick>,
+    /// See [`Editor::set_file_header_path_first`].
+    pub(crate) file_header_path_first: bool,
     /// See [`Editor::set_full_width_block`].
     pub(crate) full_width_block: Option<CustomBlockId>,
 }
@@ -2613,6 +2615,7 @@ impl Editor {
             hovered_gutter_row: None,
             gutter_row_drag: None,
             line_number_click: None,
+            file_header_path_first: false,
             full_width_block: None,
         };
 

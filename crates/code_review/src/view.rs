@@ -2493,11 +2493,13 @@ impl ReviewView {
 impl EventEmitter<EditorEvent> for ReviewView {}
 
 /// Sets up a side of the review's diff (the left side on every split). The review's comment
-/// button takes the place of the gutter's hover button for breakpoints and bookmarks.
+/// button takes the place of the gutter's hover button for breakpoints and bookmarks, and file
+/// headers read as paths: directory, then name.
 fn configure_side(editor: &Entity<Editor>, cx: &mut App) {
     editor.update(cx, |editor, cx| {
         editor.set_show_breakpoints(false, cx);
         editor.set_show_bookmarks(false, cx);
+        editor.set_file_header_path_first(true, cx);
     });
 }
 
@@ -4145,6 +4147,28 @@ mod tests {
                 ]
             );
             cx.update(|window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
+        }
+
+        /// File headers show the directory before the file's name, on both sides, the left side
+        /// recreated by a split too.
+        #[gpui::test]
+        async fn test_file_headers_read_as_paths(cx: &mut TestAppContext) {
+            init_vim_test(cx, DiffViewStyle::Split);
+            let (_fs, _workspace, review, cx) = open_review_fixture(cx).await;
+            let path_first = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+                editor.read_with(cx, |editor, _| editor.file_header_path_first())
+            };
+            assert!(path_first(&rhs_editor(&review, cx), cx));
+            assert!(path_first(&lhs_editor(&review, cx), cx));
+            let rhs = rhs_editor(&review, cx);
+            for _ in 0..2 {
+                cx.update(|window, cx| {
+                    rhs.focus_handle(cx)
+                        .dispatch_action(&editor::ToggleSplitDiff, window, cx)
+                });
+                cx.run_until_parked();
+            }
+            assert!(path_first(&lhs_editor(&review, cx), cx));
         }
 
         #[gpui::test]

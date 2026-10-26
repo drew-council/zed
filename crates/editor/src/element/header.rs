@@ -624,6 +624,19 @@ pub(crate) fn header_jump_data(
     }
 }
 
+impl Editor {
+    /// Shows a file header's directory before the file's name, as a path reads, instead of
+    /// after it.
+    pub fn set_file_header_path_first(&mut self, path_first: bool, cx: &mut Context<Self>) {
+        self.file_header_path_first = path_first;
+        cx.notify();
+    }
+
+    pub fn file_header_path_first(&self) -> bool {
+        self.file_header_path_first
+    }
+}
+
 pub(crate) fn render_buffer_header(
     editor: &Entity<Editor>,
     for_excerpt: &ExcerptBoundaryInfo,
@@ -693,6 +706,7 @@ pub(crate) fn render_buffer_header(
     } else {
         (None, None)
     };
+    let path_first = editor_read.file_header_path_first;
     let focus_handle = editor_read.focus_handle(cx);
     let colors = cx.theme().colors();
     // On transparent windows, only render an opaque `editor_subheader_background` so it masks
@@ -843,7 +857,19 @@ pub(crate) fn render_buffer_header(
                                     _ => filename.as_str().to_string(),
                                 };
 
+                                let parent_label = |path: String| {
+                                    Label::new(path).buffer_font(cx).truncate_start().color(
+                                        if file_status.is_some_and(FileStatus::is_deleted) {
+                                            Color::Custom(colors.text_disabled)
+                                        } else {
+                                            Color::Custom(colors.text_muted)
+                                        },
+                                    )
+                                };
                                 path_header
+                                    .when(path_first, |then| {
+                                        then.children(parent_path.clone().map(parent_label))
+                                    })
                                     .child(
                                         ButtonLike::new("filename-button")
                                             .when(ItemSettings::get_global(cx).file_icons, |this| {
@@ -885,21 +911,8 @@ pub(crate) fn render_buffer_header(
                                                 }
                                             })),
                                     )
-                                    .when_some(parent_path, |then, path| {
-                                        then.child(
-                                            Label::new(path)
-                                                .buffer_font(cx)
-                                                .truncate_start()
-                                                .color(
-                                                    if file_status
-                                                        .is_some_and(FileStatus::is_deleted)
-                                                    {
-                                                        Color::Custom(colors.text_disabled)
-                                                    } else {
-                                                        Color::Custom(colors.text_muted)
-                                                    },
-                                                ),
-                                        )
+                                    .when(!path_first, |then| {
+                                        then.children(parent_path.map(parent_label))
                                     })
                                     .when(!buffer.capability.editable(), |el| {
                                         el.child(Icon::new(IconName::FileLock).color(Color::Muted))
