@@ -1,11 +1,12 @@
 use crate::{
     AddComment, AddFileComment, AddReviewComment, ChangeBase, CopyCommentAtCursor,
     CopyReviewAsMarkdown, CopySelectedLines, DeleteComment, EditComment, FocusDiff, FocusPanel,
-    NextComment, NextFile, NextHunk, NextUnreviewedFile, OpenFileAtCursor,
-    OpenPullRequestInBrowser, PreviousComment, PreviousFile, PreviousHunk, PreviousUnreviewedFile,
-    ReloadPullRequest, ReviewBranch, ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft,
-    ScrollRight, SubmitReview, ToggleBotReviews, ToggleFileReviewed, ToggleHeader,
-    ToggleHunkReviewed, ToggleOutdatedThreads, ToggleResolvedThreads, ToggleSingleFileMode,
+    NextComment, NextFile, NextHunk, NextPullRequestInStack, NextUnreviewedFile, OpenFileAtCursor,
+    OpenPullRequestInBrowser, PreviousComment, PreviousFile, PreviousHunk,
+    PreviousPullRequestInStack, PreviousUnreviewedFile, ReloadPullRequest, ReviewBranch,
+    ReviewCommits, ReviewPanel, ReviewUncommitted, ScrollLeft, ScrollRight, SubmitReview,
+    ToggleBotReviews, ToggleFileReviewed, ToggleHeader, ToggleHunkReviewed, ToggleOutdatedThreads,
+    ToggleResolvedThreads, ToggleSingleFileMode,
     comments::{
         CommentBlocks, CommentBlocksEvent, CommentId, CommentTarget, CommentType, ItemKey,
         RemoteItem, RemoteKey, RemoteThreadContent, Side, keep_scroll_at_start, open_web_link,
@@ -18,12 +19,13 @@ use crate::{
     context_menu,
     diff::{ReviewDiff, ReviewDiffEvent, review_path_key},
     export::{self, ExportPreamble},
+    forge::StackDirection,
     gitattributes::{FileAttributes, GitAttributes},
     line_cursor::{HORIZONTAL_SCROLL_COLUMNS, HorizontalScroll, LineCursor},
     picker::{StartReviewFocus, StartReviewModal},
     pull_request::{
         LineMapping, LocalChanges, LocalChangesEvent, PullRequestEvent, PullRequestState,
-        ThreadFilters, ThreadPlacement, place_thread,
+        ThreadFilters, ThreadPlacement, open_stack_neighbor, place_thread,
     },
     reviewed::paint_reviewed_hunks,
     session::{ReviewKey, ReviewSession, ReviewSessionEvent},
@@ -124,6 +126,18 @@ pub(crate) fn register(workspace: &mut Workspace) {
             return;
         };
         submit_review(workspace, review, window, cx);
+    });
+    workspace.register_action(|workspace, _: &NextPullRequestInStack, window, cx| {
+        discard_vim_count(window, cx);
+        if let Some(review) = current_review(workspace, cx) {
+            open_stack_neighbor(workspace, review, StackDirection::Up, window, cx);
+        }
+    });
+    workspace.register_action(|workspace, _: &PreviousPullRequestInStack, window, cx| {
+        discard_vim_count(window, cx);
+        if let Some(review) = current_review(workspace, cx) {
+            open_stack_neighbor(workspace, review, StackDirection::Down, window, cx);
+        }
     });
     workspace.register_action(|workspace, _: &OpenPullRequestInBrowser, window, cx| {
         if let Some(pull_request) = current_pull_request(workspace, cx) {

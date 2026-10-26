@@ -32,7 +32,10 @@ B"), and slice C, the review toolbar in the pane, the review's right-click menu,
 the panel and line numbers that select rows (see "UX-1 slice C"), with a live pass over the whole
 batch. Then the Review Pull Request picker, a GitHub search of the repository's pull requests
 prefilled from the first `code_review` settings, reachable from the panel's "+" (see "Review Pull
-Request picker").
+Request picker"; since merged into the Start Review picker's Pull Requests section). Then GitHub
+stacks: stacked pull requests are one row per stack in the Start Review picker, which opens the
+stack's first pull request to review, and a pull request review in a stack shows the stack and
+steps up and down it (see "Stacked pull requests").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -104,26 +107,26 @@ What exists:
 | `crates/code_review/src/comments/remote.rs` | M7c: `RemoteThreadView` (a pull request's review thread, or a file's outdated/moved threads, read-only: badges, location, comments with author/time/markdown, "…N more on GitHub", Open on GitHub), `RemoteThreadContent`, `thread_location`; M7d: `open_web_link` (only http(s) opens), `HoveredLink` + `untrusted_markdown` (links show their destination while hovered); fix 2: `github_markdown` (GitHub's `<details>`/`<summary>` tags dropped) |
 | `crates/code_review/src/submit.rs` | M7d: `comment_body`/`review_body` (`[TYPE] ` prefixes), `needs_body` (LV §5.1), `plan_review` → `PlannedReview` (the payload mapping, counts, outdated and refused drafts), `SubmitReviewModal` (events, blockers, warnings, body prompt; polish A: re-plans on every change, starts `PullRequestState::submit`/`check_uncertain_submit` and shows their reply, can't be dismissed while its submit runs), `finish_local_review`; payload/flow/modal tests |
 | `crates/code_review/src/export.rs` | M6: `review_markdown` (tuicr's Markdown export), `ExportPreamble`; golden tests |
-| `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`; M7d: `ReviewEvent`, `ReviewSubmission`, `ReviewLineComment`/`ReviewFileComment`, `SubmittedReview`), the `Forge` trait (with `submit_review`), `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
-| `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, host rules (`GitHubHost::{Cloud, Configured, Unverified}`, `GitHubHosts`: user-configured providers, registry hosts, SSH aliases via `ssh -G`), remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup (gh's rules) and cache per (host, work dir), `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks), `GitHubForge`, the forge cache (keyed by every remote URL); `test_support` (fake GitHub `HttpClient`, fixtures, `FakeLookups`) and tests, an ignored live test |
+| `crates/code_review/src/forge.rs` | M7: forge-neutral pull request types (`ForgeRepo`/`ForgeRepoRef`, `RepositoryContext`, `PullRequestSummary`/`Details`, `HeadStatus`, `RemoteThread` + `ThreadAnchor`, `RemoteReviewSummary`, `ChangedFile` + `Hunk`, `CommentableLines` with `allows`/`allows_range`/`current_path`; M7d: `ReviewEvent`, `ReviewSubmission`, `ReviewLineComment`/`ReviewFileComment`, `SubmittedReview`; stacks: `PullRequestStack` (`review_start`, `neighbor`), `StackDirection`), the `Forge` trait (with `submit_review`; stacks: `pull_request_stacks`, `pull_request_stack`), `resolve_forge`, `error_message` / `github_error` / `show_error_toast` |
+| `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, host rules (`GitHubHost::{Cloud, Configured, Unverified}`, `GitHubHosts`: user-configured providers, registry hosts, SSH aliases via `ssh -G`), remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup (gh's rules) and cache per (host, work dir), `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks, stacks), `GitHubForge`, the forge cache (keyed by every remote URL); `test_support` (fake GitHub `HttpClient`, fixtures, `FakeLookups`) and tests, an ignored live test |
 | `crates/code_review/src/cli.rs` | M8: `is_review_url`, `ReviewLink` (`zed://review` parsing), `CliReviewRequest` + `handle_cli_review` (the CLI's request: the ping marker, open, `--wait`, the quit hook, one `Exit` per request through `CliReply`), `open_review_link` (a link Zed got without the CLI), `open_review` (a `TargetSpec` in a repository: checks, then `deploy_in_repo` or `open_pull_request`), `confirm_link` and the large-review prompt (links only), `repository_root`, `find_review_workspace`; CLI GPUI tests with a fake response sink (`tests::Cli`, also used by the pull request link test) |
 | `crates/cli/src/review.rs` | M8 (fork file in the upstream `cli` crate): `--review` → the `zed://review` link + the repository's canonical path, its usage errors, `requested()` (exit 1 for clap's usage errors), `check_exit` (polish A: a Zed that answered without the ping marker doesn't know `--review`) |
-| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point the CLI calls; one at a time per repository, `OpeningPullRequest`; M8: `ReviewCancelled`, `repository_at` crate-visible), the in-place flow, `plan_worktree_fetch`, `trusts_head_repository` and the new-worktree flow (own `git worktree add --detach`, `trust_worktree`, `repository_at`). M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors, from any open checkout: `add_checkout`, `resolve_forge`, `use_forge`), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment` (the per-tab gate)/`check_comment_target`; M7d: `LocalChanges` (per tab: each file's diff against HEAD, `head_to_working`/`working_to_head` → `LineMapping`; polish A: `read_head_texts`); polish A: `submit`/`SubmitRequest`/`SubmitTarget`/`SubmitReply`, `uncertain_submit`/`check_uncertain_submit`, `retry_with_new_token`; PR review GPUI tests and their `Fixture` |
+| `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point the CLI calls; one at a time per repository, `OpeningPullRequest`; M8: `ReviewCancelled`, `repository_at` crate-visible), the in-place flow, `plan_worktree_fetch`, `trusts_head_repository` and the new-worktree flow (own `git worktree add --detach`, `trust_worktree`, `repository_at`). M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors, from any open checkout: `add_checkout`, `resolve_forge`, `use_forge`), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment` (the per-tab gate)/`check_comment_target`; M7d: `LocalChanges` (per tab: each file's diff against HEAD, `head_to_working`/`working_to_head` → `LineMapping`; polish A: `read_head_texts`); polish A: `submit`/`SubmitRequest`/`SubmitTarget`/`SubmitReply`, `uncertain_submit`/`check_uncertain_submit`, `retry_with_new_token`; stacks: `PullRequestState::stack`/`stack_position` (`StackPosition`), `open_stack_neighbor`, `open_in_stack` (in place, the new tab replaces the old); PR review GPUI tests and their `Fixture` |
 | `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, `LocalState` (`read_local_state`/`local_state`: HEAD, base present, local branches + upstreams, read from git), the pure `plan_checkout`, `head_remote`, `RestrictedMode` + `ensure_trusted`, `run_checkout` (Zed's fetch and branch switch, plus our own git jobs: `fast_forward` with the branch check, `ensure_fast_forward`, detach; `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
 | `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
+| `crates/code_review/src/github/stacks.graphql` | Stacks: the stacked pull request operations, sent after `queries.graphql` (`STACK_QUERIES`) so that a GitHub without stacks fails only them |
 | `crates/code_review/test_data/github/*.json` | M7: trimmed live responses from the sandbox repo (PR A #1 threads/summaries/details/head/files, PR D #4 files, the open list, the `drew-council/zed` fork context, a NOT_FOUND) |
 | `crates/code_review/src/persistence.rs` | `CodeReviewDb` DB domain (migration 0: `code_review_sessions`, `code_review_reviewed_files`, `code_review_reviewed_hunks`; migration 1: `code_review_comments`), queued writes, `prune`, `sync` barrier |
 | `crates/code_review/src/gitattributes.rs` | `.gitattributes` parser/loader for `linguist-generated`/`gitlab-generated`/`linguist-vendored` (tuicr's rules, via `ignore`'s gitignore matcher) |
 | `crates/code_review/src/reviewed.rs` | Header controls (UX-1 B: "Comment" button, checkbox labelled "Reviewed"), `ReviewHunkRenderer` (hunk control "Mark Reviewed"/"✓ Reviewed"), dimmed reviewed-hunk painting; reviewed-mark GPUI tests |
-| `crates/code_review/src/toolbar.rs` | UX-1 C: `ReviewToolbar` (`ToolbarItemView` added to every pane by `register`, from `init`, after Zed's own items): counts (`summary_text`), single-file info, previous/next file/hunk/comment, Review Comment, single-file toggle, Copy as Markdown, Submit/Finish Review; toolbar GPUI tests |
+| `crates/code_review/src/toolbar.rs` | UX-1 C: `ReviewToolbar` (`ToolbarItemView` added to every pane by `register`, from `init`, after Zed's own items): counts (`summary_text`), single-file info, stack position with previous/next pull request in the stack, previous/next file/hunk/comment, Review Comment, single-file toggle, Copy as Markdown, Submit/Finish Review; toolbar GPUI tests |
 | `crates/code_review/src/context_menu.rs` | UX-1 C: the review's right-click menu in both sides of the diff (`install` → `Editor::set_custom_context_menu`; entries filled right after the click: `menu_items` → `MenuItem`/`MenuEntry`, disabled entries with their reason); menu GPUI tests |
-| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: the review's overview, a block above the diff's first file that scrolls with it (UX-1 slice A; `block_properties`, `is_empty`) — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
-| `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Pull Requests section (open / review requested, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action; `render_pull_request_row` (shared with the Review Pull Request picker) |
-| `crates/code_review/src/pull_request_picker.rs` | `PullRequestPickerModal` / `PullRequestPickerDelegate`: the Review Pull Request picker (`code_review::SearchPullRequests`): its query is a GitHub search of the repository's pull requests, prefilled from `code_review.pull_request_search`, debounced; approved-by-you hidden per `code_review.hide_approved_pull_requests`; a number/URL opens that pull request; "Review in Worktree" |
+| `crates/code_review/src/top_block.rs` | `ReviewTopBlock`: the review's overview, a block above the diff's first file that scrolls with it (UX-1 slice A; `block_properties`, `is_empty`) — branch base line with a Change Base button, the commit messages (collapsible), or the pull request's block (header, its stack (clickable), warnings, description and review summaries, thread toggles, load errors; collapsible, expanded by default); then the review-level comments; commit tab titles |
+| `crates/code_review/src/picker.rs` | `StartReviewModal` / `StartReviewDelegate`: Local section (uncommitted, branch vs base, recent commits with range multi-select), Stacks section (one row per stack the search found pull requests of: `ListedStack`, `group_search_results`, `render_stack_row`), Pull Requests section (the GitHub search of `code_review.pull_request_search`, edited in place with `EditPullRequestSearch`, approved-by-you hidden, open by reference, "Review in Worktree"); `CommitSelection`; the `OpenPullRequest` action; `render_pull_request_row`, `pull_request_state`, `stack_member_label`. (The separate `pull_request_picker.rs` of the Review Pull Request picker was merged into this picker.) |
 | `crates/code_review/src/line_cursor.rs` | `LineCursor`: hides the caret, paints cursor/visual rows (mirrored in split view), horizontal scroll; configures each side (UX-1 B: breakpoint/bookmark gutter hover off) |
 | `crates/code_review/src/view.rs` | `ReviewView` workspace item (key context `CodeReview`), reuse-or-create `deploy`/`deploy_in_repo`, titles, Change Base (`open_base_picker`/`select_base`/`change_base`), handlers for the review keys and the direct actions, `FocusDiff`; its session, filters (`ReviewFilters`), attributes, fold transitions, `r`/`R`/`]c`/`[c`, the panel's and toolbar's read API (`panel_files`, `summary`, `single_file_position`, `draft_comment_count`, `shown_thread_count`), `submit_review`/`copy_review_as_markdown`; GPUI tests |
-| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu, filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); UX-1 C: hover controls (a file row's reviewed checkbox, a comment row's edit/delete); GPUI tests |
-| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only) |
+| `crates/code_review/src/panel.rs` | `ReviewPanel` (left dock): follows the active review tab; file tree (compacted directories, status letters, ✓, icons, indent guides), header with progress/status line/menu (and the stack position with previous/next in a stacked pull request review), filter and search prompts, context menu (pull request entries in PR reviews), empty states, the comment and thread list; workspace-level filter/copy actions (`CopyPullRequestUrl` too); UX-1 C: hover controls (a file row's reviewed checkbox, a comment row's edit/delete); GPUI tests |
+| `assets/keymaps/code_review.json`, `code_review_vim.json` | Built-in keymaps (non-vim: `tab` → `picker::MultiSelectNext` and `ctrl-r` → `TogglePullRequestFilter` in the Start Review picker, the review panel's keys, `ctrl-enter`/`ctrl-s` in comment editors; the review tab's keys are vim-only, `] s`/`[ s` for the stack) |
 | `crates/code_review/research/benchmark-results.txt` | Measured build times (see §8) |
 | `crates/code_review/research/github-api-live-verification.md` | M7's live GitHub API probes against the sandbox repository (payload shapes, line/side rules, error texts, pending reviews, the sandbox's PRs and its reset recipe), the source of §4's and `submit.rs`'s rules |
 | `crates/code_review/research/final-validation/` | The final live validation: `CHECKLIST.md` (sessions V1–V8 as run, with their setup) and `SUMMARY.md` (results per session, the fixes they led to, the sweeps R1/R2) |
@@ -2048,6 +2051,62 @@ although GitHub's API takes it (LV L8; existing threads still may); local review
 `git diff` would show (3 context lines, `Hunk::with_context`), like tuicr, so expanded context rows
 are refused there too. Refusals are toasts or disabled entries with the reason.
 
+**Stacked pull requests (the user's request after the picker)** — "the code review panel … has no
+notion of what PRs are together in a GitHub stack … display in a separate section all PRs that
+are associated with the stack, where you can select a single entry to review that GitHub stack …
+step through with … next and previous"; individual pull requests outside stacks stay reviewable;
+drafts, merged, closed and open parts of a stack are shown and handled; a stack is listed when any
+of its pull requests matches the search, and opening it skips ahead to the first one open for
+review. No upstream edits.
+
+- **GitHub's API** (verified live 2026-10-26 on `sheerhealth/sheer`): GraphQL `PullRequest.stack`
+  (`PullRequestStack`: `number`, `baseRefName`, `size`, `entries { position pullRequest }`,
+  positions 1-based from the bottom; a `Node`, so `nodes(ids:)` takes its id) and
+  `PullRequest.stackEntry`; REST `repos/{owner}/{repo}/stacks[?pull_request=N]` (gh-stack 0.2.1
+  uses it). Merged and closed pull requests stay in their stack; after the bottom merges, the next
+  one is retargeted to the base. A stack's number shares the issue/pull request numbering.
+- **Queries** (`github/stacks.graphql`, sent as `queries.graphql` + it, `STACK_QUERIES`): GitHub
+  validates every operation of a document (checked live: an unknown field in an unused operation
+  fails the request), so stack fields in `queries.graphql` would break every request on a GitHub
+  without stacks (older GHES). The summary fragment gained only `id`. The picker sends
+  `PullRequestStackIds` (the found pull requests' stacks by node id) then `PullRequestStacks` (each
+  distinct stack, `entries(first: 50)` with the full summary fragment: 10 stacks with up to 22
+  entries cost nothing notable live); a review sends `PullRequestStackOf`. Stack failures are logged
+  only: the picker lists everything alone, the review has no stack.
+- **Picker**: `group_search_results`: approved-by-you hidden first (counted as before); a pull
+  request in a stack goes to its stack's row (listed once, in the order of its first pull request
+  found), the others to Pull Requests. Sections: Local, **Stacks**, Pull Requests, Recent Commits.
+  A stack row: the review start's number, title, author and time; below, the stack gh-stack's way
+  from its base (`main ← #1 ← #2`), each number colored by state (Open green, Draft muted, Merged
+  accent, Closed red and struck through), the start bold and underlined; chips "N of M", the
+  start's state, review decision and the viewer's verdict. Its fuzzy candidate has every member's
+  number and title. Enter reviews the start in place, the secondary confirm in a worktree; opening
+  the picker at its pull requests selects the first stack. A `#N` of a stacked pull request gets
+  the "Open pull request #N" row (the user named that one).
+- **Review start** (`PullRequestStack::review_start`): the lowest pull request ready for review
+  (open, not a draft) the viewer hasn't approved; else the lowest ready for review; else the lowest
+  open (a draft); else the bottom.
+- **In a review** (`PullRequestState::stack`, loaded with threads/summaries/files on every load):
+  the top block's header is followed by "Stack #N · 2 of 9: main ← #1 ← #2 …" (always shown, also
+  collapsed; each number a button with the title and state in its tooltip; a click reviews it,
+  merged and closed ones too); the toolbar has "Stack 2/9" with ← / → (disabled with "none open"
+  at the ends); the panel header the same line, its menu Previous/Next Pull Request in Stack.
+  `code_review::NextPullRequestInStack` (up, away from the base) / `PreviousPullRequestInStack`
+  (down), `] s` / `[ s` in vim mode. **Stepping skips merged and closed pull requests** (drafts
+  are stepped onto). Without a neighbor, or before the stack loaded, a toast says why.
+- **Stepping replaces the tab** (`open_in_stack`, agent's choice): the neighbor is opened in place
+  in the review's repository (`open_pull_request` with the canonical repository as the
+  reference), and once its tab is open the previous tab closes (`SaveIntent::Skip`; its drafts
+  stay in its session), so a stack is reviewed in one tab. A failed open (checkout refused) keeps
+  the old tab and shows the error toast.
+- Tests: 5 new (232 + 1 ignored): `forge::test_stack_review_start_and_neighbors`,
+  `github::test_pull_request_stacks` (the two-step lookup, ordering by position, no request without
+  ids, `QUERIES` free of stack fields), `picker::test_group_search_results`,
+  `picker::test_stacks_section` (sections, start, fuzzy match on another member, Enter opens the
+  start), `pull_request::test_stack_navigation` (position, top block/toolbar/panel drawn, toast at
+  the bottom, → skips a closed one and replaces the tab, `[ s`, the toolbar button). Not done: a
+  live run in the app.
+
 **Known issues / notes for the next slices:**
 
 - **Observations recorded, not fixed** (final validation; `plans/FIX-final-validation.md` group
@@ -2132,8 +2191,8 @@ are refused there too. Refusals are toasts or disabled entries with the reason.
   row. Header controls go only through `ReviewAddon` in `diff.rs`.
 - Multi-cursor commands (`g l`, `g a`) only show the newest selection.
 - `cargo test -p zed test_action_namespaces` passes (polish B; the rest of `zed`'s tests not run).
-  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 224 tests + 1 ignored live
-  GitHub test (after the Review Pull Request picker; 222 after UX-1 slice C; 214 after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
+  `cargo test -p cli`: 8 passed (fix 2). `cargo test -p code_review`: 232 tests + 1 ignored live
+  GitHub test (after stacked pull requests; 224 after the Review Pull Request picker; 222 after UX-1 slice C; 214 after UX-1 slice B; 206 after UX-1 slice A; 202 after the review panel fix; 201 after fix 3; 198 after fix 2; 191 after fix 1; 184 after polish B; 180 after polish
   A; 166 after M8; 152 after M7 slice d, 136
   after hardening 3, 127 after M7 slice c, 120 after slice b, 113 after hardening 2, 110 after
   M7 slice a, 89 after M6, stable under

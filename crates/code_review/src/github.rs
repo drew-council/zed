@@ -4,8 +4,8 @@
 use crate::forge::{
     Actor, ChangedFile, ChangedFileStatus, CommentableLines, DiffSide, Forge, ForgeRepo,
     ForgeRepoRef, HeadStatus, Hunk, HunkRowKind, HunkRows, PendingReview, PullRequestDetails,
-    PullRequestStatus, PullRequestSummary, RemoteComment, RemoteReviewSummary, RemoteThread,
-    RepositoryContext, ReviewDecision, ReviewEvent, ReviewLineComment, ReviewState,
+    PullRequestStack, PullRequestStatus, PullRequestSummary, RemoteComment, RemoteReviewSummary,
+    RemoteThread, RepositoryContext, ReviewDecision, ReviewEvent, ReviewLineComment, ReviewState,
     ReviewSubmission, SubmitAttempt, SubmittedReview, ThreadAnchor,
 };
 use anyhow::anyhow;
@@ -47,6 +47,11 @@ use util::command::Stdio;
 
 /// Every GraphQL operation, sent whole with an `operationName`.
 const QUERIES: &str = include_str!("github/queries.graphql");
+/// The stacked pull request operations, with the fragments of [`QUERIES`] they use.
+const STACK_QUERIES: &str = concat!(
+    include_str!("github/queries.graphql"),
+    include_str!("github/stacks.graphql")
+);
 const API_VERSION: &str = "2022-11-28";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const GH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1075,6 +1080,8 @@ struct SearchField {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestSummaryNode {
+    #[serde(default)]
+    id: String,
     number: u64,
     title: String,
     url: String,
@@ -1090,6 +1097,43 @@ struct PullRequestSummaryNode {
     updated_at: OffsetDateTime,
     author: Option<ActorNode>,
     latest_opinionated_reviews: Option<OpinionatedReviewsField>,
+}
+
+#[derive(Deserialize)]
+struct NodesData<N> {
+    nodes: Vec<Option<N>>,
+}
+
+/// A node of `PullRequestStackIds`: `{}` for an id that isn't a pull request's.
+#[derive(Deserialize)]
+struct StackIdNode {
+    #[serde(default)]
+    stack: Option<IdNode>,
+}
+
+#[derive(Deserialize)]
+struct IdNode {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct StackOfField {
+    stack: Option<StackNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StackNode {
+    number: u64,
+    base_ref_name: String,
+    entries: Connection<StackEntryNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StackEntryNode {
+    position: u32,
+    pull_request: Option<PullRequestSummaryNode>,
 }
 
 #[derive(Deserialize)]
@@ -1322,6 +1366,7 @@ fn summary(node: PullRequestSummaryNode, viewer: &str) -> PullRequestSummary {
             _ => None,
         });
     PullRequestSummary {
+        node_id: node.id.into(),
         number: node.number,
         title: node.title.into(),
         url: node.url.into(),
@@ -1339,6 +1384,25 @@ fn summary(node: PullRequestSummaryNode, viewer: &str) -> PullRequestSummary {
         is_cross_repository: node.is_cross_repository,
         updated_at: node.updated_at,
         viewer_review,
+    }
+}
+
+fn stack(node: StackNode, viewer: &str) -> PullRequestStack {
+    let mut entries = node
+        .entries
+        .nodes
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| Some((entry.position, entry.pull_request?)))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(position, _)| *position);
+    PullRequestStack {
+        number: node.number,
+        base_ref: node.base_ref_name.into(),
+        pull_requests: entries
+            .into_iter()
+            .map(|(_, pull_request)| summary(pull_request, viewer))
+            .collect(),
     }
 }
 
@@ -1656,8 +1720,19 @@ impl GitHubClient {
         variables: serde_json::Value,
         what: &SharedString,
     ) -> Result<D, GitHubError> {
+        self.graphql_in(QUERIES, operation, variables, what).await
+    }
+
+    /// [`Self::graphql`], with `operation` from `document`.
+    async fn graphql_in<D: DeserializeOwned>(
+        &self,
+        document: &'static str,
+        operation: &'static str,
+        variables: serde_json::Value,
+        what: &SharedString,
+    ) -> Result<D, GitHubError> {
         let body = serde_json::to_vec(&json!({
-            "query": QUERIES,
+            "query": document,
             "operationName": operation,
             "variables": variables,
         }))
@@ -1813,6 +1888,80 @@ impl GitHubClient {
             .into_iter()
             .map(|node| summary(node, viewer))
             .collect())
+    }
+
+    async fn pull_request_stacks(
+        &self,
+        repo: &ForgeRepo,
+        viewer: &str,
+        node_ids: Vec<SharedString>,
+    ) -> Result<Vec<PullRequestStack>, GitHubError> {
+        let what = SharedString::from(repo.to_string());
+        let node_ids = node_ids
+            .into_iter()
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let data: NodesData<StackIdNode> = self
+            .graphql_in(
+                STACK_QUERIES,
+                "PullRequestStackIds",
+                json!({ "ids": node_ids }),
+                &what,
+            )
+            .await?;
+        let mut stack_ids = Vec::<String>::new();
+        for stack in data
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter_map(|node| node.stack)
+        {
+            if !stack_ids.contains(&stack.id) {
+                stack_ids.push(stack.id);
+            }
+        }
+        if stack_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let data: NodesData<StackNode> = self
+            .graphql_in(
+                STACK_QUERIES,
+                "PullRequestStacks",
+                json!({ "ids": stack_ids }),
+                &what,
+            )
+            .await?;
+        Ok(data
+            .nodes
+            .into_iter()
+            .flatten()
+            .map(|node| stack(node, viewer))
+            .collect())
+    }
+
+    async fn pull_request_stack(
+        &self,
+        repo: &ForgeRepo,
+        viewer: &str,
+        number: u64,
+    ) -> Result<Option<PullRequestStack>, GitHubError> {
+        let what = pull_request_name(repo, number);
+        let data: RepositoryData<PullRequestData<StackOfField>> = self
+            .graphql_in(
+                STACK_QUERIES,
+                "PullRequestStackOf",
+                json!({ "owner": repo.owner, "name": repo.name, "number": number }),
+                &what,
+            )
+            .await?;
+        let field = data
+            .repository
+            .and_then(|repository| repository.pull_request)
+            .ok_or_else(|| GitHubError::NotFound { what: what.clone() })?;
+        Ok(field.stack.map(|node| stack(node, viewer)))
     }
 
     async fn pull_request(
@@ -2615,6 +2764,26 @@ impl Forge for GitHubForge {
         async move { Ok(client.search_pull_requests(&repo, &viewer, &search).await?) }.boxed()
     }
 
+    fn pull_request_stacks(
+        &self,
+        node_ids: Vec<SharedString>,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<PullRequestStack>>> {
+        let client = self.client.clone();
+        let repo = self.context.canonical.clone();
+        let viewer = self.context.viewer.clone();
+        async move { Ok(client.pull_request_stacks(&repo, &viewer, node_ids).await?) }.boxed()
+    }
+
+    fn pull_request_stack(
+        &self,
+        number: u64,
+    ) -> BoxFuture<'static, anyhow::Result<Option<PullRequestStack>>> {
+        let client = self.client.clone();
+        let repo = self.context.canonical.clone();
+        let viewer = self.context.viewer.clone();
+        async move { Ok(client.pull_request_stack(&repo, &viewer, number).await?) }.boxed()
+    }
+
     fn pull_request(&self, number: u64) -> BoxFuture<'static, anyhow::Result<PullRequestDetails>> {
         let client = self.client.clone();
         let repo = self.context.canonical.clone();
@@ -3060,6 +3229,58 @@ pub(crate) mod test_support {
             name: "code-review-sandbox".into(),
         };
         futures::executor::block_on(client.review_threads(&repo, 1)).unwrap()
+    }
+
+    /// A pull request of a stack in the sandbox, as the `PullRequestSummary` fragment has it:
+    /// "Layer N" on branch `stack/N`, by the viewer unless `viewer_approved` (then by someone
+    /// else, approved by the viewer).
+    pub(crate) fn stacked_pull_request(
+        number: u64,
+        state: &str,
+        is_draft: bool,
+        viewer_approved: bool,
+    ) -> Value {
+        let reviews = if viewer_approved {
+            json!([{ "state": "APPROVED", "author": { "login": "drew-council" } }])
+        } else {
+            json!([])
+        };
+        json!({
+            "id": format!("PR_{number}"),
+            "number": number,
+            "title": format!("Layer {number}"),
+            "url": format!("https://github.com/drew-council/code-review-sandbox/pull/{number}"),
+            "state": state,
+            "reviewDecision": null,
+            "isDraft": is_draft,
+            "isCrossRepository": false,
+            "headRefName": format!("stack/{number}"),
+            "baseRefName": "main",
+            "updatedAt": "2026-10-17T03:00:00Z",
+            "author": {
+                "__typename": "User",
+                "login": if viewer_approved { "someone-else" } else { "drew-council" },
+            },
+            "latestOpinionatedReviews": { "nodes": reviews },
+        })
+    }
+
+    /// A stack (the `PullRequestStack` fragment) of `pull_requests`, from the bottom. GitHub's
+    /// entries are listed top first, so that parsing has to order them.
+    pub(crate) fn stack_node(number: u64, pull_requests: Vec<Value>) -> Value {
+        let entries = pull_requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, pull_request)| {
+                json!({ "position": index + 1, "pullRequest": pull_request })
+            })
+            .rev()
+            .collect::<Vec<_>>();
+        json!({
+            "number": number,
+            "baseRefName": "main",
+            "entries": { "nodes": entries },
+        })
     }
 
     pub(crate) fn repository_context_reply(request: &SentRequest) -> Reply {
@@ -3661,6 +3882,119 @@ mod tests {
                 (PullRequestStatus::Open, None),
             ]
         );
+    }
+
+    #[test]
+    fn test_pull_request_stacks() {
+        // Only the stack operations name stacks: a GitHub without them fails nothing else.
+        assert!(!QUERIES.contains("stack"));
+        let (http, requests) = fake_github(|request| match request.operation() {
+            Some("PullRequestStackIds") => Reply::json(
+                json!({ "data": { "nodes": [
+                    { "stack": { "id": "PRS_a" } },
+                    { "stack": null },
+                    { "stack": { "id": "PRS_a" } },
+                    { "stack": { "id": "PRS_b" } },
+                    {},
+                ] } })
+                .to_string(),
+            ),
+            Some("PullRequestStacks") => Reply::json(
+                json!({ "data": { "nodes": [
+                    stack_node(7, vec![
+                        stacked_pull_request(5, "MERGED", false, false),
+                        stacked_pull_request(1, "OPEN", false, true),
+                        stacked_pull_request(6, "OPEN", true, false),
+                    ]),
+                    stack_node(9, vec![stacked_pull_request(3, "CLOSED", false, false)]),
+                ] } })
+                .to_string(),
+            ),
+            Some("PullRequestStackOf") => Reply::json(
+                json!({ "data": { "repository": { "pullRequest": { "stack": null } } } })
+                    .to_string(),
+            ),
+            _ => Reply::status(500, "{}"),
+        });
+        let client = client(http);
+
+        let ids = ["PR_1", "PR_2", "PR_6", "PR_3", "", "MDQ6VXNlcjE="].map(SharedString::from);
+        let stacks =
+            block_on(client.pull_request_stacks(&sandbox(), "drew-council", ids.to_vec())).unwrap();
+        assert_eq!(
+            stacks
+                .iter()
+                .map(|stack| (
+                    stack.number,
+                    stack.base_ref.to_string(),
+                    stack
+                        .pull_requests
+                        .iter()
+                        .map(|pull_request| (
+                            pull_request.number,
+                            pull_request.status,
+                            pull_request.is_draft,
+                            pull_request.viewer_review,
+                        ))
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    7,
+                    "main".to_string(),
+                    vec![
+                        (5, PullRequestStatus::Merged, false, None),
+                        (
+                            1,
+                            PullRequestStatus::Open,
+                            false,
+                            Some(ReviewDecision::Approved)
+                        ),
+                        (6, PullRequestStatus::Open, true, None),
+                    ]
+                ),
+                (
+                    9,
+                    "main".to_string(),
+                    vec![(3, PullRequestStatus::Closed, false, None)]
+                ),
+            ]
+        );
+        assert_eq!(stacks[0].pull_requests[1].node_id, "PR_1");
+        assert_eq!(
+            block_on(client.pull_request_stack(&sandbox(), "drew-council", 2)).unwrap(),
+            None
+        );
+        // Nothing to ask about, nothing asked.
+        block_on(client.pull_request_stacks(&sandbox(), "drew-council", Vec::new())).unwrap();
+        block_on(client.pull_request_stacks(&sandbox(), "drew-council", vec!["".into()])).unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| (request.operation(), request.variables().clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some("PullRequestStackIds"),
+                    json!({ "ids": ["PR_1", "PR_2", "PR_6", "PR_3", "MDQ6VXNlcjE="] })
+                ),
+                (
+                    Some("PullRequestStacks"),
+                    json!({ "ids": ["PRS_a", "PRS_b"] })
+                ),
+                (
+                    Some("PullRequestStackOf"),
+                    json!({ "owner": "drew-council", "name": "code-review-sandbox", "number": 2 })
+                ),
+            ]
+        );
+        // The stack operations are sent with the fragment they use.
+        let document = requests[1].body["query"].as_str().unwrap();
+        assert!(document.contains("fragment PullRequestSummary on PullRequest"));
+        assert!(document.contains("query PullRequestStacks("));
     }
 
     #[test]

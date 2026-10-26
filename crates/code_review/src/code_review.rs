@@ -120,6 +120,12 @@ actions!(
         CopyPullRequestUrl,
         /// Opens the pull request under review on GitHub.
         OpenPullRequestInBrowser,
+        /// In a pull request review: reviews the next open pull request up its stack (the next to
+        /// merge after it) instead, checked out in place. Merged and closed ones are skipped.
+        NextPullRequestInStack,
+        /// In a pull request review: reviews the previous open pull request down its stack
+        /// (towards its base) instead, checked out in place. Merged and closed ones are skipped.
+        PreviousPullRequestInStack,
         /// Loads the pull request under review from GitHub again: its description, review
         /// threads and diff.
         ReloadPullRequest,

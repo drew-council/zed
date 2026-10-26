@@ -1,9 +1,10 @@
 use crate::{
     ClearExcludeFilter, ClearFilters, ClearIncludeFilter, CollapseSelectedEntry, CopyBranchName,
     CopyPullRequestUrl, EditExcludeFilter, EditIncludeFilter, ExpandSelectedEntry, FocusPanel,
-    OpenPullRequestInBrowser, ReloadPullRequest, ReviewUncommitted, ReviewView, SearchPaths,
-    SelectNextMatch, SelectPreviousMatch, StartReview, ToggleBotReviews, ToggleFileReviewed,
-    ToggleFocus, ToggleHideReviewed, ToggleOutdatedThreads, TogglePanel, ToggleResolvedThreads,
+    NextPullRequestInStack, OpenPullRequestInBrowser, PreviousPullRequestInStack,
+    ReloadPullRequest, ReviewUncommitted, ReviewView, SearchPaths, SelectNextMatch,
+    SelectPreviousMatch, StartReview, ToggleBotReviews, ToggleFileReviewed, ToggleFocus,
+    ToggleHideReviewed, ToggleOutdatedThreads, TogglePanel, ToggleResolvedThreads,
     ToggleSelectedDirectory, ToggleShowGenerated, ToggleShowVendored,
     comments::{CommentId, ItemKey},
     view::{
@@ -1022,6 +1023,12 @@ impl ReviewPanel {
                 .pull_request()
                 .map(|pull_request| pull_request.read(cx).filters())
         });
+        let stack = review.as_ref().and_then(|review| {
+            review
+                .read(cx)
+                .pull_request()
+                .and_then(|pull_request| pull_request.read(cx).stack_position())
+        });
         let project_path = file
             .as_ref()
             .zip(review.as_ref())
@@ -1115,6 +1122,18 @@ impl ReviewPanel {
                         Some(ToggleBotReviews.boxed_clone()),
                         |window, cx| window.dispatch_action(ToggleBotReviews.boxed_clone(), cx),
                     )
+                    .when_some(stack, |menu, stack| {
+                        menu.action_disabled_when(
+                            stack.below.is_none(),
+                            "Previous Pull Request in Stack",
+                            PreviousPullRequestInStack.boxed_clone(),
+                        )
+                        .action_disabled_when(
+                            stack.above.is_none(),
+                            "Next Pull Request in Stack",
+                            NextPullRequestInStack.boxed_clone(),
+                        )
+                    })
                     .action("Reload Pull Request", ReloadPullRequest.boxed_clone())
                     .action(
                         "Open Pull Request in Browser",
@@ -1477,6 +1496,9 @@ impl ReviewPanel {
         let review = review.read(cx);
         let title = review.title_with_repository(cx);
         let summary = review.summary(cx);
+        let stack = review
+            .pull_request()
+            .and_then(|pull_request| pull_request.read(cx).stack_position());
         let status = status_line(
             review.filters(),
             &summary,
@@ -1516,6 +1538,53 @@ impl ReviewPanel {
                             }),
                     ),
             )
+            .when_some(stack, |header, stack| {
+                let stack_button = |id: &'static str,
+                                    icon: IconName,
+                                    title: &'static str,
+                                    neighbor: Option<u64>,
+                                    action: Box<dyn Action>| {
+                    IconButton::new(id, icon)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(neighbor.is_none())
+                        .tooltip(Tooltip::text(match neighbor {
+                            Some(number) => format!("{title}: #{number}"),
+                            None => format!("{title}: none open"),
+                        }))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(action.boxed_clone(), cx)
+                        })
+                };
+                header.child(
+                    h_flex()
+                        .debug_selector(|| "review-panel-stack".into())
+                        .gap_1()
+                        .child(
+                            Label::new(format!(
+                                "Stack #{} · {} of {}",
+                                stack.stack,
+                                stack.position + 1,
+                                stack.count
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(stack_button(
+                            "review-panel-previous-in-stack",
+                            IconName::ArrowLeft,
+                            "Previous Pull Request in Stack",
+                            stack.below,
+                            PreviousPullRequestInStack.boxed_clone(),
+                        ))
+                        .child(stack_button(
+                            "review-panel-next-in-stack",
+                            IconName::ArrowRight,
+                            "Next Pull Request in Stack",
+                            stack.above,
+                            NextPullRequestInStack.boxed_clone(),
+                        )),
+                )
+            })
             .child(
                 Label::new(format!("{}/{} reviewed", summary.reviewed, summary.total))
                     .size(LabelSize::Small)

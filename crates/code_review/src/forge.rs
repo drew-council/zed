@@ -87,6 +87,8 @@ pub struct RepositoryContext {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PullRequestSummary {
+    /// The forge's id of the pull request; empty when the forge didn't say.
+    pub node_id: SharedString,
     pub number: u64,
     pub title: SharedString,
     pub url: SharedString,
@@ -103,11 +105,80 @@ pub struct PullRequestSummary {
     pub viewer_review: Option<ReviewDecision>,
 }
 
+impl PullRequestSummary {
+    /// Open and not a draft: ready for review.
+    pub fn is_ready_for_review(&self) -> bool {
+        self.status == PullRequestStatus::Open && !self.is_draft
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PullRequestStatus {
     Open,
     Closed,
     Merged,
+}
+
+/// A stack of pull requests (GitHub's stacked pull requests, `gh stack`): each one is based on the
+/// head branch of the one below it, and the bottom one on `base_ref`. Merged and closed pull
+/// requests stay in their stack.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PullRequestStack {
+    pub number: u64,
+    /// The branch the bottom pull request merges into.
+    pub base_ref: SharedString,
+    /// From the bottom (merged first) to the top.
+    pub pull_requests: Vec<PullRequestSummary>,
+}
+
+/// Up a stack is away from its base, towards the pull requests that merge last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackDirection {
+    Up,
+    Down,
+}
+
+impl PullRequestStack {
+    /// The index of pull request `number`, from the bottom.
+    pub fn position(&self, number: u64) -> Option<usize> {
+        self.pull_requests
+            .iter()
+            .position(|pull_request| pull_request.number == number)
+    }
+
+    pub fn contains(&self, number: u64) -> bool {
+        self.position(number).is_some()
+    }
+
+    /// The index of the pull request a review of the stack starts at: the lowest one ready for
+    /// review that the viewer hasn't approved, else the lowest one ready for review, else the
+    /// lowest open one (a draft), else the bottom one.
+    pub fn review_start(&self) -> usize {
+        let lowest = |matches: &dyn Fn(&PullRequestSummary) -> bool| {
+            self.pull_requests
+                .iter()
+                .position(|pull_request| matches(pull_request))
+        };
+        lowest(&|pull_request| {
+            pull_request.is_ready_for_review()
+                && pull_request.viewer_review != Some(ReviewDecision::Approved)
+        })
+        .or_else(|| lowest(&PullRequestSummary::is_ready_for_review))
+        .or_else(|| lowest(&|pull_request| pull_request.status == PullRequestStatus::Open))
+        .unwrap_or(0)
+    }
+
+    /// The nearest open pull request (drafts too) above or below pull request `number`: merged
+    /// and closed ones are skipped.
+    pub fn neighbor(&self, number: u64, direction: StackDirection) -> Option<&PullRequestSummary> {
+        let position = self.position(number)?;
+        let is_open =
+            |pull_request: &&PullRequestSummary| pull_request.status == PullRequestStatus::Open;
+        match direction {
+            StackDirection::Up => self.pull_requests[position + 1..].iter().find(is_open),
+            StackDirection::Down => self.pull_requests[..position].iter().rev().find(is_open),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,6 +714,20 @@ pub trait Forge: Send + Sync + 'static {
         search: String,
     ) -> BoxFuture<'static, Result<Vec<PullRequestSummary>>>;
 
+    /// The stacks the pull requests with these [`PullRequestSummary::node_id`]s are in, each
+    /// once, in the order of the first pull request in each. Fails where the forge has no
+    /// stacks.
+    fn pull_request_stacks(
+        &self,
+        node_ids: Vec<SharedString>,
+    ) -> BoxFuture<'static, Result<Vec<PullRequestStack>>>;
+
+    /// The stack pull request `number` is in, if any. Fails where the forge has no stacks.
+    fn pull_request_stack(
+        &self,
+        number: u64,
+    ) -> BoxFuture<'static, Result<Option<PullRequestStack>>>;
+
     fn pull_request(&self, number: u64) -> BoxFuture<'static, Result<PullRequestDetails>>;
 
     fn pull_request_head(&self, number: u64) -> BoxFuture<'static, Result<HeadStatus>>;
@@ -742,8 +827,112 @@ pub fn dismiss_error_toast(workspace: &mut Workspace, cx: &mut Context<Workspace
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A pull request "Layer N" for stack tests.
+    pub(crate) fn layer(
+        number: u64,
+        status: PullRequestStatus,
+        is_draft: bool,
+        viewer_review: Option<ReviewDecision>,
+    ) -> PullRequestSummary {
+        PullRequestSummary {
+            node_id: format!("PR_{number}").into(),
+            number,
+            title: format!("Layer {number}").into(),
+            url: format!("https://github.com/drew-council/code-review-sandbox/pull/{number}")
+                .into(),
+            author: Actor {
+                login: "drew-council".into(),
+                is_bot: false,
+            },
+            head_ref: format!("stack/{number}").into(),
+            base_ref: "main".into(),
+            status,
+            is_draft,
+            review_decision: None,
+            is_cross_repository: false,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            viewer_review,
+        }
+    }
+
+    pub(crate) fn stack_of(
+        number: u64,
+        pull_requests: Vec<PullRequestSummary>,
+    ) -> PullRequestStack {
+        PullRequestStack {
+            number,
+            base_ref: "main".into(),
+            pull_requests,
+        }
+    }
+
+    #[test]
+    fn test_stack_review_start_and_neighbors() {
+        use PullRequestStatus::{Closed, Merged, Open};
+        let approved = Some(ReviewDecision::Approved);
+        let changes_requested = Some(ReviewDecision::ChangesRequested);
+
+        // Merged, closed, a draft and one the viewer approved come before the first one to
+        // review; one with changes requested by the viewer is still to review.
+        let stack = stack_of(
+            9,
+            vec![
+                layer(1, Merged, false, approved),
+                layer(2, Closed, false, None),
+                layer(3, Open, true, None),
+                layer(4, Open, false, approved),
+                layer(5, Open, false, changes_requested),
+                layer(6, Open, false, None),
+            ],
+        );
+        assert_eq!(stack.review_start(), 4);
+        assert_eq!(stack.position(6), Some(5));
+        assert!(stack.contains(2) && !stack.contains(7));
+        let neighbor = |number, direction| {
+            stack
+                .neighbor(number, direction)
+                .map(|pull_request| pull_request.number)
+        };
+        // Approved and draft pull requests are stepped onto, merged and closed ones skipped.
+        assert_eq!(neighbor(5, StackDirection::Down), Some(4));
+        assert_eq!(neighbor(4, StackDirection::Down), Some(3));
+        assert_eq!(neighbor(3, StackDirection::Down), None);
+        assert_eq!(neighbor(1, StackDirection::Up), Some(3));
+        assert_eq!(neighbor(5, StackDirection::Up), Some(6));
+        assert_eq!(neighbor(6, StackDirection::Up), None);
+        assert_eq!(neighbor(7, StackDirection::Up), None);
+
+        // Everything to review approved: the lowest one ready for review.
+        let stack = stack_of(
+            9,
+            vec![
+                layer(1, Merged, false, None),
+                layer(2, Open, true, None),
+                layer(3, Open, false, approved),
+                layer(4, Open, false, approved),
+            ],
+        );
+        assert_eq!(stack.review_start(), 2);
+        // Only drafts open: the lowest draft.
+        let stack = stack_of(
+            9,
+            vec![
+                layer(1, Merged, false, None),
+                layer(2, Open, true, None),
+                layer(3, Open, true, None),
+            ],
+        );
+        assert_eq!(stack.review_start(), 1);
+        // Nothing open: the bottom.
+        let stack = stack_of(
+            9,
+            vec![layer(1, Merged, false, None), layer(2, Closed, false, None)],
+        );
+        assert_eq!(stack.review_start(), 0);
+    }
 
     fn rows(kind: HunkRowKind, old_start: u32, new_start: u32, len: u32) -> HunkRows {
         HunkRows {

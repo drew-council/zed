@@ -76,6 +76,9 @@
       "shift-r": "code_review::ToggleHunkReviewed",
       "] c": "code_review::NextHunk",
       "[ c": "code_review::PreviousHunk",
+      // The pull requests up and down a stack (gh-stack's `up`/`down`).
+      "] s": "code_review::NextPullRequestInStack",
+      "[ s": "code_review::PreviousPullRequestInStack",
       "g i": null,
       "insert": null,
     },

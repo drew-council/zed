@@ -1,6 +1,7 @@
 use crate::{
-    AddReviewComment, CopyReviewAsMarkdown, NextComment, NextFile, NextHunk, PreviousComment,
-    PreviousFile, PreviousHunk, ReviewView, SubmitReview, ToggleSingleFileMode,
+    AddReviewComment, CopyReviewAsMarkdown, NextComment, NextFile, NextHunk,
+    NextPullRequestInStack, PreviousComment, PreviousFile, PreviousHunk,
+    PreviousPullRequestInStack, ReviewView, SubmitReview, ToggleSingleFileMode,
     view::{copy_review_as_markdown, submit_review},
 };
 use gpui::{Action, Entity, EventEmitter, Focusable as _, Subscription, WeakEntity};
@@ -210,6 +211,55 @@ impl Render for ReviewToolbar {
                     ))
             };
 
+        // In a stack: where the pull request is in it, and the open ones up and down from it.
+        let stack = review
+            .pull_request()
+            .and_then(|pull_request| pull_request.read(cx).stack_position());
+        let stack_button = |selector: &'static str,
+                            icon: IconName,
+                            title: &'static str,
+                            neighbor: Option<u64>,
+                            action: Box<dyn Action>| {
+            let tooltip = match neighbor {
+                Some(number) => format!("{title}: #{number}"),
+                None => format!("{title}: none open"),
+            };
+            div().debug_selector(|| selector.into()).child(
+                IconButton::new(selector, icon)
+                    .icon_size(IconSize::Small)
+                    .disabled(neighbor.is_none())
+                    .tooltip(Tooltip::for_action_title_in(
+                        tooltip,
+                        action.as_ref(),
+                        &focus_handle,
+                    ))
+                    .on_click(dispatcher(action)),
+            )
+        };
+        let stack_navigation = stack.map(|stack| {
+            h_flex()
+                .gap_0p5()
+                .child(
+                    Label::new(format!("Stack {}/{}", stack.position + 1, stack.count))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(stack_button(
+                    "review-toolbar-previous-in-stack",
+                    IconName::ArrowLeft,
+                    "Previous Pull Request in Stack",
+                    stack.below,
+                    PreviousPullRequestInStack.boxed_clone(),
+                ))
+                .child(stack_button(
+                    "review-toolbar-next-in-stack",
+                    IconName::ArrowRight,
+                    "Next Pull Request in Stack",
+                    stack.above,
+                    NextPullRequestInStack.boxed_clone(),
+                ))
+        });
+
         // What the single-file bar said: which file of how many, and its path.
         let summary = match &single_file {
             Some((position, count, path)) => {
@@ -220,6 +270,9 @@ impl Render for ReviewToolbar {
         let controls = h_flex()
             .flex_none()
             .gap_2()
+            .when_some(stack_navigation, |controls, stack_navigation| {
+                controls.child(stack_navigation).child(Divider::vertical())
+            })
             .child(navigation(
                 "File",
                 (

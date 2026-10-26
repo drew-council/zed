@@ -1,0 +1,44 @@
+# Stacked pull requests. Not in `queries.graphql`: GitHub validates every operation of a document,
+# so on a GitHub without stacks (an older GitHub Enterprise Server) these would fail all the
+# others. Sent after `queries.graphql`, whose `PullRequestSummary` fragment they use.
+
+query PullRequestStackIds($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on PullRequest {
+      stack {
+        id
+      }
+    }
+  }
+}
+
+query PullRequestStacks($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on PullRequestStack {
+      ...PullRequestStack
+    }
+  }
+}
+
+query PullRequestStackOf($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      stack {
+        ...PullRequestStack
+      }
+    }
+  }
+}
+
+fragment PullRequestStack on PullRequestStack {
+  number
+  baseRefName
+  entries(first: 50) {
+    nodes {
+      position
+      pullRequest {
+        ...PullRequestSummary
+      }
+    }
+  }
+}

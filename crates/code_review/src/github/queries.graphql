@@ -28,6 +28,7 @@ query SearchPullRequests($query: String!) {
 }
 
 fragment PullRequestSummary on PullRequest {
+  id
   number
   title
   url

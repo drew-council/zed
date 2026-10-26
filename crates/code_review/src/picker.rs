@@ -2,8 +2,8 @@ use crate::{
     CodeReviewSettings, EditPullRequestSearch, OpenPullRequest, StartReview,
     commits::{RECENT_COMMITS_LIMIT, first_parent_chain},
     forge::{
-        self, Forge, ForgeRepo, GitHubError, PullRequestStatus, PullRequestSummary, ReviewDecision,
-        resolve_forge,
+        self, Forge, ForgeRepo, GitHubError, PullRequestStack, PullRequestStatus,
+        PullRequestSummary, ReviewDecision, resolve_forge,
     },
     pull_request::{OpenPullRequestOptions, open_pull_request_and_notify},
     target::{
@@ -16,7 +16,7 @@ use fuzzy::StringMatchCandidate;
 use git::repository::CommitData;
 use gpui::{
     Action as _, AnyElement, DismissEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, Task, WeakEntity,
+    FontWeight, Subscription, Task, WeakEntity,
 };
 use picker::{Picker, PickerDelegate};
 use project::{Project, git_store::Repository};
@@ -82,8 +82,9 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// The Start Review picker: uncommitted changes and the current branch against its base; then the
 /// pull requests of the repository's GitHub remote that a GitHub search finds (the
-/// `code_review.pull_request_search` setting, editable in the picker), and any pull request by
-/// number or URL; then recent commits, where multi-selection picks a range.
+/// `code_review.pull_request_search` setting, editable in the picker), the stacked ones as one
+/// row per stack, and any pull request by number or URL; then recent commits, where
+/// multi-selection picks a range.
 pub struct StartReviewModal {
     picker: Entity<Picker<StartReviewDelegate>>,
     _load_tasks: Vec<Task<()>>,
@@ -264,17 +265,83 @@ pub(crate) enum RecentCommits {
 #[derive(Clone)]
 pub(crate) enum PullRequestList {
     Loading,
-    /// Most recently updated first, unless the search sorts them; without the ones the viewer
-    /// approved when those are hidden.
-    Loaded(Vec<PullRequestSummary>),
+    Loaded(SearchResults),
     Failed(SharedString),
     /// The repository has no GitHub remote: the picker has no pull request section.
     Unsupported,
 }
 
+/// What a pull request search found, without the pull requests the viewer approved when those
+/// are hidden.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SearchResults {
+    /// The pull requests in no stack: most recently updated first, unless the search sorts them.
+    pub(crate) pull_requests: Vec<PullRequestSummary>,
+    /// The stacks of the others, in the order of their first pull request found.
+    pub(crate) stacks: Vec<ListedStack>,
+}
+
+/// A stack the search found pull requests of. The whole stack is listed as one row, which opens
+/// its review start.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ListedStack {
+    pub(crate) stack: PullRequestStack,
+    /// The index of [`PullRequestStack::review_start`].
+    pub(crate) start: usize,
+}
+
+impl ListedStack {
+    fn new(stack: PullRequestStack) -> Self {
+        Self {
+            start: stack.review_start(),
+            stack,
+        }
+    }
+
+    pub(crate) fn start(&self) -> Option<&PullRequestSummary> {
+        self.stack.pull_requests.get(self.start)
+    }
+}
+
+/// Splits what a search `found` into the pull requests in no stack and the stacks of the others
+/// (`stacks` has the stacks of everything found). With `hide_approved`, the pull requests the
+/// viewer approved are left out first, and their number is returned: a stack is listed while it
+/// has a pull request found that isn't left out.
+pub(crate) fn group_search_results(
+    mut found: Vec<PullRequestSummary>,
+    stacks: Vec<PullRequestStack>,
+    hide_approved: bool,
+) -> (SearchResults, usize) {
+    let count = found.len();
+    if hide_approved {
+        found.retain(|pull_request| pull_request.viewer_review != Some(ReviewDecision::Approved));
+    }
+    let approved_hidden = count - found.len();
+    let mut results = SearchResults::default();
+    for pull_request in found {
+        match stacks
+            .iter()
+            .find(|stack| stack.contains(pull_request.number))
+        {
+            Some(stack) => {
+                if !results
+                    .stacks
+                    .iter()
+                    .any(|listed| listed.stack.number == stack.number)
+                {
+                    results.stacks.push(ListedStack::new(stack.clone()));
+                }
+            }
+            None => results.pull_requests.push(pull_request),
+        }
+    }
+    (results, approved_hidden)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Section {
     Local,
+    Stacks,
     PullRequests,
     Commits,
 }
@@ -298,6 +365,11 @@ pub(crate) enum Entry {
         index: usize,
         positions: Vec<usize>,
     },
+    /// `index` is into the loaded stacks.
+    Stack {
+        index: usize,
+        positions: Vec<usize>,
+    },
     /// The pull request the query names, when it isn't in the list.
     OpenReference(PullRequestReference),
     Status(SharedString),
@@ -310,18 +382,25 @@ enum EntryKey {
     Commit(usize),
     /// By number, so the selection survives reloading the list.
     PullRequest(u64),
+    /// By the stack's number.
+    Stack(u64),
     OpenReference,
 }
 
 impl Entry {
-    fn key(&self, pull_requests: &[PullRequestSummary]) -> Option<EntryKey> {
+    fn key(&self, results: &SearchResults) -> Option<EntryKey> {
         match self {
             Entry::Uncommitted { .. } => Some(EntryKey::Uncommitted),
             Entry::Branch { .. } => Some(EntryKey::Branch),
             Entry::Commit { index, .. } => Some(EntryKey::Commit(*index)),
-            Entry::PullRequest { index, .. } => pull_requests
+            Entry::PullRequest { index, .. } => results
+                .pull_requests
                 .get(*index)
                 .map(|pull_request| EntryKey::PullRequest(pull_request.number)),
+            Entry::Stack { index, .. } => results
+                .stacks
+                .get(*index)
+                .map(|listed| EntryKey::Stack(listed.stack.number)),
             Entry::OpenReference(_) => Some(EntryKey::OpenReference),
             Entry::Header(_) | Entry::Status(_) => None,
         }
@@ -333,6 +412,7 @@ const BRANCH_CANDIDATE: usize = 1;
 const FIRST_COMMIT_CANDIDATE: usize = 2;
 /// Far above the commits' ids, so sorting matches by id keeps the sections apart.
 const FIRST_PULL_REQUEST_CANDIDATE: usize = 1 << 20;
+const FIRST_STACK_CANDIDATE: usize = 1 << 21;
 
 /// A contiguous range of the recent commits, as indices `(newest, oldest)` with
 /// `newest <= oldest`. Toggling never leaves a gap (tuicr's range selection): a commit outside
@@ -461,19 +541,31 @@ impl StartReviewDelegate {
         }
     }
 
-    fn loaded_pull_requests(&self) -> &[PullRequestSummary] {
+    fn search_results(&self) -> &SearchResults {
+        static NONE: SearchResults = SearchResults {
+            pull_requests: Vec::new(),
+            stacks: Vec::new(),
+        };
         match &self.pull_requests {
-            PullRequestList::Loaded(pull_requests) => pull_requests,
+            PullRequestList::Loaded(results) => results,
             PullRequestList::Loading
             | PullRequestList::Failed(_)
-            | PullRequestList::Unsupported => &[],
+            | PullRequestList::Unsupported => &NONE,
         }
+    }
+
+    fn loaded_pull_requests(&self) -> &[PullRequestSummary] {
+        &self.search_results().pull_requests
+    }
+
+    fn loaded_stacks(&self) -> &[ListedStack] {
+        &self.search_results().stacks
     }
 
     fn entry_key(&self, index: usize) -> Option<EntryKey> {
         self.entries
             .get(index)
-            .and_then(|entry| entry.key(self.loaded_pull_requests()))
+            .and_then(|entry| entry.key(self.search_results()))
     }
 
     /// The repository whose pull requests are listed, once known.
@@ -514,11 +606,24 @@ impl StartReviewDelegate {
             }
             let result = async {
                 let forge = forge.await?;
-                let pull_requests = cx
+                let found = cx
                     .background_executor()
                     .spawn(forge.search_pull_requests(search))
-                    .await;
-                anyhow::Ok((forge, pull_requests?))
+                    .await?;
+                let node_ids = found
+                    .iter()
+                    .map(|pull_request| pull_request.node_id.clone())
+                    .collect();
+                // Without stacks (a GitHub that has none), every pull request is listed alone.
+                let stacks = cx
+                    .background_executor()
+                    .spawn(forge.pull_request_stacks(node_ids))
+                    .await
+                    .unwrap_or_else(|error| {
+                        log::warn!("finding the stacks of pull requests: {error:#}");
+                        Vec::new()
+                    });
+                anyhow::Ok((forge, found, stacks))
             }
             .await;
             picker
@@ -526,16 +631,12 @@ impl StartReviewDelegate {
                     let delegate = &mut picker.delegate;
                     delegate.searching = false;
                     match result {
-                        Ok((forge, mut pull_requests)) => {
+                        Ok((forge, found, stacks)) => {
                             delegate.forge = Some(forge);
-                            let found = pull_requests.len();
-                            if hide_approved {
-                                pull_requests.retain(|pull_request| {
-                                    pull_request.viewer_review != Some(ReviewDecision::Approved)
-                                });
-                            }
-                            delegate.approved_hidden = found - pull_requests.len();
-                            delegate.pull_requests = PullRequestList::Loaded(pull_requests);
+                            let (results, approved_hidden) =
+                                group_search_results(found, stacks, hide_approved);
+                            delegate.approved_hidden = approved_hidden;
+                            delegate.pull_requests = PullRequestList::Loaded(results);
                         }
                         Err(error) => {
                             delegate.forge = None;
@@ -640,7 +741,9 @@ impl StartReviewDelegate {
             PullRequestList::Unsupported => {}
             PullRequestList::Loading => statuses.push("Loading pull requests…".into()),
             PullRequestList::Failed(error) => statuses.push(error.clone()),
-            PullRequestList::Loaded(pull_requests) if pull_requests.is_empty() => {
+            PullRequestList::Loaded(results)
+                if results.pull_requests.is_empty() && results.stacks.is_empty() =>
+            {
                 statuses.push("No pull requests match the search".into())
             }
             PullRequestList::Loaded(_) => {}
@@ -662,6 +765,20 @@ impl StartReviewDelegate {
             pull_request.author.login,
             pull_request.head_ref
         )
+    }
+
+    /// The stack's review start first (what its row shows), then the others from the bottom.
+    fn stack_candidate(listed: &ListedStack) -> String {
+        let mut candidate = listed
+            .start()
+            .map(Self::pull_request_candidate)
+            .unwrap_or_default();
+        for (index, pull_request) in listed.stack.pull_requests.iter().enumerate() {
+            if index != listed.start {
+                candidate.push_str(&format!(" #{} {}", pull_request.number, pull_request.title));
+            }
+        }
+        candidate
     }
 
     /// The listed pull request a reference names, if any.
@@ -720,6 +837,17 @@ impl StartReviewDelegate {
                 )
             },
         ));
+        candidates.extend(
+            self.loaded_stacks()
+                .iter()
+                .enumerate()
+                .map(|(index, listed)| {
+                    StringMatchCandidate::new(
+                        FIRST_STACK_CANDIDATE + index,
+                        &Self::stack_candidate(listed),
+                    )
+                }),
+        );
         candidates
     }
 
@@ -733,12 +861,19 @@ impl StartReviewDelegate {
         self.query = query;
 
         let mut local_entries = Vec::new();
+        let mut stack_entries = Vec::new();
         let mut pull_request_entries = Vec::new();
         let mut commit_entries = Vec::new();
         for (candidate, positions) in matches {
             match candidate {
                 UNCOMMITTED_CANDIDATE => local_entries.push(Entry::Uncommitted { positions }),
                 BRANCH_CANDIDATE => local_entries.push(Entry::Branch { positions }),
+                candidate if candidate >= FIRST_STACK_CANDIDATE => {
+                    stack_entries.push(Entry::Stack {
+                        index: candidate - FIRST_STACK_CANDIDATE,
+                        positions,
+                    })
+                }
                 candidate if candidate >= FIRST_PULL_REQUEST_CANDIDATE => pull_request_entries
                     .push(Entry::PullRequest {
                         index: candidate - FIRST_PULL_REQUEST_CANDIDATE,
@@ -793,6 +928,10 @@ impl StartReviewDelegate {
             };
             pull_request_entries.insert(0, entry);
         }
+        if !stack_entries.is_empty() {
+            entries.push(Entry::Header(Section::Stacks));
+            entries.extend(stack_entries);
+        }
         if !matches!(self.pull_requests, PullRequestList::Unsupported) {
             let open_reference = reference
                 .clone()
@@ -828,9 +967,14 @@ impl StartReviewDelegate {
                 && matches!(self.pull_requests, PullRequestList::Loaded(_))
             {
                 self.select_first_pull_request = false;
-                self.loaded_pull_requests()
+                self.loaded_stacks()
                     .first()
-                    .map(|pull_request| EntryKey::PullRequest(pull_request.number))
+                    .map(|listed| EntryKey::Stack(listed.stack.number))
+                    .or_else(|| {
+                        self.loaded_pull_requests()
+                            .first()
+                            .map(|pull_request| EntryKey::PullRequest(pull_request.number))
+                    })
             } else if reference_key.is_some()
                 && (query_changed || previous_key == Some(EntryKey::OpenReference))
             {
@@ -838,24 +982,32 @@ impl StartReviewDelegate {
             } else {
                 previous_key
             };
-        let pull_requests = self.loaded_pull_requests();
+        let results = self.search_results();
         self.selected_index = wanted_key
             .and_then(|key| {
                 self.entries
                     .iter()
-                    .position(|entry| entry.key(pull_requests) == Some(key.clone()))
+                    .position(|entry| entry.key(results) == Some(key.clone()))
             })
             .or_else(|| {
                 self.entries
                     .iter()
-                    .position(|entry| entry.key(pull_requests).is_some())
+                    .position(|entry| entry.key(results).is_some())
             })
             .unwrap_or(0);
     }
 
-    /// While the search is edited: only the pull request section, nothing selectable.
+    /// While the search is edited: only the stacks and pull requests, nothing selectable.
     fn set_search_entries(&mut self) {
-        let mut entries = vec![Entry::Header(Section::PullRequests)];
+        let mut entries = Vec::new();
+        if !self.loaded_stacks().is_empty() {
+            entries.push(Entry::Header(Section::Stacks));
+            entries.extend((0..self.loaded_stacks().len()).map(|index| Entry::Stack {
+                index,
+                positions: Vec::new(),
+            }));
+        }
+        entries.push(Entry::Header(Section::PullRequests));
         entries.extend(
             (0..self.loaded_pull_requests().len()).map(|index| Entry::PullRequest {
                 index,
@@ -947,6 +1099,23 @@ impl StartReviewDelegate {
             selected,
             self.timezone,
         ))
+    }
+
+    fn render_stack(
+        &self,
+        entry_index: usize,
+        index: usize,
+        positions: &[usize],
+        selected: bool,
+    ) -> Option<AnyElement> {
+        let listed = self.loaded_stacks().get(index)?;
+        render_stack_row(
+            ("start-review-stack", entry_index).into(),
+            listed,
+            positions,
+            selected,
+            self.timezone,
+        )
     }
 
     fn render_commit(
@@ -1140,6 +1309,20 @@ impl PickerDelegate for StartReviewDelegate {
                 let reference = PullRequestReference { repo: None, number };
                 self.open_pull_request(reference, secondary, window, cx);
             }
+            EntryKey::Stack(stack_number) => {
+                let start = self
+                    .loaded_stacks()
+                    .iter()
+                    .find(|listed| listed.stack.number == stack_number)
+                    .and_then(ListedStack::start);
+                if let Some(start) = start {
+                    let reference = PullRequestReference {
+                        repo: None,
+                        number: start.number,
+                    };
+                    self.open_pull_request(reference, secondary, window, cx);
+                }
+            }
             EntryKey::OpenReference => {
                 if let Some(Entry::OpenReference(reference)) =
                     self.entries.get(self.selected_index).cloned()
@@ -1223,6 +1406,15 @@ impl PickerDelegate for StartReviewDelegate {
                     .child(ListSubHeader::new("Local").inset(true))
                     .into_any_element(),
             ),
+            Entry::Header(Section::Stacks) => Some(
+                div()
+                    .pt_1()
+                    .child(ListSubHeader::new("Stacks").inset(true))
+                    .into_any_element(),
+            ),
+            Entry::Stack { index, positions } => {
+                self.render_stack(entry_index, *index, positions, selected)
+            }
             Entry::Header(Section::PullRequests) => Some(
                 div()
                     .pt_1()
@@ -1373,7 +1565,11 @@ impl PickerDelegate for StartReviewDelegate {
                         .when(
                             matches!(
                                 selected,
-                                Some(EntryKey::PullRequest(_) | EntryKey::OpenReference)
+                                Some(
+                                    EntryKey::PullRequest(_)
+                                        | EntryKey::Stack(_)
+                                        | EntryKey::OpenReference
+                                )
                             ),
                             |buttons| {
                                 buttons.child(
@@ -1438,27 +1634,8 @@ pub(crate) fn render_pull_request_row(
         timezone,
         time_format::TimestampFormat::Relative,
     );
-    let state = match pull_request.status {
-        PullRequestStatus::Merged => ("Merged", Color::Accent),
-        PullRequestStatus::Closed => ("Closed", Color::Error),
-        PullRequestStatus::Open if pull_request.is_draft => ("Draft", Color::Muted),
-        PullRequestStatus::Open => ("Open", Color::Success),
-    };
-    let decision = pull_request.review_decision.map(|decision| match decision {
-        ReviewDecision::Approved => ("Approved", Color::Success),
-        ReviewDecision::ChangesRequested => ("Changes requested", Color::Error),
-        ReviewDecision::ReviewRequired => ("Review required", Color::Warning),
-    });
-    let viewer_review = pull_request.viewer_review.map(|review| match review {
-        ReviewDecision::Approved => ("You approved", Color::Success),
-        ReviewDecision::ChangesRequested => ("You requested changes", Color::Error),
-        ReviewDecision::ReviewRequired => ("Review required", Color::Muted),
-    });
-    let chip = |(label, color): (&'static str, Color)| {
-        Chip::new(label)
-            .label_size(LabelSize::XSmall)
-            .label_color(color)
-    };
+    let state = pull_request_state(pull_request);
+    let (decision, viewer_review) = review_labels(pull_request);
     ListItem::new(id)
         .inset(true)
         .spacing(ListItemSpacing::Sparse)
@@ -1526,15 +1703,209 @@ pub(crate) fn render_pull_request_row(
                             h_flex()
                                 .gap_1()
                                 .flex_none()
-                                .child(chip(state))
-                                .when_some(decision, |chips, decision| chips.child(chip(decision)))
+                                .child(state_chip(state))
+                                .when_some(decision, |chips, decision| {
+                                    chips.child(state_chip(decision))
+                                })
                                 .when_some(viewer_review, |chips, review| {
-                                    chips.child(chip(review))
+                                    chips.child(state_chip(review))
                                 }),
                         ),
                 ),
         )
         .into_any_element()
+}
+
+/// A pull request's state as its rows show it: Open, Draft, Merged or Closed, and its color.
+pub(crate) fn pull_request_state(pull_request: &PullRequestSummary) -> (&'static str, Color) {
+    match pull_request.status {
+        PullRequestStatus::Merged => ("Merged", Color::Accent),
+        PullRequestStatus::Closed => ("Closed", Color::Error),
+        PullRequestStatus::Open if pull_request.is_draft => ("Draft", Color::Muted),
+        PullRequestStatus::Open => ("Open", Color::Success),
+    }
+}
+
+/// The review decision and the viewer's own verdict of a pull request, as chips' labels.
+fn review_labels(
+    pull_request: &PullRequestSummary,
+) -> (Option<(&'static str, Color)>, Option<(&'static str, Color)>) {
+    let decision = pull_request.review_decision.map(|decision| match decision {
+        ReviewDecision::Approved => ("Approved", Color::Success),
+        ReviewDecision::ChangesRequested => ("Changes requested", Color::Error),
+        ReviewDecision::ReviewRequired => ("Review required", Color::Warning),
+    });
+    let viewer_review = pull_request.viewer_review.map(|review| match review {
+        ReviewDecision::Approved => ("You approved", Color::Success),
+        ReviewDecision::ChangesRequested => ("You requested changes", Color::Error),
+        ReviewDecision::ReviewRequired => ("Review required", Color::Muted),
+    });
+    (decision, viewer_review)
+}
+
+fn state_chip((label, color): (&'static str, Color)) -> Chip {
+    Chip::new(label)
+        .label_size(LabelSize::XSmall)
+        .label_color(color)
+}
+
+/// A stack's number in its chain of pull requests: colored by its state, struck through when
+/// closed, underlined when `current`.
+pub(crate) fn stack_member_label(pull_request: &PullRequestSummary, current: bool) -> Label {
+    let (_, color) = pull_request_state(pull_request);
+    Label::new(format!("#{}", pull_request.number))
+        .size(LabelSize::XSmall)
+        .color(color)
+        .when(pull_request.status == PullRequestStatus::Closed, |label| {
+            label.strikethrough()
+        })
+        .when(current, |label| label.weight(FontWeight::BOLD).underline())
+}
+
+/// A stack's row: the pull request its review starts at (number, title, author, last update),
+/// then the stack from its base to its top, gh-stack's way (`main ← #1 ← #2`), each pull request
+/// colored by its state with the start underlined, and the start's position, state and reviews.
+/// `positions` are the matched characters of the start's `#number title`.
+pub(crate) fn render_stack_row(
+    id: ElementId,
+    listed: &ListedStack,
+    positions: &[usize],
+    selected: bool,
+    timezone: UtcOffset,
+) -> Option<AnyElement> {
+    let start = listed.start()?;
+    let stack = &listed.stack;
+    let number = format!("#{}", start.number);
+    let title_start = number.len() + 1;
+    let title_end = title_start + start.title.len();
+    let positions_in = |begin: usize, end: usize| {
+        positions
+            .iter()
+            .filter(|position| (begin..end).contains(*position))
+            .map(|position| position - begin)
+            .collect::<Vec<_>>()
+    };
+    let time = time_format::format_localized_timestamp(
+        start.updated_at,
+        OffsetDateTime::now_utc(),
+        timezone,
+        time_format::TimestampFormat::Relative,
+    );
+    let (decision, viewer_review) = review_labels(start);
+    let arrow = || {
+        Label::new("←")
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .flex_none()
+    };
+    let chain = h_flex()
+        .gap_1()
+        .min_w_0()
+        .overflow_hidden()
+        .child(
+            Label::new(stack.base_ref.clone())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .flex_none(),
+        )
+        .children(
+            stack
+                .pull_requests
+                .iter()
+                .enumerate()
+                .flat_map(|(index, pull_request)| {
+                    [
+                        arrow().into_any_element(),
+                        stack_member_label(pull_request, index == listed.start)
+                            .flex_none()
+                            .into_any_element(),
+                    ]
+                }),
+        );
+    Some(
+        ListItem::new(id)
+            .inset(true)
+            .spacing(ListItemSpacing::Sparse)
+            .toggle_state(selected)
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .child(
+                                        Icon::new(IconName::ListTree)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        HighlightedLabel::new(
+                                            number.clone(),
+                                            positions_in(0, number.len()),
+                                        )
+                                        .color(Color::Muted)
+                                        .flex_none(),
+                                    )
+                                    .child(
+                                        HighlightedLabel::new(
+                                            start.title.clone(),
+                                            positions_in(title_start, title_end),
+                                        )
+                                        .truncate(),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .flex_none()
+                                    .child(
+                                        Label::new(start.author.login.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(time).size(LabelSize::Small).color(Color::Muted),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .justify_between()
+                            .child(chain)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .flex_none()
+                                    .child(
+                                        Chip::new(format!(
+                                            "{} of {}",
+                                            listed.start + 1,
+                                            stack.pull_requests.len()
+                                        ))
+                                        .label_size(LabelSize::XSmall),
+                                    )
+                                    .child(state_chip(pull_request_state(start)))
+                                    .when_some(decision, |chips, decision| {
+                                        chips.child(state_chip(decision))
+                                    })
+                                    .when_some(viewer_review, |chips, review| {
+                                        chips.child(state_chip(review))
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]
@@ -1697,10 +2068,13 @@ mod tests {
 
     /// A checkout of the sandbox repository at PR #1's head, and a fake GitHub that knows its
     /// open pull requests and PR #1. `fail_lists` makes listing answer 401; `base_oid`, when set,
-    /// replaces PR #1's base commit.
+    /// replaces PR #1's base commit. With `stacked`, #1 and #3 are in stack 7: #5 (merged), #3
+    /// (approved by the viewer), #1, #6 (a draft), from the bottom; otherwise GitHub has no
+    /// stacks.
     async fn pull_request_fixture(
         fail_lists: Arc<std::sync::atomic::AtomicBool>,
         base_oid: Arc<std::sync::Mutex<Option<String>>>,
+        stacked: bool,
         cx: &mut TestAppContext,
     ) -> (
         Arc<FakeFs>,
@@ -1712,6 +2086,7 @@ mod tests {
             set_fake_token_source,
             test_support::{
                 OPEN_PULL_REQUESTS, PR1_DETAILS, Reply, fake_github, repository_context_reply,
+                stack_node, stacked_pull_request,
             },
         };
         use std::sync::atomic::Ordering;
@@ -1753,8 +2128,32 @@ mod tests {
                 if query.contains("is:closed") {
                     nodes = json!([]);
                 }
+                for node in nodes.as_array_mut().into_iter().flatten() {
+                    node["id"] = json!(format!("PR_{}", node["number"]));
+                }
                 Reply::json(json!({ "data": { "search": { "nodes": nodes } } }).to_string())
             }
+            Some("PullRequestStackIds") if stacked => {
+                let nodes = request.variables()["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|id| match id.as_str() {
+                        Some("PR_1" | "PR_3") => json!({ "stack": { "id": "PRS_7" } }),
+                        _ => json!({ "stack": null }),
+                    })
+                    .collect::<Vec<_>>();
+                Reply::json(json!({ "data": { "nodes": nodes } }).to_string())
+            }
+            Some("PullRequestStacks") if stacked => Reply::json(
+                json!({ "data": { "nodes": [stack_node(7, vec![
+                    stacked_pull_request(5, "MERGED", false, false),
+                    stacked_pull_request(3, "OPEN", false, true),
+                    stacked_pull_request(1, "OPEN", false, false),
+                    stacked_pull_request(6, "OPEN", true, false),
+                ])] } })
+                .to_string(),
+            ),
             Some("PullRequestDetails") => match base_oid.lock().unwrap().as_deref() {
                 Some(base_oid) => Reply::json(PR1_DETAILS.replace(PR1_BASE_OID, base_oid)),
                 None => Reply::json(PR1_DETAILS),
@@ -1816,7 +2215,7 @@ mod tests {
     async fn test_pull_request_section(cx: &mut TestAppContext) {
         let base_oid = Arc::new(std::sync::Mutex::new(None));
         let (fs, workspace, requests, cx) =
-            pull_request_fixture(Default::default(), base_oid.clone(), cx).await;
+            pull_request_fixture(Default::default(), base_oid.clone(), false, cx).await;
 
         // Local first, then the pull requests the setting's search finds (without the one the
         // viewer approved), then the commits.
@@ -2031,13 +2430,131 @@ mod tests {
         });
     }
 
+    /// Stacked pull requests the search finds are one row per stack, in a section of their own,
+    /// which reviews the stack's first pull request to review.
+    #[gpui::test]
+    async fn test_stacks_section(cx: &mut TestAppContext) {
+        let (_fs, workspace, _requests, cx) =
+            pull_request_fixture(Default::default(), Default::default(), true, cx).await;
+        dispatch(StartReview, cx);
+        let picker = start_review_picker(&workspace, cx);
+        assert_eq!(
+            entry_keys(&picker, cx),
+            [
+                None,
+                Some(EntryKey::Uncommitted),
+                Some(EntryKey::Branch),
+                None,
+                Some(EntryKey::Stack(7)),
+                None,
+                Some(EntryKey::PullRequest(4)),
+                None,
+                None,
+                Some(EntryKey::Commit(0)),
+            ]
+        );
+        picker.read_with(cx, |picker, _| {
+            let entries = picker.delegate.entries();
+            assert_eq!(entries[3], Entry::Header(Section::Stacks));
+            assert_eq!(entries[5], Entry::Header(Section::PullRequests));
+            // #5 is merged and the viewer approved #3: the review starts at #1.
+            let listed = &picker.delegate.loaded_stacks()[0];
+            assert_eq!(listed.start().map(|start| start.number), Some(1));
+            assert_eq!(
+                listed
+                    .stack
+                    .pull_requests
+                    .iter()
+                    .map(|pull_request| pull_request.number)
+                    .collect::<Vec<_>>(),
+                [5, 3, 1, 6]
+            );
+        });
+        assert_eq!(
+            statuses(&picker, cx),
+            ["1 pull request you approved is hidden"]
+        );
+
+        // Any of its pull requests' titles finds the stack.
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("layer 6", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(selected_key(&picker, cx), Some(EntryKey::Stack(7)));
+        picker.update_in(cx, |picker, window, cx| picker.set_query("", window, cx));
+        cx.run_until_parked();
+        dispatch(menu::Cancel, cx);
+
+        // Opened at the pull requests, the picker selects the first stack.
+        dispatch(OpenPullRequest::default(), cx);
+        let picker = start_review_picker(&workspace, cx);
+        assert_eq!(selected_key(&picker, cx), Some(EntryKey::Stack(7)));
+        dispatch(menu::Confirm, cx);
+        let review = active_review(&workspace, cx);
+        review.read_with(cx, |review, _| {
+            let ReviewTarget::PullRequest(target) = review.target() else {
+                panic!("expected a pull request review");
+            };
+            assert_eq!(target.number, 1);
+        });
+    }
+
+    #[test]
+    fn test_group_search_results() {
+        use crate::forge::{
+            PullRequestStatus::{Merged, Open},
+            tests::{layer, stack_of},
+        };
+        let approved = Some(ReviewDecision::Approved);
+        let stacks = vec![
+            stack_of(
+                30,
+                vec![layer(10, Merged, false, None), layer(11, Open, false, None)],
+            ),
+            stack_of(40, vec![layer(41, Open, false, approved)]),
+        ];
+        let found = vec![
+            layer(20, Open, false, None),
+            layer(41, Open, false, approved),
+            layer(11, Open, false, None),
+            layer(21, Open, false, approved),
+        ];
+        let numbers = |results: &SearchResults| {
+            (
+                results
+                    .stacks
+                    .iter()
+                    .map(|listed| (listed.stack.number, listed.start))
+                    .collect::<Vec<_>>(),
+                results
+                    .pull_requests
+                    .iter()
+                    .map(|pull_request| pull_request.number)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // Stack 40 has nothing found but what the viewer approved.
+        let (results, approved_hidden) = group_search_results(found.clone(), stacks.clone(), true);
+        assert_eq!(numbers(&results), (vec![(30, 1)], vec![20]));
+        assert_eq!(approved_hidden, 2);
+
+        let (results, approved_hidden) = group_search_results(found.clone(), stacks, false);
+        assert_eq!(numbers(&results), (vec![(40, 0), (30, 1)], vec![20, 21]));
+        assert_eq!(approved_hidden, 0);
+
+        // Without stacks, every pull request is listed alone.
+        let (results, _) = group_search_results(found, Vec::new(), false);
+        assert_eq!(numbers(&results), (vec![], vec![20, 41, 11, 21]));
+    }
+
     #[gpui::test]
     async fn test_pull_request_section_errors(cx: &mut TestAppContext) {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let fail_lists = Arc::new(AtomicBool::new(true));
         let (_fs, workspace, _requests, cx) =
-            pull_request_fixture(fail_lists.clone(), Default::default(), cx).await;
+            pull_request_fixture(fail_lists.clone(), Default::default(), false, cx).await;
         dispatch(StartReview, cx);
         let picker = start_review_picker(&workspace, cx);
         assert_eq!(

@@ -1,0 +1,9 @@
+- markdown is rendered with line wrapping for me, but diff shown doesn't wrap lines (generally i'd guess).
+    - leads to cases where the entire line is off-screen and i can't actually see anything (no horizontal scroll either...)
+- general lag when scrolling around with j or k keybinds, visually low FPS (seems to skip some lines)
+    - you should not have to introduce ANY lag here. if you are, you should remove any customization and mostly stick to the normal editor controls (keeping things read-only) instead of customizing to have this cross-bar highlight. that was nice to have, but not worth any performance loss.
+- ctrl+u seems to break if scrolling up to the top of the diff
+    - starts to loop down and count very strangely...
+- issue links not rendered, stay as plain numbers. need to have a link so i can view them.
+    - at some point, should ideally render into dropdown so i can view inline
+- "expand exerpt" and + buttons overlap, should not happen. both are frequently used.

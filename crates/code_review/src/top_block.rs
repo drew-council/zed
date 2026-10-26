@@ -5,8 +5,12 @@ use crate::{
     },
     commits::CommitChain,
     diff::ReviewDiff,
-    forge::{ForgeRepo, PullRequestStatus, RemoteReviewSummary, ReviewDecision, ReviewState},
-    pull_request::{PullRequestState, ThreadFilters},
+    forge::{
+        ForgeRepo, PullRequestStack, PullRequestStatus, RemoteReviewSummary, ReviewDecision,
+        ReviewState,
+    },
+    picker::{pull_request_state, stack_member_label},
+    pull_request::{PullRequestState, ThreadFilters, open_in_stack},
     target::CommitRange,
     view::ReviewView,
 };
@@ -23,7 +27,7 @@ use language::LanguageRegistry;
 use markdown::{Markdown, MarkdownElement};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
-use ui::{Checkbox, Disclosure, ToggleState, Tooltip, prelude::*};
+use ui::{ButtonLike, Checkbox, Disclosure, ToggleState, Tooltip, prelude::*};
 use util::{ResultExt as _, truncate_and_trailoff};
 
 /// The review's overview, at the top of the diff: the commit messages of a commit review, the
@@ -363,7 +367,7 @@ impl ReviewTopBlock {
                 .color(Color::Muted)
                 .into_any_element();
         };
-        let (details, summaries, hidden_bot_summaries, load_errors) = {
+        let (details, summaries, hidden_bot_summaries, load_errors, stack) = {
             let pull_request = state.read(cx);
             (
                 pull_request.details().clone(),
@@ -373,8 +377,10 @@ impl ReviewTopBlock {
                     .collect::<Vec<_>>(),
                 pull_request.hidden_bot_summaries(),
                 pull_request.load_errors().to_vec(),
+                pull_request.stack().cloned(),
             )
         };
+        let stack = stack.map(|stack| self.render_stack(&stack, number));
         // Another branch checked out, or the pull request moved on.
         let local_head = self
             .view
@@ -569,8 +575,75 @@ impl ReviewTopBlock {
         v_flex()
             .gap_1()
             .child(header)
+            .children(stack)
             .children(warnings)
             .children(body)
+            .into_any_element()
+    }
+
+    /// The stack the pull request is in, gh-stack's way from its base to its top (`main ← #1 ←
+    /// #2`), each pull request colored by its state and the reviewed one underlined. A click
+    /// reviews another one instead.
+    fn render_stack(&self, stack: &PullRequestStack, number: u64) -> AnyElement {
+        let position = stack.position(number);
+        let arrow = || Label::new("←").size(LabelSize::XSmall).color(Color::Muted);
+        let members = stack
+            .pull_requests
+            .iter()
+            .enumerate()
+            .flat_map(|(index, pull_request)| {
+                let is_current = position == Some(index);
+                let (state, _) = pull_request_state(pull_request);
+                let tooltip = format!(
+                    "#{} {} · {state}{}",
+                    pull_request.number,
+                    pull_request.title,
+                    if is_current { " · Reviewing" } else { "" }
+                );
+                let target = pull_request.number;
+                let view = self.view.clone();
+                let member = ButtonLike::new(("review-stack-member", index))
+                    .toggle_state(is_current)
+                    .child(stack_member_label(pull_request, is_current))
+                    .tooltip(Tooltip::text(tooltip))
+                    .when(!is_current, |member| {
+                        member.on_click(move |_, window, cx| {
+                            let Some(review) = view.upgrade() else {
+                                return;
+                            };
+                            let workspace = review.read(cx).workspace().clone();
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    open_in_stack(workspace, review, target, window, cx)
+                                })
+                                .log_err();
+                        })
+                    });
+                [arrow().into_any_element(), member.into_any_element()]
+            });
+        h_flex()
+            .debug_selector(|| "review-pull-request-stack".into())
+            .flex_wrap()
+            .gap_1()
+            .child(
+                Label::new(match position {
+                    Some(position) => format!(
+                        "Stack #{} · {} of {}:",
+                        stack.number,
+                        position + 1,
+                        stack.pull_requests.len()
+                    ),
+                    None => format!("Stack #{}:", stack.number),
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new(stack.base_ref.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .children(members)
             .into_any_element()
     }
 

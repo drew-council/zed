@@ -7,8 +7,9 @@ use crate::{
     comments::{CommentId, CommentTarget, Side},
     forge::{
         self, CommentableLines, DiffSide, Forge, ForgeRepoRef, GitHubError, LinesRefusal,
-        PullRequestDetails, RemoteReviewSummary, RemoteThread, RepositoryContext, ReviewEvent,
-        ReviewSubmission, SubmitAttempt, SubmittedReview, ThreadAnchor,
+        PullRequestDetails, PullRequestStack, RemoteReviewSummary, RemoteThread, RepositoryContext,
+        ReviewEvent, ReviewSubmission, StackDirection, SubmitAttempt, SubmittedReview,
+        ThreadAnchor,
     },
     github::{self, GitHubRemote},
     session::{ReviewKey, ReviewOutcome, ReviewSession},
@@ -26,7 +27,7 @@ use git::{
 use gpui::{
     App, AppContext as _, AsyncApp, AsyncWindowContext, BackgroundExecutor, ClipboardItem, Context,
     Entity, EntityId, EventEmitter, Global, PromptLevel, SharedString, Subscription, Task,
-    WeakEntity, Window,
+    TaskExt as _, WeakEntity, Window,
 };
 use language::{Buffer, BufferSnapshot, Point};
 use project::{
@@ -45,7 +46,7 @@ use std::{
     time::Duration,
 };
 use util::{ResultExt as _, path_list::PathList};
-use workspace::{OpenMode, Toast, Workspace, notifications::NotificationId};
+use workspace::{OpenMode, SaveIntent, Toast, Workspace, notifications::NotificationId};
 
 /// What the review tabs of one pull request share: the forge it is on, its details, and what it
 /// has on GitHub besides the code (threads, summaries, GitHub's own diff).
@@ -59,6 +60,8 @@ pub struct PullRequestState {
     summaries: Vec<RemoteReviewSummary>,
     /// GitHub's diff hunks: comments are only accepted inside them.
     commentable: Option<CommentableLines>,
+    /// The stack the pull request is in, once loaded.
+    stack: Option<PullRequestStack>,
     filters: ThreadFilters,
     is_loading: bool,
     load_errors: Vec<SharedString>,
@@ -123,6 +126,19 @@ struct UncertainSubmit {
 
 /// The toast saying a review was posted.
 pub(crate) struct ReviewSubmittedToast;
+
+/// Where a pull request is in its stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StackPosition {
+    /// The stack's number.
+    pub(crate) stack: u64,
+    /// From the bottom, 0-based.
+    pub(crate) position: usize,
+    pub(crate) count: usize,
+    /// The numbers of the nearest open pull requests below and above it.
+    pub(crate) below: Option<u64>,
+    pub(crate) above: Option<u64>,
+}
 
 /// Which review threads and review summaries of a pull request show, for all its tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -195,6 +211,7 @@ impl PullRequestState {
                 threads: Vec::new(),
                 summaries: Vec::new(),
                 commentable: None,
+                stack: None,
                 filters: ThreadFilters::default(),
                 is_loading: false,
                 load_errors: Vec::new(),
@@ -239,6 +256,28 @@ impl PullRequestState {
 
     pub fn threads(&self) -> &[Arc<RemoteThread>] {
         &self.threads
+    }
+
+    pub fn stack(&self) -> Option<&PullRequestStack> {
+        self.stack.as_ref()
+    }
+
+    /// Where the pull request is in its stack, once that is loaded.
+    pub(crate) fn stack_position(&self) -> Option<StackPosition> {
+        let stack = self.stack.as_ref()?;
+        let number = self.details.number;
+        let neighbor = |direction| {
+            stack
+                .neighbor(number, direction)
+                .map(|neighbor| neighbor.number)
+        };
+        Some(StackPosition {
+            stack: stack.number,
+            position: stack.position(number)?,
+            count: stack.pull_requests.len(),
+            below: neighbor(StackDirection::Down),
+            above: neighbor(StackDirection::Up),
+        })
     }
 
     pub(crate) fn commentable(&self) -> Option<&CommentableLines> {
@@ -701,6 +740,12 @@ impl PullRequestState {
             Ok(files) => self.commentable = Some(files),
             Err(error) => record(error),
         }
+        // Not a load error: a GitHub without stacks (GitHub Enterprise Server) fails it every
+        // time, and the review works without it.
+        match loaded.stack {
+            Ok(stack) => self.stack = stack,
+            Err(error) => log::warn!("loading the stack of pull request #{number}: {error:#}"),
+        }
         self.forge = forge;
         self.forge_is_stale = auth_failed;
         self.load_errors = errors;
@@ -1130,6 +1175,7 @@ struct Loaded {
     threads: Result<Vec<RemoteThread>>,
     summaries: Result<Vec<RemoteReviewSummary>>,
     files: Result<CommentableLines>,
+    stack: Result<Option<PullRequestStack>>,
 }
 
 impl Loaded {
@@ -1157,6 +1203,7 @@ async fn fetch(
     let threads = executor.spawn(forge.review_threads(number));
     let summaries = executor.spawn(forge.review_summaries(number));
     let files = executor.spawn(forge.changed_files(number));
+    let stack = executor.spawn(forge.pull_request_stack(number));
     let details = match details {
         Some(details) => Some(details.await),
         None => None,
@@ -1166,6 +1213,7 @@ async fn fetch(
         threads: threads.await,
         summaries: summaries.await,
         files: files.await,
+        stack: stack.await,
     }
 }
 
@@ -1423,6 +1471,110 @@ pub(crate) fn open_pull_request_and_notify(
                 log::error!("opening a pull request: {error:#}");
             }
         }
+    })
+    .detach();
+}
+
+/// The toast saying where a stack can't be stepped through.
+struct StackNavigationToast;
+
+/// Reviews the nearest open pull request above or below `review`'s in its stack instead (see
+/// [`open_in_stack`]), or says in a toast why there is none.
+pub(crate) fn open_stack_neighbor(
+    workspace: &mut Workspace,
+    review: Entity<ReviewView>,
+    direction: StackDirection,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let message = match review.read(cx).pull_request() {
+        None => "Open a pull request review first".to_string(),
+        Some(pull_request) => {
+            let pull_request = pull_request.read(cx);
+            let number = pull_request.details().number;
+            match pull_request.stack() {
+                None if pull_request.is_loading() => {
+                    format!("Loading the stack of pull request #{number}…")
+                }
+                None => format!("Pull request #{number} isn't in a stack"),
+                Some(stack) => match stack.neighbor(number, direction) {
+                    Some(neighbor) => {
+                        let neighbor = neighbor.number;
+                        open_in_stack(workspace, review, neighbor, window, cx);
+                        return;
+                    }
+                    None => match direction {
+                        StackDirection::Up => {
+                            format!("No open pull request above #{number} in its stack")
+                        }
+                        StackDirection::Down => {
+                            format!("No open pull request below #{number} in its stack")
+                        }
+                    },
+                },
+            }
+        }
+    };
+    workspace.show_toast(
+        Toast::new(NotificationId::unique::<StackNavigationToast>(), message).autohide(),
+        cx,
+    );
+}
+
+/// Reviews pull request `number`, of the stack of `review`'s pull request, instead of that one:
+/// checked out in the review's repository (in place), in a tab that replaces the review's once it
+/// is open. The review's drafts stay in its session, for when it is opened again.
+pub(crate) fn open_in_stack(
+    workspace: &mut Workspace,
+    review: Entity<ReviewView>,
+    number: u64,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let (repository, canonical) = {
+        let view = review.read(cx);
+        let Some(pull_request) = view.pull_request() else {
+            return;
+        };
+        (
+            view.repository().clone(),
+            pull_request.read(cx).forge().context().canonical.clone(),
+        )
+    };
+    let reference = PullRequestReference {
+        repo: Some(ForgeRepoRef {
+            host: Some(canonical.host),
+            owner: canonical.owner,
+            name: canonical.name,
+        }),
+        number,
+    };
+    let task = open_pull_request(
+        workspace,
+        repository,
+        reference,
+        OpenPullRequestOptions::default(),
+        window,
+        cx,
+    );
+    cx.spawn_in(window, async move |workspace, cx| {
+        let result = task.await;
+        workspace
+            .update_in(cx, |workspace, window, cx| match result {
+                Ok(opened) => {
+                    forge::dismiss_error_toast(workspace, cx);
+                    if opened != review
+                        && let Some(pane) = workspace.pane_for(&review)
+                    {
+                        pane.update(cx, |pane, cx| {
+                            pane.close_item_by_id(review.entity_id(), SaveIntent::Skip, window, cx)
+                        })
+                        .detach_and_log_err(cx);
+                    }
+                }
+                Err(error) => forge::show_error_toast(workspace, &error, cx),
+            })
+            .log_err();
     })
     .detach();
 }
@@ -2510,6 +2662,117 @@ pub(crate) mod tests {
                 LineMapping::Lines(59..=59),
                 "threads still show"
             );
+        }
+
+        /// A pull request review in a stack shows the stack, and steps up and down it to the
+        /// open pull requests, each replacing the tab of the one before.
+        #[gpui::test]
+        async fn test_stack_navigation(cx: &mut TestAppContext) {
+            use crate::{
+                NextPullRequestInStack, PreviousPullRequestInStack, ReviewPanel,
+                github::test_support::{stack_node, stacked_pull_request},
+                test_support::{add_review_panel, click_selector, redraw, review_count, tab_title},
+            };
+
+            // #1 is between a merged #5 and a closed #8, with the draft #4 on top. #4's head is
+            // #1's, so that it opens without a checkout.
+            let stack = stack_node(
+                7,
+                vec![
+                    stacked_pull_request(5, "MERGED", false, false),
+                    stacked_pull_request(1, "OPEN", false, false),
+                    stacked_pull_request(8, "CLOSED", false, false),
+                    stacked_pull_request(4, "OPEN", true, false),
+                ],
+            );
+            let mut pr4_details: serde_json::Value = serde_json::from_str(PR1_DETAILS).unwrap();
+            let details = &mut pr4_details["data"]["repository"]["pullRequest"];
+            details["number"] = json!(4);
+            details["title"] = json!("Layer 4");
+            details["isDraft"] = json!(true);
+            let respond = move |request: &SentRequest| {
+                let number = request.variables()["number"].as_u64();
+                match request.operation() {
+                    Some("PullRequestStackOf") => Some(Reply::json(
+                        json!({ "data": { "repository": { "pullRequest": { "stack": stack } } } })
+                            .to_string(),
+                    )),
+                    Some("PullRequestDetails") if number == Some(4) => {
+                        Some(Reply::json(pr4_details.to_string()))
+                    }
+                    None if request.uri.contains("/pulls/4/files") => Some(Reply::json(PR1_FILES)),
+                    _ => None,
+                }
+            };
+            let fixture = Fixture {
+                respond: Some(Arc::new(respond)),
+                ..Fixture::default()
+            };
+            let (_fs, workspace, review, _requests, cx) = open_review(fixture, cx).await;
+            add_review_panel(&workspace, cx);
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_panel::<ReviewPanel>(window, cx)
+            });
+            cx.run_until_parked();
+            let position = |review: &Entity<ReviewView>, cx: &mut VisualTestContext| {
+                review.read_with(cx, |review, cx| {
+                    review.pull_request().unwrap().read(cx).stack_position()
+                })
+            };
+            assert_eq!(
+                position(&review, cx),
+                Some(StackPosition {
+                    stack: 7,
+                    position: 1,
+                    count: 4,
+                    below: None,
+                    above: Some(4),
+                })
+            );
+            redraw(cx);
+            for selector in [
+                "review-pull-request-stack",
+                "review-toolbar-next-in-stack",
+                "review-panel-stack",
+            ] {
+                assert!(
+                    cx.debug_bounds(selector).is_some(),
+                    "{selector} isn't drawn"
+                );
+            }
+
+            // Nothing open below #1: a toast, and the review stays.
+            dispatch(PreviousPullRequestInStack, cx);
+            assert_eq!(notification_count(&workspace, cx), 1);
+            assert_eq!(active_review(&workspace, cx), review);
+
+            // Up skips the closed #8; #4's tab replaces #1's.
+            dispatch(NextPullRequestInStack, cx);
+            let next = active_review(&workspace, cx);
+            assert_ne!(next, review);
+            assert_eq!(review_count(&workspace, cx), 1);
+            assert_eq!(tab_title(&next, cx), "PR #4: Layer 4");
+            assert_eq!(
+                position(&next, cx).map(|position| (position.position, position.below)),
+                Some((3, Some(1)))
+            );
+
+            // `[ s` steps back down, and the toolbar's button back up.
+            cx.focus(&next);
+            cx.simulate_keystrokes("[ s");
+            cx.run_until_parked();
+            let back = active_review(&workspace, cx);
+            assert_eq!(
+                tab_title(&back, cx),
+                "PR #1: Add template filters and retire the legacy renderer"
+            );
+            assert_eq!(review_count(&workspace, cx), 1);
+            click_selector("review-toolbar-next-in-stack", cx);
+            assert_eq!(
+                tab_title(&active_review(&workspace, cx), cx),
+                "PR #4: Layer 4"
+            );
+            assert_eq!(review_count(&workspace, cx), 1);
         }
 
         #[gpui::test]
