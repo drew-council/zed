@@ -245,7 +245,33 @@ impl Vim {
                     _ => starting_column,
                 };
 
-                let new_head = map.clip_point(DisplayPoint::new(new_row, new_column), Bias::Left);
+                // A row inside a block (a diagnostic, a multibuffer's file header, a block
+                // taller than the margin) has no cursor position: leave it the way the view
+                // scrolled, so the cursor never moves against the scroll, and stay on screen
+                // when the other way does and still goes with the scroll.
+                let target = DisplayPoint::new(new_row, new_column);
+                let vertical = matches!(amount, ScrollAmount::Line(_) | ScrollAmount::Page(_));
+                let downwards = vertical && !amount.direction().is_upwards();
+                let (toward, away) = if downwards {
+                    (Bias::Right, Bias::Left)
+                } else {
+                    (Bias::Left, Bias::Right)
+                };
+                let mut new_head = map.clip_point(target, toward);
+                let visible = min_row..=max_row;
+                if !visible.contains(&new_head.row()) {
+                    let other = map.clip_point(target, away);
+                    let with_scroll = if !vertical {
+                        true
+                    } else if downwards {
+                        other.row() >= head.row()
+                    } else {
+                        other.row() <= head.row()
+                    };
+                    if visible.contains(&other.row()) && with_scroll {
+                        new_head = other;
+                    }
+                }
                 let goal = match amount {
                     ScrollAmount::Column(_) | ScrollAmount::PageWidth(_) => SelectionGoal::None,
                     _ => goal,

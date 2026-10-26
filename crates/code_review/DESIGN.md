@@ -42,7 +42,8 @@ and the text, off the excerpts' expand buttons (see "Gutter buttons don't overla
 references (`#123`, `owner/repo#123`, `GH-123`) in GitHub's text link to GitHub (see "GitHub
 references link"), and long lines wrap in the diff by default, on both sides (see "Long lines
 wrap"). Then the Start Review picker loads its pull requests about 3× faster and takes most of the
-window (see "Faster, bigger Start Review picker").
+window (see "Faster, bigger Start Review picker"). Then `ctrl-u`/`ctrl-d` work over the diff's blocks
+(see "`ctrl-u`/`ctrl-d` over blocks").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -2144,7 +2145,8 @@ symbol and do `gd`". Split view stays (upstream's works with a real cursor).
   `keep_scroll_at_start` (block heights at the very top; not a cursor follow).
 - **`ctrl-u` loop**: not reproduced in GPUI tests, neither before nor after (the old code passes the
   new test too), so the cause isn't pinned down. All the review's own cursor and scroll code is gone; what
-  scrolls is upstream's.
+  scrolls is upstream's. **Wrong: it was still broken**, upstream's own — see "`ctrl-u`/`ctrl-d`
+  over blocks".
 - Tests: `line_cursor.rs`'s tests removed with it; tests on `e`, `{`/`}`, `m`/`M`, `y`/`Y`, visual
   `y`, the cursor highlight and `gg`'s header-at-top updated or dropped; new
   `pull_request::test_half_page_scrolls_reach_both_ends` (`ctrl-u`/`ctrl-d` from end to end, view
@@ -2311,6 +2313,35 @@ kinda small on screen … i care about width AND height being FAR too small".
 - Possible next steps (not done): ask for the search hits' decisions while the stacks load
   (chips ~3 s sooner), and keep the last results per search to show at once when the picker
   reopens while they refresh.
+
+**`ctrl-u`/`ctrl-d` over blocks (the user's report after the picker)** — "ctrl+u is STILL BROKEN! …
+it still has cases where it starts to just switch between two adjacent lines or move DOWN LINE BY
+LINE for NO REASON! it should keep going up until it reaches the top of the diff!" The earlier
+"Upstream vim in the review tab" left it unreproduced and claimed nothing about the cause; it was
+upstream's, in Zed's editor and vim, and shows wherever tall blocks are (the review is full of
+them: the overview, file headers, comments and threads).
+
+- **Reproduced** with a probe over the PR A fixture plus two 8-line comments, 4 window sizes, every
+  5th row as the start, `ctrl-u` and `ctrl-d` with a frame drawn after each key: the first `ctrl-u`
+  from the diff's first row moved the cursor 3 rows *down*; after the first fix, `ctrl-d` left the
+  cursor behind (stuck on a row while the view scrolled on) in 33 of the runs.
+- **Cause 1** (`ctrl-u` down): Zed's scroll position is an anchor (a buffer row) plus an offset; a view
+  whose top is inside the blocks above a row keeps that row's anchor with a negative offset.
+  `scroll_top_display_point` returned the anchor's row and dropped the offset, so vim saw the top
+  as the row below the blocks, unchanged by the scroll (`old_top == top`), and its scroll margin
+  (`top + 3`) pulled the cursor down. Every user of it took it for the first visible row (vim's
+  `ctrl-u/d/f/b`, `H`/`M`/`L`, the editor's own scroll-and-clamp, `newest_selection_on_screen`).
+  Fix: the real top row, `floor(scroll_position.y)`.
+- **Cause 2** (`ctrl-d` left the cursor behind): vim moves the cursor by display rows; a target inside
+  a block was clipped with `Bias::Left`, to the row above the block, which after a scroll down is
+  above the view: off screen, so the next `ctrl-d` didn't move it at all
+  (`newest_selection_on_screen`). Fix: leave a block the way the view scrolled, the other way only
+  when that stays on screen and still goes with the scroll.
+- Both in core patch #8 (§3.10); 237 pass, 1 ignored. Tests: `pull_request::test_half_page_scrolls_go_one_way` and
+  `…_in_split_view` (comment blocks, 800×400 and 1600×1000, every 9th row as the start, `ctrl-u` and
+  `ctrl-d` until they stop: the view and the cursor move one way only and the cursor ends on the
+  first or last row); both fail without the fix (`ctrl-u` from row 0: row 0 → row 3). vim's 577
+  tests and editor's scroll/split tests pass. Not done: a live run.
 
 **Known issues / notes for the next slices:**
 
@@ -2875,8 +2906,9 @@ crates/code_review/
   (`selections.newest_adjusted`; an end at column 0 excludes that row).
 - Cursor never lands on custom blocks (`BlockSnapshot::clip_point`, `block_map.rs:2504-2558`);
   folded (reviewed) file headers *are* cursor stops.
-- Vim counts count buffer lines, not blocks (`vim/src/motion.rs:1537-1606`). Upstream's half-page
-  scroll leaves an off-screen cursor where it is (`newest_selection_on_screen`), so at the top of a
+- Vim counts count buffer lines, not blocks (`vim/src/motion.rs:1537-1606`). Half-page scrolls over
+  blocks needed core patch #8 (see "`ctrl-u`/`ctrl-d` over blocks"). Upstream's half-page scroll
+  still leaves an off-screen cursor where it is (`newest_selection_on_screen`), so at the top of a
   review whose overview fills the view, `ctrl-u` scrolls without moving the cursor.
 
 ### 3.5 Comment blocks & editors
@@ -2998,6 +3030,7 @@ change, so mismatched CLI/app versions don't break).
 | `crates/cli/src/main.rs` | `--review` flag (M8 + polish A, +58/−4: `mod review`, help example, the flag and its help and conflicts, `try_parse` (usage errors exit 1), link + path, the ping marker check, "Zed exited before the review finished") |
 | `crates/cli/src/review.rs` | new file (M8): the `--review` request and `check_exit` (95 lines + tests) |
 | `crates/editor/src/scroll.rs`, `scroll/autoscroll.rs`, `editor.rs` (`RowHighlightOptions`) | None any more: core patches #2 (`set_forbid_horizontal_autoscroll`) and #3 (`RowHighlightOptions::include_end_row`) went with the line cursor ("Upstream vim in the review tab"), #1 in polish B. `git diff v1.25.0-pre -- crates/editor/src/scroll.rs crates/editor/src/scroll/autoscroll.rs crates/editor/src/config.rs` is empty |
+| `crates/editor/src/scroll.rs`, `crates/vim/src/normal/scroll.rs`, `crates/vim/src/motion.rs` | Core patch #8 ("`ctrl-u`/`ctrl-d` over blocks", +11/−1 in `scroll.rs`, +27/−1 in vim's `scroll.rs`, +9/−3 in `motion.rs`): `SharedScrollAnchor::scroll_top_display_point` returns the view's real top row (the anchor's row moved by the offset, `floor(scroll_position.y)`; the anchor's own point when that's its row, so nothing changes without tall blocks); vim's half-page/line scroll leaves a block row for the cursor the way the view scrolled (`Bias::Right` down, `Left` up), taking the other way only when that stays on screen and still goes with the scroll; `window_bottom` (`L`) adds only the offset's fraction. Tests in `code_review` (`test_half_page_scrolls_go_one_way`, `…_in_split_view`); vim's 577 and editor's scroll/split tests pass |
 | `crates/editor/src/display_map/block_map.rs` | Core patch #5 (UX-1, +14/−1): `Block::is_above_start` (a custom block at `BlockPlacement::Above(Anchor::Min)`) sorts right after the start comparison in `sort_blocks`, so it comes before the first buffer's header and a folded first buffer (`dedup_by` keeps both), and `balancing_block` keeps `Anchor::Min` for its spacer on the other side (else an excerpt anchor after that side's header). Upstream places no block there (only a test on a headerless singleton). Tests +127 (`test_block_above_multibuffer_start`) |
 | `crates/editor/src/split_editor_view.rs`, `element.rs` (`render_blocks`), `editor.rs` | Core patch #7 (UX-1, +149 in `split_editor_view.rs`, +13 in `element.rs`, +3 in `editor.rs`): `Editor::set_full_width_block(Option<CustomBlockId>)`. When that editor is the right side of a split diff, its `EditorElement` skips the block (and hands a focused-block record for it on), and `SplitBufferHeadersElement::build_full_width_block` renders it with the block's own render callback across the overlay's width, measures it there (`resize_blocks`, which resizes the left spacer too), paints it under the file headers, and keeps it rendered below the view while it holds the focus. Unsplit, nothing changes. Tests in `split.rs` +217 with #5's (`test_block_above_start_leads_both_sides`, `test_full_width_block_in_split_view`) |
 | `crates/editor/src/gutter_row.rs` (new), `element.rs` (prepaint/paint), `element/mouse.rs`, `editor.rs` | Core patch #6 (UX-1, for slice B's gutter "+": 119-line new file, +48 in `element.rs`, +14 in `mouse.rs`, +8 in `editor.rs`): `GutterRow`/`GutterRowRenderer` (`Rc<dyn Fn(&GutterRow, &mut Window, &mut App) -> Option<AnyElement>>`), `Editor::set_gutter_row_renderer`, `hovered_gutter_row`, `start_gutter_row_drag` + `GutterRowDragEnd`. The renderer's elements are prepainted with `Gutter::prepaint_button` for each visible row with a buffer row (both split sides, deleted rows too) and painted with the gutter indicators; `mouse_moved` tracks the hovered row (only while a renderer is set) and a drag's current row, `mouse_up` ends the drag. "Gutter buttons don't overlap" added `GutterRow::right_padding` (+6 in `gutter_row.rs`, +10 in `element.rs`): the gutter's right padding, between the line numbers and the text, as x offsets from the element's origin (`prepaint_button` draws it after the git strip), where the review puts its "+". Tests +152 in `editor_tests.rs` (`test_gutter_row_renderer_hover_and_drag`, which also checks `right_padding`) |

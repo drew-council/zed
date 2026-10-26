@@ -108,7 +108,17 @@ impl SharedScrollAnchor {
             snapshot
         };
 
-        self.scroll_anchor.anchor.to_display_point(snapshot)
+        // The view's top is the anchor's row moved by the offset, which reaches past the row when
+        // blocks sit above it (the top inside a tall block above a row is still that row's
+        // anchor): callers take this for the first visible row.
+        let anchor_point = self.scroll_anchor.anchor.to_display_point(snapshot);
+        let top_row = (self.scroll_anchor.scroll_position(snapshot).y.floor() as u32)
+            .min(snapshot.max_point().row().0);
+        if top_row == anchor_point.row().0 {
+            anchor_point
+        } else {
+            DisplayPoint::new(DisplayRow(top_row), 0)
+        }
     }
 }
 

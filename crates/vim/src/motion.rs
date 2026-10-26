@@ -3121,9 +3121,15 @@ fn window_bottom(
         let first_visible_line = text_layout_details
             .scroll_anchor
             .scroll_top_display_point(map);
-        let bottom_row = first_visible_line.row().0
-            + (visible_rows + text_layout_details.scroll_anchor.scroll_anchor.offset.y - 1.).floor()
-                as u32;
+        // The first visible line already has the offset's whole rows (blocks above the anchor).
+        let top_row_hidden = text_layout_details
+            .scroll_anchor
+            .scroll_anchor
+            .offset
+            .y
+            .rem_euclid(1.);
+        let bottom_row =
+            first_visible_line.row().0 + (visible_rows + top_row_hidden - 1.).floor() as u32;
         if bottom_row < map.max_point().row().0
             && text_layout_details.vertical_scroll_margin as usize > times
         {

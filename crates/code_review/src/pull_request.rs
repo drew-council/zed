@@ -3928,6 +3928,96 @@ pub(crate) mod tests {
             });
         }
 
+        /// `ctrl-u` and `ctrl-d` from all over a review with tall blocks (the overview, file
+        /// headers, comments) move the view and the cursor one way only, until the cursor reaches
+        /// the diff's first or last row. Zed's scroll top used to be the scroll anchor's row even
+        /// when the view's top was in the blocks above it, and vim moved a cursor that landed in a
+        /// block to the row above: `ctrl-u` dragged the cursor down, `ctrl-d` left it behind.
+        async fn assert_half_page_scrolls_go_one_way(split: bool, cx: &mut TestAppContext) {
+            use editor::SelectionEffects;
+            let (_fs, _workspace, review, _requests, cx) = open_review(
+                Fixture {
+                    split,
+                    ..Fixture::default()
+                },
+                cx,
+            )
+            .await;
+            let rhs = rhs_editor(&review, cx);
+            for text in ["ENGINE 59", "filter 25"] {
+                move_to_row_with_text(&rhs, text, cx);
+                cx.simulate_keystrokes("c");
+                cx.simulate_input("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+                cx.simulate_keystrokes("ctrl-enter");
+            }
+            let position = |cx: &mut VisualTestContext| {
+                draw(cx);
+                rhs.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let head = editor.selections.newest::<Point>(&snapshot).head();
+                    (editor.scroll_position(cx).y, head.row)
+                })
+            };
+            for (width, height) in [(800., 400.), (1600., 1000.)] {
+                cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(height)));
+                cx.run_until_parked();
+                let last_row = rhs.update(cx, |editor, cx| {
+                    editor.buffer().read(cx).snapshot(cx).max_point().row
+                });
+                for start in (0..=last_row).step_by(9) {
+                    for (keys, up) in [("ctrl-u", true), ("ctrl-d", false)] {
+                        rhs.update_in(cx, |editor, window, cx| {
+                            editor.change_selections(
+                                SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+                                window,
+                                cx,
+                                |selections| {
+                                    selections
+                                        .select_ranges([Point::new(start, 0)..Point::new(start, 0)])
+                                },
+                            )
+                        });
+                        let mut previous = position(cx);
+                        let mut trace = vec![previous];
+                        loop {
+                            cx.simulate_keystrokes(keys);
+                            let current = position(cx);
+                            trace.push(current);
+                            let one_way = if up {
+                                current.0 <= previous.0 && current.1 <= previous.1
+                            } else {
+                                current.0 >= previous.0 && current.1 >= previous.1
+                            };
+                            assert!(
+                                one_way,
+                                "{keys} at {width}x{height} from row {start}: {trace:?}"
+                            );
+                            if current == previous {
+                                break;
+                            }
+                            assert!(trace.len() < 80, "{keys} doesn't stop: {trace:?}");
+                            previous = current;
+                        }
+                        let end = if up { 0 } else { last_row };
+                        assert_eq!(
+                            previous.1, end,
+                            "{keys} at {width}x{height} from row {start}: {trace:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[gpui::test]
+        async fn test_half_page_scrolls_go_one_way(cx: &mut TestAppContext) {
+            assert_half_page_scrolls_go_one_way(false, cx).await
+        }
+
+        #[gpui::test]
+        async fn test_half_page_scrolls_go_one_way_in_split_view(cx: &mut TestAppContext) {
+            assert_half_page_scrolls_go_one_way(true, cx).await
+        }
+
         /// Vim's half-page scrolls run to either end of a review with the overview above its
         /// first file, expanded or collapsed, moving the view and the cursor one way only.
         #[gpui::test]
