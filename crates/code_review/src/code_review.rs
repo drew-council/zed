@@ -8,6 +8,7 @@ mod export;
 pub mod forge;
 mod gitattributes;
 mod github;
+mod opening;
 mod panel;
 mod persistence;
 mod picker;

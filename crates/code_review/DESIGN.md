@@ -44,7 +44,8 @@ references link"), and long lines wrap in the diff by default, on both sides (se
 wrap"). Then the Start Review picker loads its pull requests about 3× faster and takes most of the
 window (see "Faster, bigger Start Review picker"). Then `ctrl-u`/`ctrl-d` work over the diff's blocks
 (see "`ctrl-u`/`ctrl-d` over blocks"), and cursor movement was measured against Zed's own editors
-(see "Cursor movement speed").
+(see "Cursor movement speed"), and stepping through a stack shows the next pull request's tab at
+once (see "Stepping shows at once").
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
@@ -120,6 +121,7 @@ What exists:
 | `crates/code_review/src/github.rs` | M7: `GitHubError` + hints, endpoints, host rules (`GitHubHost::{Cloud, Configured, Unverified}`, `GitHubHosts`: user-configured providers, registry hosts, SSH aliases via `ssh -G`), remote parsing (`remotes`: the checkout's GitHub remotes, preferred first), token lookup (gh's rules) and cache per (host, work dir), `GitHubClient` (GraphQL/REST over `HttpClient`, paging), response parsing (threads, summaries, files/patch hunks, stacks), `GitHubForge`, the forge cache (keyed by every remote URL); `test_support` (fake GitHub `HttpClient`, fixtures, `FakeLookups`) and tests, an ignored live test |
 | `crates/code_review/src/cli.rs` | M8: `is_review_url`, `ReviewLink` (`zed://review` parsing), `CliReviewRequest` + `handle_cli_review` (the CLI's request: the ping marker, open, `--wait`, the quit hook, one `Exit` per request through `CliReply`), `open_review_link` (a link Zed got without the CLI), `open_review` (a `TargetSpec` in a repository: checks, then `deploy_in_repo` or `open_pull_request`), `confirm_link` and the large-review prompt (links only), `repository_root`, `find_review_workspace`; CLI GPUI tests with a fake response sink (`tests::Cli`, also used by the pull request link test) |
 | `crates/cli/src/review.rs` | M8 (fork file in the upstream `cli` crate): `--review` → the `zed://review` link + the repository's canonical path, its usage errors, `requested()` (exit 1 for clap's usage errors), `check_exit` (polish A: a Zed that answered without the ping marker doesn't know `--review`) |
+| `crates/code_review/src/opening.rs` | `OpeningReview`: the tab a stack's pull request takes while `open_in_stack` fetches and checks it out — its number, title, author, state and branches from the stack's summary at once, then "Checking out …" or the error |
 | `crates/code_review/src/pull_request.rs` | M7b: `PullRequestState` (forge + details, one per review key through the `PullRequests` weak global), `open_pull_request` / `OpenPullRequestOptions` (the entry point the CLI calls; one at a time per repository, `OpeningPullRequest`; M8: `ReviewCancelled`, `repository_at` crate-visible), the in-place flow, `plan_worktree_fetch`, `trusts_head_repository` and the new-worktree flow (own `git worktree add --detach`, `trust_worktree`, `repository_at`). M7c: threads, summaries, `CommentableLines`, `ThreadFilters`, `load`/`reload` (+ forge re-resolution after auth errors, from any open checkout: `add_checkout`, `resolve_forge`, `use_forge`), `PullRequestEvent`, `place_thread`/`ThreadPlacement`, `check_comment` (the per-tab gate)/`check_comment_target`; M7d: `LocalChanges` (per tab: each file's diff against HEAD, `head_to_working`/`working_to_head` → `LineMapping`; polish A: `read_head_texts`); polish A: `submit`/`SubmitRequest`/`SubmitTarget`/`SubmitReply`, `uncertain_submit`/`check_uncertain_submit`, `retry_with_new_token`; stacks: `PullRequestState::stack`/`stack_position` (`StackPosition`), `open_stack_neighbor`, `open_in_stack` (in place, the new tab replaces the old); PR review GPUI tests and their `Fixture` |
 | `crates/code_review/src/checkout.rs` | M7b: `CheckoutStep`, `LocalState` (`read_local_state`/`local_state`: HEAD, base present, local branches + upstreams, read from git), the pure `plan_checkout`, `head_remote`, `RestrictedMode` + `ensure_trusted`, `run_checkout` (Zed's fetch and branch switch, plus our own git jobs: `fast_forward` with the branch check, `ensure_fast_forward`, detach; `run_git` with Zed's safety flags and askpass), the askpass delegate; planner and real-git tests |
 | `crates/code_review/src/github/queries.graphql` | M7: every GraphQL operation in one document (sent whole with `operationName`) |
@@ -2370,6 +2372,27 @@ nothing; this does.
   block on every cursor move (now one per side). Zed's diff view itself costs ~10 ms (debug) over a
   plain editor (the hunk gutter's `diff_hunks_in_range`, anchors over a long file): upstream's.
 - Not done: a live check by the user in a release-fast build.
+
+**Stepping shows at once (the user's report after the picker)** — "there is also a delay when
+pressing \"] s\". there should be no delay, UI updates immediately and shows loading state if things
+are loading"; "the loading state should show immediately, and the elements should load
+independently and show when ready … decouple properly and keep things simple".
+
+- **Cause**: `open_in_stack` showed nothing until `open_pull_request` had fetched the details and
+  run the checkout (the network and git), then swapped the tabs.
+- **Now**: `] s`, `[ s`, the toolbar's arrows and the top block's stack all go through
+  `open_in_stack`, which first adds an `OpeningReview` tab after the review and focuses it: the
+  stack's summary already has the number, title, author, state, draft and branches, so it shows
+  them at once with "Checking out <head>…". `open_pull_request` is unchanged; the tab only reflects
+  its outcome: opened, the new review replaces both tabs (the review's and the opening one); failed,
+  the opening tab shows the error (and the usual toast) while the old review stays open behind it,
+  so closing it goes back. The new review's parts already load independently once it exists (the
+  diff, the threads, summaries, files and stack each as they arrive). The review tab itself can't
+  appear earlier: its diff needs the checkout and the details' base commit.
+- Tests: `test_stack_navigation` extended: the opening tab is the active item right after the
+  action, before any request is answered, with its status drawn; #4's details failing shows the
+  error, keeps #1's review, and closing the tab goes back to it; on success one tab is left. 237
+  pass, 1 ignored. Not done: a live run.
 
 **Known issues / notes for the next slices:**
 

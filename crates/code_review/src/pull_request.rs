@@ -12,6 +12,7 @@ use crate::{
         ThreadAnchor,
     },
     github::{self, GitHubRemote},
+    opening::OpeningReview,
     session::{ReviewKey, ReviewOutcome, ReviewSession},
     target::{PullRequestReference, PullRequestTarget, ReviewTarget, validate_branch_name},
     view::ReviewView,
@@ -1536,8 +1537,9 @@ pub(crate) fn open_stack_neighbor(
 }
 
 /// Reviews pull request `number`, of the stack of `review`'s pull request, instead of that one:
-/// checked out in the review's repository (in place), in a tab that replaces the review's once it
-/// is open. The review's drafts stay in its session, for when it is opened again.
+/// checked out in the review's repository (in place). A tab showing what the stack says about it
+/// takes the focus at once; once its review is open, that review replaces both tabs. The review's
+/// drafts stay in its session, for when it is opened again.
 pub(crate) fn open_in_stack(
     workspace: &mut Workspace,
     review: Entity<ReviewView>,
@@ -1545,16 +1547,34 @@ pub(crate) fn open_in_stack(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let (repository, canonical) = {
+    let (repository, canonical, summary) = {
         let view = review.read(cx);
         let Some(pull_request) = view.pull_request() else {
             return;
         };
+        let pull_request = pull_request.read(cx);
+        let summary = pull_request.stack().and_then(|stack| {
+            stack
+                .pull_requests
+                .iter()
+                .find(|pull_request| pull_request.number == number)
+                .cloned()
+        });
         (
             view.repository().clone(),
-            pull_request.read(cx).forge().context().canonical.clone(),
+            pull_request.forge().context().canonical.clone(),
+            summary,
         )
     };
+    let opening = summary.and_then(|summary| {
+        let pane = workspace.pane_for(&review)?;
+        let opening = cx.new(|cx| OpeningReview::new(summary, cx));
+        pane.update(cx, |pane, cx| {
+            let index = pane.index_for_item(&review).map(|index| index + 1);
+            pane.add_item(Box::new(opening.clone()), true, true, index, window, cx);
+        });
+        Some(opening)
+    });
     let reference = PullRequestReference {
         repo: Some(ForgeRepoRef {
             host: Some(canonical.host),
@@ -1577,16 +1597,31 @@ pub(crate) fn open_in_stack(
             .update_in(cx, |workspace, window, cx| match result {
                 Ok(opened) => {
                     forge::dismiss_error_toast(workspace, cx);
-                    if opened != review
-                        && let Some(pane) = workspace.pane_for(&review)
-                    {
+                    let mut replaced = vec![review.entity_id()];
+                    replaced.extend(opening.map(|opening| opening.entity_id()));
+                    for item_id in replaced {
+                        if item_id == opened.entity_id() {
+                            continue;
+                        }
+                        let Some(pane) = workspace.panes().iter().find(|pane| {
+                            pane.read(cx).items().any(|item| item.item_id() == item_id)
+                        }) else {
+                            continue;
+                        };
                         pane.update(cx, |pane, cx| {
-                            pane.close_item_by_id(review.entity_id(), SaveIntent::Skip, window, cx)
+                            pane.close_item_by_id(item_id, SaveIntent::Skip, window, cx)
                         })
                         .detach_and_log_err(cx);
                     }
                 }
-                Err(error) => forge::show_error_toast(workspace, &error, cx),
+                Err(error) => {
+                    // The tab says what went wrong; closing it goes back to the review.
+                    if let Some(opening) = &opening {
+                        let message = forge::error_message(&error);
+                        opening.update(cx, |opening, cx| opening.fail(message, cx));
+                    }
+                    forge::show_error_toast(workspace, &error, cx);
+                }
             })
             .log_err();
     })
@@ -2704,9 +2739,17 @@ pub(crate) mod tests {
             details["number"] = json!(4);
             details["title"] = json!("Layer 4");
             details["isDraft"] = json!(true);
-            let respond = move |request: &SentRequest| {
-                let number = request.variables()["number"].as_u64();
-                match request.operation() {
+            let fail_details = Arc::new(AtomicBool::new(false));
+            let respond = {
+                let fail_details = fail_details.clone();
+                move |request: &SentRequest| {
+                    let number = request.variables()["number"].as_u64();
+                    match request.operation() {
+                    Some("PullRequestDetails")
+                        if number == Some(4) && fail_details.load(Ordering::SeqCst) =>
+                    {
+                        Some(Reply::status(500, "{}"))
+                    }
                     Some("PullRequestStackOf") => Some(Reply::json(
                         json!({ "data": { "repository": { "pullRequest": { "stack": stack } } } })
                             .to_string(),
@@ -2716,6 +2759,7 @@ pub(crate) mod tests {
                     }
                     None if request.uri.contains("/pulls/4/files") => Some(Reply::json(PR1_FILES)),
                     _ => None,
+                }
                 }
             };
             let fixture = Fixture {
@@ -2760,8 +2804,52 @@ pub(crate) mod tests {
             assert_eq!(notification_count(&workspace, cx), 1);
             assert_eq!(active_review(&workspace, cx), review);
 
-            // Up skips the closed #8; #4's tab replaces #1's.
-            dispatch(NextPullRequestInStack, cx);
+            let opening_tab = |cx: &mut VisualTestContext| {
+                workspace.read_with(cx, |workspace, cx| {
+                    workspace.active_item_as::<crate::opening::OpeningReview>(cx)
+                })
+            };
+
+            // Up skips the closed #8. #4's tab shows at once, before anything loaded; when #4
+            // can't be loaded it says so, and closing it goes back to #1's review.
+            fail_details.store(true, Ordering::SeqCst);
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(NextPullRequestInStack), cx)
+            });
+            let opening = opening_tab(cx).expect("#4's tab shows at once");
+            assert_eq!(
+                workspace.read_with(cx, |workspace, cx| workspace
+                    .active_item(cx)
+                    .map(|item| item.tab_content_text(0, cx))),
+                Some("PR #4: Layer 4".into())
+            );
+            redraw(cx);
+            assert!(cx.debug_bounds("review-opening-status").is_some());
+            cx.run_until_parked();
+            assert!(opening.read_with(cx, |opening, _| opening.error().is_some()));
+            assert_eq!(review_count(&workspace, cx), 1);
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+            let opening_id = opening.entity_id();
+            pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(opening_id, SaveIntent::Skip, window, cx)
+            })
+            .await
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(active_review(&workspace, cx), review);
+            fail_details.store(false, Ordering::SeqCst);
+
+            // Loaded, #4's review replaces both tabs.
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(NextPullRequestInStack), cx)
+            });
+            assert!(opening_tab(cx).is_some());
+            cx.run_until_parked();
+            assert!(opening_tab(cx).is_none());
+            let open_items = workspace.read_with(cx, |workspace, cx| {
+                workspace.active_pane().read(cx).items_len()
+            });
+            assert_eq!(open_items, 1);
             let next = active_review(&workspace, cx);
             assert_ne!(next, review);
             assert_eq!(review_count(&workspace, cx), 1);
