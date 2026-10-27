@@ -50,6 +50,15 @@ while it refreshes them (see "Instant reopen"). Then the overview stopped multip
 files (see "The overview is one block"), and wrapping follows the language settings again, so
 `ctrl-u`/`ctrl-d` move whole lines as in other buffers (see "Wrapping follows the settings"). Then the review stopped redrawing its own UI on every keypress
 (see "Less work per keypress"), and file headers read as paths (see "Headers read as paths").
+Bugs round 2 (the user's second list; item 1 came first, the rest were fixed on another machine from
+the same base and merged in on top of all of the above) is done too: comments stay in the diff's
+hunks, with ranges across hunks and from removed lines to added ones as GitHub takes them (see "Bugs
+2, item 1" and its follow-up), the overview collapses and expands at once in split view (item 2) and
+with `; t`, a squash merge's commit tab leads with its pull request number (item 3, "Titles" under
+"Implementation decisions (milestone 3)") while the overview and the panel show the whole title,
+wrapped list items in commit messages stay in their list (item 4), drafts are left out of the pull
+request search (item 5), comments are written in the buffer font as Markdown (item 6, "Editors"
+under "Milestone 5, part 1") and the panel's tree looks like the project panel's (item 7).
 
 **History: milestones 1–7 done: M4 (panel, reviewed marks, filters), a hardening pass over the M1–M4
 code reviews (see "Hardening" below), M5 (comments: part 1 "comments core", part 2 "old side,
